@@ -1,5 +1,5 @@
 module GraphNetSim
 
-greet() = print("Hello World!")
+# Write your package code here.
 
-end # module GraphNetSim
+end

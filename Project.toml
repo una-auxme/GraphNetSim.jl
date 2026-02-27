@@ -1,4 +1,13 @@
 name = "GraphNetSim"
-uuid = "4f9a1f1e-e61b-4753-af3e-9f66d9bd1962"
-version = "0.1.0"
-authors = ["Josef Kircher <Josef.Kircher@uni-a.de>"]
+uuid = "5ff66f56-808c-48e7-ac84-dd29877231f8"
+authors = ["Josef Kircher <Josef.Kircher@uni-a.de> and contributors"]
+version = "1.0.0-DEV"
+
+[compat]
+julia = "1.10.10"
+
+[extras]
+Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
+
+[targets]
+test = ["Test"]
