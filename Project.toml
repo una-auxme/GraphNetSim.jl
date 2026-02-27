@@ -1,0 +1,4 @@
+name = "GraphNetSim"
+uuid = "4f9a1f1e-e61b-4753-af3e-9f66d9bd1962"
+version = "0.1.0"
+authors = ["Josef Kircher <Josef.Kircher@uni-a.de>"]
