@@ -38,6 +38,10 @@ Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 Zygote = "e88e6eb3-aa80-5325-afca-941959d7151f"
 cuDNN = "02a925ec-e4fe-4b08-9a7e-0d78e3d38ccd"
 
+[sources.GraphNetCore]
+rev = "GNS-small-graph"
+url = "https://github.com/una-auxme/GraphNetCore.jl"
+
 [compat]
 Adapt = "4.3.0"
 Aqua = "0.8"
@@ -49,7 +53,7 @@ DataFrames = "1.6"
 DataInterpolations = "8.6.0"
 Distributions = "0.25"
 HDF5 = "0.17"
-JLD2 = "0.5"
+JLD2 = "0.5, 0.6"
 JSON = "0.21"
 JuliaFormatter = "2.2.1"
 KernelAbstractions = "0.9.39"
@@ -74,9 +78,6 @@ Test = "1"
 Zygote = "0.6"
 cuDNN = "1.4"
 julia = "1.10"
-
-[sources]
-GraphNetCore = {url = "https://github.com/una-auxme/GraphNetCore.jl", rev = "GNS-small-graph"}
 
 [extras]
 Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
