@@ -163,7 +163,3 @@ This package is inspired by the Graph Network-based Simulator (GNS) framework:
 ## Contributing
 
 We welcome contributions to GraphNetSim.jl! Please follow the [ColPrac](https://github.com/SciML/ColPrac) guidelines for collaborative practices.
-
-## License
-
-This project is licensed under the MIT License. See the [LICENSE]((https://github.com/una-auxme/GraphNetSim.jl/blob/main/LICENSE)) file for details.
