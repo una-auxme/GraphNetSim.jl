@@ -53,12 +53,13 @@ GraphNetSim.eval_network!
 ### Abstract Base Type
 
 ```@docs
-GraphNetSim.TrainingStrategy
 GraphNetSim.prepare_training
 GraphNetSim.get_delta
-GraphNetSim.init_train_step
-GraphNetSim.train_step
-GraphNetSim.validation_step
+init_train_step
+train_step
+validation_step
+GraphNetSim._validation_step
+GraphNetSim.batchTrajectory
 ```
 
 ### Concrete Strategies
@@ -67,6 +68,7 @@ GraphNetSim.validation_step
 GraphNetSim.SingleShooting
 GraphNetSim.MultipleShooting
 GraphNetSim.DerivativeTraining
+GraphNetSim.BatchingStrategy
 ```
 
 ## Normalization and Data Statistics
@@ -113,5 +115,5 @@ GraphNetSim.csv_to_hdf5
 ### VTK Export
 
 ```@docs
-GraphNetSim.visualize
+visualize
 ```

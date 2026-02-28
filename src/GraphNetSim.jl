@@ -37,6 +37,8 @@ include("../convert_csv/csvToh5.jl")
 export SingleShooting, MultipleShooting, DerivativeTraining, BatchingStrategy
 
 export train_network, eval_network, data_minmax, data_meanstd
+export init_train_step, train_step, validation_step, batchTrajectory
+# export prepare_training, get_delta
 export visualize
 export csv_to_hdf5
 

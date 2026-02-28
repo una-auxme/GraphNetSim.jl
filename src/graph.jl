@@ -12,7 +12,7 @@ using ChainRulesCore
 """
     build_graph(gns::GraphNetCore.GraphNetwork, data::Dict{String,Any}, datapoint::Integer, meta, node_type, device)
 
-Construct a [FeatureGraph](@ref) from trajectory data at a specific time step.
+Construct a [FeatureGraph](https://una-auxme.github.io/MeshGraphNets.jl/dev/graph_net_core/#GraphNetCore.FeatureGraph) from trajectory data at a specific time step.
 
 Extracts position and velocity data from the trajectory dictionary at the given time point,
 then delegates to the second method to construct the graph with edge connectivity and normalized features.
@@ -54,7 +54,7 @@ end
 """
     build_graph(gns::GraphNetCore.GraphNetwork, position, velocity, meta, node_type, mask, device)
 
-Construct a [FeatureGraph](@ref) from position and velocity data with edge connectivity.
+Construct a [FeatureGraph](https://una-auxme.github.io/MeshGraphNets.jl/dev/graph_net_core/#GraphNetCore.FeatureGraph) from position and velocity data with edge connectivity.
 
 Computes edges based on spatial proximity using GPU-accelerated neighborhood search, calculates relative displacements
 and normalized distances. Node features are constructed from position, velocity, node type, and distance bounds to domain boundaries.

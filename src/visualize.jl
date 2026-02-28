@@ -32,7 +32,6 @@ When using timesteps, all datasets to be read need "[Int]" appended.
 ## Returns
 - `Dict`: Dictionary mapping (trajectory, dataset_name, timestep) tuples to numerical arrays.
 """
-
 function visualize(
     inPath::String,
     outFolder::String,

@@ -95,14 +95,14 @@ end
 """
     validation_step(strategy, t)
 
-Performs validation of a single trajectory. Should be overwritten by training strategies to determine simulation and data interval before calling the inner function [_validation_step](@ref).
+Performs validation of a single trajectory. Should be overwritten by training strategies to determine simulation and data interval before calling the inner function [`_validation_step`](@ref).
 
 ## Arguments
 - `strategy`: Type of training strategy (used for dispatch).
 - `t`: Tuple containing the variables necessary for validation.
 
 ## Returns
-- See [_validation_step](@ref).
+- See [`_validation_step`](@ref).
 """
 function validation_step(strategy::TrainingStrategy, ::Tuple)
     throw(
