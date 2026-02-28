@@ -166,4 +166,4 @@ We welcome contributions to GraphNetSim.jl! Please follow the [ColPrac](https://
 
 ## License
 
-This project is licensed under the MIT License. See the [LICENSE](LICENSE) file for details.
+This project is licensed under the MIT License. See the [LICENSE]((https://github.com/una-auxme/GraphNetSim.jl/blob/main/LICENSE)) file for details.

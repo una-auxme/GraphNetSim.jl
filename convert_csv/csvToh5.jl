@@ -29,7 +29,7 @@ Convert particle trajectory data from CSV to HDF5 format with computed accelerat
 ## Keyword Arguments
 - `dt::Float64`: Time step (default: 0.01)
 - `n_trajectories::Int`: Number of trajectories to process (default: 1)
-- `dims::Vector{Int}`: Spatial dimensions to extract, e.g. [1, 2] or [1, 3] (default: [1, 2])
+- `dims::Vector{Int}`: Spatial dimensions to extract, e.g. [1, 2] or [1, 3] (default: `[1, 2]`)
 - `groupby_col::Symbol`: Column name for grouping particles (default: :Idp)
 - `interpolation_scheme::String`: Acceleration calculation method (default: "pchip")
   - "central_diff": Central difference scheme
