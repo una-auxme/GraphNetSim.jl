@@ -334,57 +334,6 @@ function data_meanstd(path)
 end
 
 """
-    li_to_ci(dims, li)
-
-Helper function to project a LinearIndex onto the given dimensions as a CartesianIndex.
-
-## Arguments
-- `dims`: Dimensions to where the LinearIndex is projected onto.
-- `li`: LinearIndex to convert.
-
-## Returns
-- Converted CartesianIndex.
-"""
-function li_to_ci(dims, li)
-    ci = CartesianIndices(Tuple(dims))
-    return ci[li]
-end
-
-"""
-    ci_to_li(dims, ci)
-
-Helper function to project a CartesianIndex onto the given dimension as a LinearIndex.
-
-## Arguments
-- `dims`: Dimensions to where the CartesianIndex is projected onto.
-- `li`: CartesianIndex to convert.
-
-## Returns
-- Converted LinearIndex.
-"""
-function ci_to_li(dims, ci)
-    li = LinearIndices(Tuple(dims))
-    return li[ci]
-end
-
-"""
-    dims_to_li(dims, li)
-
-Helper function to proejct the given indices onto the given dimensions as a LinearIndex.
-
-## Arguments
-- `dims`: Dimensions to where the LinearIndex is projected onto.
-- `idxs`: Indices to convert.
-
-## Returns
-- Converted LinearIndex.
-"""
-function dims_to_li(dims, idxs)
-    li = LinearIndices(Tuple(dims))
-    return li[idxs...]
-end
-
-"""
     clear_line(move_up = true)
 
 Deletes the content of the current line in the terminal.
