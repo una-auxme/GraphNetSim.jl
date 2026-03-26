@@ -208,17 +208,22 @@ function MLUtils.getobs!(buffer, ds::Dataset, idx)
     end
 
     prepare_trajectory!(buffer, ds.meta, ds.meta["device"])
-    buffer["mask"] = ds.meta["device"](Int32.(
-        findall(x -> x in ds.meta["types_updated"], buffer["node_type"][1, :, 1])
-    ))
-
-    val_mask = Float32.(
-        map(x -> x in ds.meta["types_updated"], buffer["node_type"][:, :, 1])
-    )
-
-    buffer["val_mask"] = ds.meta["device"](repeat(
-        val_mask, sum(size(buffer[field], 1) for field in ds.meta["output_features"]), 1
-    ))
+    n_particles = size(buffer["node_type"], 2)
+    if n_node_types(ds.meta) == 1
+        buffer["mask"] = ds.meta["device"](Int32.(1:n_particles))
+        n_out = sum(size(buffer[field], 1) for field in ds.meta["output_features"])
+        buffer["val_mask"] = ds.meta["device"](ones(Float32, n_out, n_particles))
+    else
+        buffer["mask"] = ds.meta["device"](Int32.(
+            findall(x -> x in ds.meta["types_updated"], buffer["node_type"][1, :, 1])
+        ))
+        val_mask = Float32.(
+            map(x -> x in ds.meta["types_updated"], buffer["node_type"][:, :, 1])
+        )
+        buffer["val_mask"] = ds.meta["device"](repeat(
+            val_mask, sum(size(buffer[field], 1) for field in ds.meta["output_features"]), 1
+        ))
+    end
 
     # if !isnothing(ds.meta["training_strategy"]) && 
     #     (typeof(ds.meta["training_strategy"]) <: DerivativeStrategy)

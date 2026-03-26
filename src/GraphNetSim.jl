@@ -172,30 +172,14 @@ function calc_norms(dataset, device, args)
         ) == Int32
             if haskey(dataset.meta["features"][feature], "onehot") &&
                 dataset.meta["features"][feature]["onehot"]
-                quantities +=
-                    dataset.meta["features"][feature]["data_max"] -
-                    dataset.meta["features"][feature]["data_min"] + 1
-                if haskey(dataset.meta["features"][feature], "target_min") &&
-                    haskey(dataset.meta["features"][feature], "target_max")
-                    n_norms[feature] = NormaliserOfflineMinMax(
-                        0.0f0,
-                        1.0f0,
-                        Float32(dataset.meta["features"][feature]["target_min"]),
-                        Float32(dataset.meta["features"][feature]["target_max"]),
-                    )
-                    if feature in output_features
-                        o_norms[feature] = NormaliserOfflineMinMax(
-                            0.0f0,
-                            1.0f0,
-                            Float32(dataset.meta["features"][feature]["target_min"]),
-                            Float32(dataset.meta["features"][feature]["target_max"]),
-                        )
-                    end
-                else
-                    n_norms[feature] = NormaliserOfflineMinMax(0.0f0, 1.0f0)
-                    if feature in output_features
-                        o_norms[feature] = NormaliserOfflineMinMax(0.0f0, 1.0f0)
-                    end
+                # One-hot values are already in {0,1} so NormaliserOfflineMinMax(0,1)
+                # would be an identity — no normaliser is created in any scenario.
+                # For multi-type datasets the dimension is counted; for single-type
+                # the feature is omitted entirely from node features (no information).
+                if n_node_types(dataset.meta) > 1
+                    quantities +=
+                        dataset.meta["features"][feature]["data_max"] -
+                        dataset.meta["features"][feature]["data_min"] + 1
                 end
             else
                 throw(
@@ -279,11 +263,8 @@ function calc_norms(dataset, device, args)
             end
         end
     end
-    if dataset.meta["features"]["node_type"]["data_max"] -
-       dataset.meta["features"]["node_type"]["data_min"] + 1 > 1
+    if n_node_types(dataset.meta) > 1
         quantities += length(dataset.meta["bounds"]) * 2
-    else
-        quantities += length(dataset.meta["bounds"])
     end
 
     return quantities, e_norms, n_norms, o_norms

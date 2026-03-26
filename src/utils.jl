@@ -6,6 +6,20 @@
 import Printf: @sprintf
 
 """
+    n_node_types(meta)
+
+Returns the number of distinct node types in the dataset.
+
+## Arguments
+- `meta`: Feature metadata dictionary containing `node_type` feature spec.
+
+## Returns
+- `Int`: `data_max - data_min + 1` for the `node_type` feature.
+"""
+n_node_types(meta) =
+    meta["features"]["node_type"]["data_max"] - meta["features"]["node_type"]["data_min"] + 1
+
+"""
     isnumber(meta, f)
 
 Checks whether the given feature is a numeric type (Int32 or Float32).
