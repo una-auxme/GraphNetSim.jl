@@ -32,6 +32,7 @@ include("graph.jl")
 include("solve.jl")
 include("dataset.jl")
 include("visualize.jl")
+include("config.jl")
 include("../convert_csv/csvToh5.jl")
 
 export SingleShooting, MultipleShooting, DerivativeTraining, BatchingStrategy
@@ -41,6 +42,7 @@ export init_train_step, train_step, validation_step, batchTrajectory
 # export prepare_training, get_delta
 export visualize
 export csv_to_hdf5
+export ModelConfig, save_model_config, load_model_config
 
 """
     Args
@@ -60,9 +62,6 @@ Configuration structure for training and evaluating Graph Neural Network simulat
 - `checkpoint::Integer=10000`: Interval (in steps) for saving checkpoints
 - `norm_steps::Integer=1000`: Steps to accumulate normalization statistics before weight updates
 - `batchsize::Integer=1`: Batch size (currently limited to 1 - full trajectory per batch)
-
-### Normalization
-- `max_norm_steps::Integer=10.0f6`: Maximum steps for online normalizer accumulation
 
 ### Data Augmentation
 - `types_updated::Vector{Integer}=[1]`: Node types whose features are predicted
@@ -95,7 +94,6 @@ Configuration structure for training and evaluating Graph Neural Network simulat
     steps::Integer = 10e6
     checkpoint::Integer = 10000
     norm_steps::Integer = 1000
-    max_norm_steps::Integer = 10.0f6
     types_updated::Vector{Integer} = [1]
     types_noisy::Vector{Integer} = [0]
     noise_stddevs::Vector{Float32} = [0.0f0]
@@ -110,6 +108,8 @@ Configuration structure for training and evaluating Graph Neural Network simulat
     optimizer_learning_rate_start::Float32 = 1.0f-4
     optimizer_learning_rate_stop::Union{Nothing,Float32} = nothing
     save_step::Bool = false
+    on_grad::Union{Nothing,Function} = nothing
+    on_valid::Union{Nothing,Function} = nothing
 end
 
 """
@@ -312,7 +312,6 @@ periodically on validation set and saves checkpoints for the best model.
 - `steps::Int=10e6`: Total number of training steps.
 - `checkpoint::Int=10000`: Create checkpoint every N steps.
 - `norm_steps::Int=1000`: Steps for accumulating normalization statistics without updates.
-- `max_norm_steps::Float32=10.0f6`: Maximum steps for online normalizers.
 - `types_updated::Vector{Int}=[1]`: Node types whose features are predicted.
 - `types_noisy::Vector{Int}=[0]`: Node types to which noise is added.
 - `noise_stddevs::Vector{Float32}=[0.0f0]`: Standard deviations for Gaussian noise.
@@ -348,7 +347,32 @@ train_network(
 ```
 """
 function train_network(opt, ds_path, cp_path; kws...)
+    existing_cfg = load_model_config(cp_path)
+    if !isnothing(existing_cfg)
+        kws = merge(
+            (
+                mps=existing_cfg.mps,
+                layer_size=existing_cfg.layer_size,
+                hidden_layers=existing_cfg.hidden_layers,
+            ),
+            NamedTuple(kws),
+        )
+    end
+
     args = Args(; kws...)
+
+    save_model_config(
+        ModelConfig(;
+            mps=args.mps,
+            layer_size=args.layer_size,
+            hidden_layers=args.hidden_layers,
+            norm_steps=args.norm_steps,
+            types_updated=args.types_updated,
+            types_noisy=args.types_noisy,
+            noise_stddevs=args.noise_stddevs,
+        ),
+        cp_path,
+    )
 
     if CUDA.functional() && args.use_cuda
         @info "Training on CUDA GPU..."
@@ -554,6 +578,9 @@ function train_gns!(
                     ),
                 )
                 gs, losses = train_step(args.training_strategy, train_tuple)
+                if !isnothing(args.on_grad)
+                    args.on_grad(step + datapoint, gs, gns.ps, sum(losses))
+                end
                 tmp_loss += sum(losses)
                 if args.save_step
                     push!(df_step, [datapoint, sum(losses)])
@@ -697,6 +724,9 @@ function train_gns!(
                     cp_progress = args.checkpoint
                 end
                 last_validation_loss = valid_error / ds_valid.meta["n_trajectories"]
+                if !isnothing(args.on_valid)
+                    args.on_valid(step, last_validation_loss)
+                end
                 if !args.show_progress_bars
                     println("Train step: $(step)/$(args.epochs*args.steps)")
                     println(
@@ -789,6 +819,18 @@ function eval_network(
     mse_steps,
     kws...,
 )
+    existing_cfg = load_model_config(cp_path)
+    if !isnothing(existing_cfg)
+        kws = merge(
+            (
+                mps=existing_cfg.mps,
+                layer_size=existing_cfg.layer_size,
+                hidden_layers=existing_cfg.hidden_layers,
+            ),
+            NamedTuple(kws),
+        )
+    end
+
     args = Args(; kws...)
 
     if CUDA.functional() && args.use_cuda

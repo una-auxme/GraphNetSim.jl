@@ -692,9 +692,9 @@ function train_loss(strategy::BatchingStrategy, t::Tuple)
     pred = cat(sol_pos...; dims=3)
 
     if strategy.loss_function == :mse
-        error = cpu_device()((gt[:, mask, 1:size(pred, 3)] .- pred[:, mask, :]) .^ 2)
+        error = cpu_device()((gt[:, :, 1:size(pred, 3)] .- pred[:, mask, :]) .^ 2)
     elseif strategy.loss_function == :mae
-        error = cpu_device()(abs.(gt[:, mask, 1:size(pred, 3)] .- pred[:, mask, :]))
+        error = cpu_device()(abs.(gt[:, :, 1:size(pred, 3)] .- pred[:, mask, :]))
     end
     loss = mean(error)
     return loss
@@ -749,9 +749,10 @@ function SingleShooting(
     sense::AbstractSensitivityAlgorithm=InterpolatingAdjoint(;
         autojacvec=ZygoteVJP(), checkpointing=true
     ),
+    loss_function=:mae,
     solargs...,
 )
-    SingleShooting(tstart, dt, tstop, solver, sense, solargs)
+    SingleShooting(tstart, dt, tstop, solver, sense, loss_function, solargs)
 end
 
 """
@@ -808,7 +809,13 @@ function train_loss(strategy::SingleShooting, t::Tuple)
     # println(typeof(gt_n))
     # println(typeof(pred_n))
 
-    error = cpu_device()((gt[:, mask, 1:size(pred, 3)] .- pred[:, mask, :]) .^ 2)
+    if strategy.loss_function == :mse
+        error = cpu_device()((gt[:, :, 1:size(pred, 3)] .- pred[:, mask, :]) .^ 2)
+    elseif strategy.loss_function == :mae
+        error = cpu_device()(abs.(gt[:, :, 1:size(pred, 3)] .- pred[:, mask, :]))
+    end
+    loss = mean(error)
+    return loss
 
     # err_buf = Zygote.Buffer(error)
 
@@ -816,8 +823,6 @@ function train_loss(strategy::SingleShooting, t::Tuple)
     # for i in axes(err_buf, 3)
     #     err_buf[:, mask, i] = err_buf[:, :, i] .* vm
     # end
-    loss = mean(error)
-    return loss
 end
 
 """

@@ -130,26 +130,32 @@ function csv_to_hdf5(source::String, output::String;
                     trajectory_length = length(pos_data_sliced[1])
                     n_dims = length(dims)
                     n_particles = length(grp)
-                    position_arrays = Array{Float32,3}(undef, n_particles, n_dims, trajectory_length)
-                    velocity_arrays = Array{Float32,3}(undef, n_particles, n_dims, trajectory_length)
-                    acceleration_arrays = Array{Float32,3}(undef, n_particles, n_dims, trajectory_length)
+                    position_arrays = Array{Float32,3}(undef, n_dims, n_particles, trajectory_length)
+                    velocity_arrays = Array{Float32,3}(undef, n_dims, n_particles, trajectory_length)
+                    acceleration_arrays = Array{Float32,3}(undef, n_dims, n_particles, trajectory_length)
                     particle_types = Array{Int}(undef, n_particles)
                 end
                 
                 # Populate 3D arrays
                 for idx in 1:length(dims)
-                    position_arrays[j, idx, :] = pos_data_sliced[idx]
-                    velocity_arrays[j, idx, :] = vel_data_sliced[idx]
-                    acceleration_arrays[j, idx, :] = acc_data_final[idx]
+                    position_arrays[idx, j, :] = pos_data_sliced[idx]
+                    velocity_arrays[idx, j, :] = vel_data_sliced[idx]
+                    acceleration_arrays[idx, j, :] = acc_data_final[idx]
                 end
                 particle_types[j] = prtl[!, type_col][1]
             end
             
+            # Remap particle types to sequential integers (1, 2, 3, ...) to minimize one-hot encoding size
+            unique_types = unique(particle_types)
+            sort!(unique_types)
+            type_mapping = Dict(zip(unique_types, 1:length(unique_types)))
+            particle_types_remapped = [type_mapping[t] for t in particle_types]
+            
             # Store trajectory length and metadata
             fid["$tra/trajectory_length"] = trajectory_length
-            fid["$tra/type"] = particle_types
+            fid["$tra/type"] = particle_types_remapped
             
-            # Store data in timestep-based format
+            # Store data in timestep-based format (dimensions × particles)
             for t in 1:trajectory_length
                 fid["$tra/pos[$t]"] = convert(Matrix{Float32}, position_arrays[:, :, t])
                 fid["$tra/vel[$t]"] = convert(Matrix{Float32}, velocity_arrays[:, :, t])
@@ -349,9 +355,8 @@ end
 #             dt=0.01, dims=[1, 2, 3], interpolation_scheme="cubic_spline")
 #
 # 2D (skip y-dimension) with extra fields
-# csv_to_hdf5(pwd() * "/data/dam_break.csv", "output.h5";
-#             dims=[1, 3], interpolation_scheme="linear",
-#             extra_fields=[:Mass, :Temperature])
+# csv_to_hdf5(pwd() * "/data/dam_break_mini/dam_break.csv", "output.h5";
+#             dims=[1, 3], interpolation_scheme="pchip")
 
 
 function particleToArray(
@@ -452,9 +457,9 @@ function particleToArray(
         # println("Offset: $offset")
 
         for n in timesteps
-            top_o["pos[$(n-offset+1)]"] = convert(Matrix, position[:, :, n]')
-            top_o["vel[$(n-offset+1)]"] = convert(Matrix, velocity[:, :, n]')
-            top_o["acc[$(n-offset+1)]"] = convert(Matrix, acceleration[:, :, n]')
+            top_o["pos[$(n-offset+1)]"] = convert(Matrix, position[:, :, n])
+            top_o["vel[$(n-offset+1)]"] = convert(Matrix, velocity[:, :, n])
+            top_o["acc[$(n-offset+1)]"] = convert(Matrix, acceleration[:, :, n])
         end
         timesteps = 0
 
@@ -467,9 +472,10 @@ function particleToArray(
     close(inputFile)
 end
 
+# Example usage of particleToArray (commented out):
 # particleToArray(
-#     "data/dam_break_first.h5",
-#     "data/dam_break_second.h5",#;
+#     "output.h5",
+#     "train.h5",#;
 #     # "data/ball_down_short_interp.h5",
 #     # "data/Ball_no_boundary/datasets/interpol_meanstd_2/valid.h5",
 #     # 8:74

@@ -113,7 +113,7 @@ function build_graph(
     # end
 
     if length(mask) == size(position, 2) # TODO val_mask is always position size long, this needs something smarter
-        dist_bound = cu(ones(Float32, size(position)...))
+        dist_bound = device(ones(Float32, size(position)...))
     else
         boundaries = device(Float32.(vcat(permutedims.(meta["bounds"])...)))
         dist_low_bound = position .- boundaries[:, 1]
