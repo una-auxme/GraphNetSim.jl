@@ -209,7 +209,8 @@ function MLUtils.getobs!(buffer, ds::Dataset, idx)
 
     prepare_trajectory!(buffer, ds.meta, ds.meta["device"])
     n_particles = size(buffer["node_type"], 2)
-    if n_node_types(ds.meta) == 1
+    single_type = ds.meta["features"]["node_type"]["data_min"]
+    if n_node_types(ds.meta) == 1 && single_type in ds.meta["types_updated"]
         buffer["mask"] = ds.meta["device"](Int32.(1:n_particles))
         n_out = sum(size(buffer[field], 1) for field in ds.meta["output_features"])
         buffer["val_mask"] = ds.meta["device"](ones(Float32, n_out, n_particles))

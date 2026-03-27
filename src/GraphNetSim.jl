@@ -37,7 +37,7 @@ include("../convert_csv/csvToh5.jl")
 
 export SingleShooting, MultipleShooting, DerivativeTraining, BatchingStrategy
 
-export train_network, eval_network, data_minmax, data_meanstd
+export train_network, eval_network, data_minmax, data_meanstd, update_meta!
 export init_train_step, train_step, validation_step, batchTrajectory
 # export prepare_training, get_delta
 export visualize
@@ -77,6 +77,11 @@ Configuration structure for training and evaluating Graph Neural Network simulat
 - `optimizer_learning_rate_start::Float32=1.0f-4`: Initial learning rate
 - `optimizer_learning_rate_stop::Union{Nothing,Float32}=nothing`: Final learning rate (for decay schedule)
 
+### Normalization
+- `norm_type::Symbol=:online`: Normalization strategy for Float32 features.
+  `:online` (accumulate stats during training), `:minmax` (requires data_min/data_max in meta.json),
+  `:meanstd` (requires data_mean/data_std in meta.json).
+
 ### Validation
 - `show_progress_bars::Bool=true`: Show training progress bars
 - `use_valid::Bool=true`: Load validation checkpoint (best loss) instead of final checkpoint
@@ -107,6 +112,7 @@ Configuration structure for training and evaluating Graph Neural Network simulat
     reset_valid::Bool = false
     optimizer_learning_rate_start::Float32 = 1.0f-4
     optimizer_learning_rate_stop::Union{Nothing,Float32} = nothing
+    norm_type::Symbol = :online
     save_step::Bool = false
     on_grad::Union{Nothing,Function} = nothing
     on_valid::Union{Nothing,Function} = nothing
@@ -189,8 +195,27 @@ function calc_norms(dataset, device, args)
                 )
             end
         else
-            if haskey(dataset.meta["features"][feature], "data_min") &&
-                haskey(dataset.meta["features"][feature], "data_max")
+            if args.norm_type == :online
+                if feature in input_features
+                    n_norms[feature] = NormaliserOnline(
+                        feature_dim, device; max_acc=Float32(args.norm_steps)
+                    )
+                elseif feature in output_features
+                    o_norms[feature] = NormaliserOnline(
+                        feature_dim, device; max_acc=Float32(args.norm_steps)
+                    )
+                end
+            elseif args.norm_type == :minmax
+                if !haskey(dataset.meta["features"][feature], "data_min") ||
+                    !haskey(dataset.meta["features"][feature], "data_max")
+                    throw(
+                        ArgumentError(
+                            "norm_type=:minmax requires 'data_min' and 'data_max' in " *
+                            "meta.json for feature \"$feature\". Run " *
+                            "`update_meta!(path, :minmax)` to compute and write these statistics.",
+                        ),
+                    )
+                end
                 if haskey(dataset.meta["features"][feature], "target_min") &&
                     haskey(dataset.meta["features"][feature], "target_max")
                     if feature in input_features
@@ -235,8 +260,17 @@ function calc_norms(dataset, device, args)
                         end
                     end
                 end
-            elseif haskey(dataset.meta["features"][feature], "data_mean") &&
-                haskey(dataset.meta["features"][feature], "data_std")
+            elseif args.norm_type == :meanstd
+                if !haskey(dataset.meta["features"][feature], "data_mean") ||
+                    !haskey(dataset.meta["features"][feature], "data_std")
+                    throw(
+                        ArgumentError(
+                            "norm_type=:meanstd requires 'data_mean' and 'data_std' in " *
+                            "meta.json for feature \"$feature\". Run " *
+                            "`update_meta!(path, :meanstd)` to compute and write these statistics.",
+                        ),
+                    )
+                end
                 if feature in input_features
                     n_norms[feature] = NormaliserOfflineMeanStd(
                         Float32.(dataset.meta["features"][feature]["data_mean"]),
@@ -251,15 +285,12 @@ function calc_norms(dataset, device, args)
                     )
                 end
             else
-                if feature in input_features
-                    n_norms[feature] = NormaliserOnline(
-                        feature_dim, device; max_acc=Float32(args.norm_steps)
-                    )
-                elseif feature in output_features
-                    o_norms[feature] = NormaliserOnline(
-                        feature_dim, device; max_acc=Float32(args.norm_steps)
-                    )
-                end
+                throw(
+                    ArgumentError(
+                        "Invalid norm_type=:$(args.norm_type). " *
+                        "Must be one of :online, :minmax, :meanstd.",
+                    ),
+                )
             end
         end
     end
@@ -335,6 +366,7 @@ function train_network(opt, ds_path, cp_path; kws...)
                 mps=existing_cfg.mps,
                 layer_size=existing_cfg.layer_size,
                 hidden_layers=existing_cfg.hidden_layers,
+                norm_type=existing_cfg.norm_type,
             ),
             NamedTuple(kws),
         )
@@ -351,6 +383,7 @@ function train_network(opt, ds_path, cp_path; kws...)
             types_updated=args.types_updated,
             types_noisy=args.types_noisy,
             noise_stddevs=args.noise_stddevs,
+            norm_type=args.norm_type,
         ),
         cp_path,
     )
@@ -689,7 +722,7 @@ function train_gns!(
                 end
 
                 if valid_error / ds_valid.meta["n_trajectories"] < min_validation_loss
-                    push!(df_valid, [step, valid_error / ds_valid.meta["n_trajectories"]])
+                    # push!(df_valid, [step, valid_error / ds_valid.meta["n_trajectories"]])
                     save!(
                         gns,
                         opt_state,

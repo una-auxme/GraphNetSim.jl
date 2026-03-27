@@ -26,6 +26,7 @@ as documentation and may legitimately differ between training phases.
 - `types_updated`: Node types whose outputs are predicted.
 - `types_noisy`: Node types receiving noise injection during training.
 - `noise_stddevs`: Per-type noise standard deviations.
+- `norm_type`: Normalization strategy for Float32 features (`:online`, `:minmax`, `:meanstd`).
 """
 @kwdef struct ModelConfig
     format_version::Int = 1
@@ -36,6 +37,7 @@ as documentation and may legitimately differ between training phases.
     types_updated::Vector{Int}
     types_noisy::Vector{Int}
     noise_stddevs::Vector{Float32}
+    norm_type::Symbol = :online
 end
 
 """
@@ -89,6 +91,7 @@ function save_model_config(cfg::ModelConfig, cp_path::String)
                     "types_updated" => cfg.types_updated,
                     "types_noisy" => cfg.types_noisy,
                     "noise_stddevs" => cfg.noise_stddevs,
+                    "norm_type" => String(cfg.norm_type),
                 ),
             ),
             2,
@@ -121,6 +124,7 @@ function load_model_config(cp_path::String)::Union{ModelConfig,Nothing}
             types_updated=Int.(train["types_updated"]),
             types_noisy=Int.(train["types_noisy"]),
             noise_stddevs=Float32.(train["noise_stddevs"]),
+            norm_type=Symbol(get(train, "norm_type", "online")),
         )
     catch e
         @warn "Could not parse model config at \"$path\": $e. Falling back to supplied arguments."
