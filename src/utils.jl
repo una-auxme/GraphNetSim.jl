@@ -16,8 +16,10 @@ Returns the number of distinct node types in the dataset.
 ## Returns
 - `Int`: `data_max - data_min + 1` for the `node_type` feature.
 """
-n_node_types(meta) =
-    meta["features"]["node_type"]["data_max"] - meta["features"]["node_type"]["data_min"] + 1
+function n_node_types(meta)
+    meta["features"]["node_type"]["data_max"] - meta["features"]["node_type"]["data_min"] +
+    1
+end
 
 """
     isnumber(meta, f)
