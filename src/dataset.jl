@@ -77,6 +77,7 @@ function Dataset(datafile::String, metafile::String, args)
     meta["keys_trajectories"] = keys_traj
     merge!(meta, Dict(String(key) => getfield(args, key) for key in propertynames(args)))
 
+    validate_type_args(meta)
     Dataset(meta, datafile, ReentrantLock())
 end
 
@@ -122,6 +123,7 @@ function Dataset(split::Symbol, path::String, args)
     meta["keys_trajectories"] = keys_traj
     merge!(meta, Dict(String(key) => getfield(args, key) for key in propertynames(args)))
 
+    validate_type_args(meta)
     Dataset(meta, datafile, ReentrantLock())
 end
 
@@ -176,6 +178,42 @@ function keystraj(datafile::String)
     close(file)
 
     return keys_traj
+end
+
+"""
+    validate_type_args(meta::Dict{String,Any})
+
+Check that `types_updated` and `types_noisy` are consistent with the node types
+present in the dataset.
+
+- `types_updated` containing a type not in the dataset throws an `ArgumentError`
+  because the resulting mask would be empty, silently producing zero gradient signal.
+- `types_noisy` containing a type not in the dataset issues a `@warn` because
+  using `[0]` as a "no noise" sentinel is a common intentional pattern.
+"""
+function validate_type_args(meta::Dict{String,Any})
+    type_min = Int(meta["features"]["node_type"]["data_min"])
+    type_max = Int(meta["features"]["node_type"]["data_max"])
+    valid_types = type_min:type_max
+
+    unknown_updated = filter(t -> t ∉ valid_types, meta["types_updated"])
+    if !isempty(unknown_updated)
+        throw(
+            ArgumentError(
+                "types_updated contains type(s) $unknown_updated that are not present " *
+                "in the dataset (valid types: $(collect(valid_types))). " *
+                "This would produce an empty particle mask and no gradient signal.",
+            ),
+        )
+    end
+
+    unknown_noisy = filter(t -> t ∉ valid_types, meta["types_noisy"])
+    if !isempty(unknown_noisy)
+        @warn "types_noisy contains type(s) $unknown_noisy not present in the dataset " *
+              "(valid types: $(collect(valid_types))). " *
+              "No noise will be applied. If this is intentional (e.g. types_noisy=[0] " *
+              "as a 'no noise' sentinel), you can ignore this warning."
+    end
 end
 
 MLUtils.numobs(ds::Dataset) = ds.meta["n_trajectories"]
@@ -606,27 +644,9 @@ function create_edges(traj_dict::Dict{String,Any}, meta::Dict{String,Any})
     for i in axes(position)[3]
         fluid_position = position[:, traj_dict["mask"], i]
         current_position = position[:, :, i]
-        if device == cpu_device()
-            cur_pos_cpu = cpu_device()(current_position)
-            tree = KDTree(cur_pos_cpu; reorder=false)
-            receivers_list = inrange(
-                tree, cur_pos_cpu, Float32(meta["default_connectivity_radius"]), false
-            )
-            sender = vcat(
-                [repeat([i], length(j)) for (i, j) in enumerate(receivers_list)]...
-            )
-            receiver = vcat(receivers_list...)
-            rel_displacement =
-                (current_position[:, receiver] - current_position[:, sender]) ./
-                Float32(meta["default_connectivity_radius"])
-            rel_dist_norm = sqrt.(sum(abs2, rel_displacement; dims=1))
-        else
-            sender, receiver, rel_displacement, rel_dist_norm = point_neighbor_ns(
-                current_position,
-                Float32(meta["default_connectivity_radius"]),
-                traj_dict["mask"],
-            )
-        end
+        sender, receiver, rel_displacement, rel_dist_norm = point_neighbor_ns(
+            current_position, Float32(meta["default_connectivity_radius"])
+        )
         # if meta["features"]["node_type"]["data_max"] - meta["features"]["node_type"]["data_min"] != 0
         #     sender_old, receiver_old, sender, receiver, _, b_particle = check_and_delete_filtered(sender, receiver, size(fluid_position, 2), true)
         #     rel_displacement = (current_position[:, receiver_old] - current_position[:, sender_old]) ./ Float32(meta["default_connectivity_radius"])

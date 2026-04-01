@@ -22,7 +22,6 @@ import ProgressMeter: Progress
 
 import Base: @kwdef
 import SciMLBase: solve, remake
-import NearestNeighbors: KDTree, inrange
 import HDF5: h5open, create_group, open_group
 import ProgressMeter: next!, update!, finish!
 import Statistics: mean
@@ -609,11 +608,11 @@ function train_gns!(
                             Optimisers.adjust!(
                                 opt_state,
                                 Float32(
-                                    args.optimizer_learning_rate_start +
+                                    args.optimizer_learning_rate_stop +
                                     (
                                         args.optimizer_learning_rate_start -
                                         args.optimizer_learning_rate_stop
-                                    )*0.1^(step*5e6),
+                                    ) * 0.1^((step + datapoint) / 5f6),
                                 ),
                             ) # Learn rate decay from GNS paper
                         end

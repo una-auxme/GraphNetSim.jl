@@ -3,7 +3,7 @@
 # Licensed under the MIT license. See LICENSE file in the project root for details.
 #
 
-import SciMLBase: AbstractSensitivityAlgorithm, ODEFunction
+import SciMLBase: AbstractSensitivityAlgorithm, ODEFunction, ReturnCode
 import SciMLSensitivity: InterpolatingAdjoint, ZygoteVJP, STACKTRACE_WITH_VJPWARN
 import Zygote: pullback
 using RecursiveArrayTools, CUDA
@@ -160,7 +160,9 @@ function _validation_step(t::Tuple, sim_interval, data_interval)
         pr,
     )
     GC.gc()         # Run Julia's garbage collector first
-    CUDA.reclaim()  # Force garbage collection and free unused memory
+    if CUDA.functional()
+        CUDA.reclaim()  # Force garbage collection and free unused memory
+    end
     sol_pos = [u.x for u in sol.u]
     prediction = cat(sol_pos...; dims=3)[:, data["mask"], data_interval]
 
@@ -225,44 +227,34 @@ prepares ground truth data for ODE problem setup.
 function init_train_step(strategy::SolverStrategy, t::Tuple)
     gns,
     data,
-    position,
-    velocity,
     meta,
     output_fields,
     target_fields,
     node_type,
     mask,
+    val_mask,
     device,
-    _ = t
+    _,
+    _,
+    show_progress_bars = t
 
-    target_dict = Dict{String,Int32}()
-    for tf in target_fields
-        target_dict[tf] = meta["features"][tf]["dim"]
-    end
-
-    initial_state = Dict("position" => position, "velocity" => velocity)
-
-    inputs = deepcopy(initial_state)
-    for i in keys(target_dict)
-        delete!(inputs, "target|" * i)
-    end
+    initial_state = Dict("position" => data["position"][:, :, 1],
+        "velocity" => data["velocity"][:, :, 1],)
 
     x0 = initial_state["position"]
     dx0 = initial_state["velocity"]
 
     u0 = device(ComponentArray(; x=initial_state["position"], dx=initial_state["velocity"]))
-    gt = vcat([data[tf] for tf in target_fields]...)
+    gt = vcat([data[tf][:,mask,:] for tf in target_fields]...)
 
     return (
         gns,
         meta,
-        inputs,
         output_fields,
         target_fields,
         node_type,
         mask,
-        x0,
-        dx0,
+        val_mask,
         u0,
         gt,
         device,
@@ -292,7 +284,7 @@ and computes gradients via sensitivity analysis (adjoint method).
 5. Return gradients and loss.
 """
 function train_step(strategy::SolverStrategy, t::Tuple)
-    gns, meta, inputs, output_fields, target_fields, node_type, mask, u0, gt, device = t
+    gns, meta, output_fields, target_fields, node_type, mask, val_mask, u0, gt, device = t
 
     pr = ProgressUnknown(; desc="Solver progress: ", showspeed=true)
     print("\n\n\n\n\n\n\n\n") # display solver progress after main progress
@@ -303,13 +295,13 @@ function train_step(strategy::SolverStrategy, t::Tuple)
             (
                 gns,
                 ps,
-                inputs,
                 output_fields,
                 meta,
                 target_fields,
                 node_type,
                 pr,
                 mask,
+                val_mask,
                 device,
             ),
             t,
@@ -769,6 +761,7 @@ trajectory with ground truth data.
 """
 function train_loss(strategy::SingleShooting, t::Tuple)
     prob, ps, u0, callback_solve, gt, mask, n_norm, target_fields, target_dims = t # TODO add du0 TODO vary ps
+    tstop_data = strategy.tstart + (size(gt, 3) - 1) * strategy.dt
     sol = solve(
         remake(prob; p=ps),
         strategy.solver;
@@ -776,6 +769,7 @@ function train_loss(strategy::SingleShooting, t::Tuple)
         dt=strategy.dt,
         sensealg=strategy.sense,
         callback=callback_solve,
+        saveat=(strategy.tstart:strategy.dt:tstop_data),
         strategy.solargs...,
     ) # TODO remake du0=du0 currently not implemented Chris what are u doing?
     # sol = solve(remake(prob; p = ps), strategy.solver; u0 = u0, dt = strategy.dt)
@@ -888,6 +882,47 @@ function MultipleShooting(
     )
 end
 
+function init_train_step(::MultipleShooting, t::Tuple)
+    gns,
+    data,
+    meta,
+    output_fields,
+    target_fields,
+    node_type,
+    mask,
+    val_mask,
+    device,
+    _,
+    _,
+    _ = t
+
+    u0 = device(ComponentArray(; x=data["position"][:, :, 1], dx=data["velocity"][:, :, 1]))
+    gt = vcat([data[tf][:, mask, :] for tf in target_fields]...)
+
+    return (gns, data, meta, output_fields, target_fields, node_type, mask, val_mask, u0, gt, device)
+end
+
+function train_step(strategy::MultipleShooting, t::Tuple)
+    gns, data, meta, output_fields, target_fields, node_type, mask, val_mask, u0, gt, device = t
+
+    pr = ProgressUnknown(; desc="Solver progress: ", showspeed=true)
+    print("\n\n\n\n\n\n\n\n")
+
+    ff = ODEFunction{false}(
+        (x, ps, t) -> ode_func_train(
+            x,
+            (gns, ps, output_fields, meta, target_fields, node_type, pr, mask, val_mask, device),
+            t,
+        ),
+    )
+    prob = ODEProblem(ff, u0, (strategy.tstart, strategy.tstop), gns.ps)
+    shoot_loss, shoot_gs = Zygote.withgradient(
+        ps -> train_loss(strategy, (prob, ps, data, gt, mask, device)),
+        gns.ps,
+    )
+    return shoot_gs, shoot_loss
+end
+
 """
     train_loss(strategy::MultipleShooting, t::Tuple)
 
@@ -898,56 +933,54 @@ for mismatches between interval endpoints.
 
 ## Arguments
 - `strategy::MultipleShooting`: MultipleShooting instance.
-- `t::Tuple`: Tuple containing problem, parameters, and ground truth data.
+- `t::Tuple`: Tuple containing problem, parameters, data, ground truth, mask, and device.
 """
 function train_loss(strategy::MultipleShooting, t::Tuple)
-    prob, ps, _, callback_solve, gt, _, _, _ = t
+    prob, ps, data, gt, mask, device = t
 
-    tsteps = strategy.tstart:strategy.dt:strategy.tstop
+    tstop_data = strategy.tstart + (size(gt, 3) - 1) * strategy.dt
+    tsteps = strategy.tstart:strategy.dt:tstop_data
     ranges = [
         i:min(length(tsteps), i + strategy.interval_size - 1) for
         i in 1:(strategy.interval_size - 1):(length(tsteps) - 1)
     ]
-    println(ranges)
     sols = [
         solve(
             remake(
                 prob;
                 p=ps,
                 tspan=(tsteps[first(rg)], tsteps[last(rg)]),
-                u0=gt[:, :, first(rg)],
+                u0=device(ComponentArray(;
+                    x=data["position"][:, :, first(rg)],
+                    dx=data["velocity"][:, :, first(rg)],
+                )),
             ),
             strategy.solver;
             saveat=tsteps[rg],
             sensealg=strategy.sense,
-            callback=callback_solve,
             strategy.solargs...,
         ) for rg in ranges
     ]
-    group_predictions = typeof(gt) <: CuArray ? CuArray.(sols) : Array.(sols)
 
     retcodes = [sol.retcode for sol in sols]
-    if any(retcodes .!= :Success)
+    if any(retcodes .!= ReturnCode.Success)
         return Inf
     end
 
-    vm = cpu_device()(val_mask)
+    group_predictions = [
+        cat([u.x for u in sol.u]...; dims=3)[:, mask, :]
+        for sol in sols
+    ]
 
     loss = 0
     for (i, rg) in enumerate(ranges)
-        error = cpu_device()((gt[:, :, rg] - group_predictions[i]) .^ 2)
-
-        err_buf = Zygote.Buffer(error)
-        err_buf[:, :, :] = error
-        for i in axes(err_buf, 3)
-            err_buf[:, :, i] = err_buf[:, :, i] .* vm
-        end
-        loss += mean(copy(err_buf))
+        error = cpu_device()((gt[:, :, rg] .- group_predictions[i]) .^ 2)
+        loss += mean(error)
 
         if i > 1
             loss +=
                 strategy.continuity_term *
-                sum(abs, group_predictions[i - 1][:, :, end] - gt[:, :, first(rg)])
+                sum(abs, group_predictions[i - 1][:, :, end] .- gt[:, :, first(rg)])
         end
     end
 
