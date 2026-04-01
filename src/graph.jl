@@ -85,12 +85,12 @@ function build_graph(
     if device == cpu_device()
         cur_pos_cpu = cpu_device()(position)
         tree = KDTree(cur_pos_cpu; reorder=false)
-        receivers_list = device(inrange(
-            tree, cur_pos_cpu, Float32(meta["default_connectivity_radius"]), false
-        ))
-        senders = device(vcat(
-            [repeat([i], length(j)) for (i, j) in enumerate(receivers_list)]...
-        ))
+        receivers_list = device(
+            inrange(tree, cur_pos_cpu, Float32(meta["default_connectivity_radius"]), false)
+        )
+        senders = device(
+            vcat([repeat([i], length(j)) for (i, j) in enumerate(receivers_list)]...)
+        )
         receivers = vcat(receivers_list...)
         rel_displacement =
             (position[:, receivers] - position[:, senders]) ./
@@ -112,39 +112,47 @@ function build_graph(
     #     particles = Colon()
     # end
 
-    if length(mask) == size(position, 2) # TODO val_mask is always position size long, this needs something smarter
-        dist_bound = device(ones(Float32, size(position)...))
-    else
-        boundaries = device(Float32.(vcat(permutedims.(meta["bounds"])...)))
-        dist_low_bound = position .- boundaries[:, 1]
-        dist_up_bound = boundaries[:, 2] .- position
-        dist_bound = clamp.(
-            vcat(dist_low_bound, dist_up_bound) ./
-            Float32(meta["default_connectivity_radius"]),
-            -1.0f0,
-            1.0f0,
-        )
-    end
-    # dist_bound = cu(ones(Float32, size(position)...))
-    edge_features = device(vcat(rel_displacement, rel_dist_norm) .+ 1.0f-8)
-    input_dim = 0
-    for feature in meta["input_features"]
-        input_dim += meta["features"][feature]["dim"]
+    if n_node_types(meta) > 1
+        if length(mask) == size(position, 2)
+            dist_bound = device(ones(Float32, size(position)...))
+        else
+            boundaries = device(Float32.(vcat(permutedims.(meta["bounds"])...)))
+            dist_low_bound = position .- boundaries[:, 1]
+            dist_up_bound = boundaries[:, 2] .- position
+            dist_bound = clamp.(
+                vcat(dist_low_bound, dist_up_bound) ./
+                Float32(meta["default_connectivity_radius"]),
+                -1.0f0,
+                1.0f0,
+            )
+        end
     end
 
-    if length(meta["input_features"]) == 2
-        node_features = device(vcat(
-            gns.n_norm["position"](position),
-            gns.n_norm["velocity"](velocity),
-            dist_bound,
-            gns.n_norm["node_type"](node_type),
-        ))
+    edge_features = device(vcat(rel_displacement, rel_dist_norm) .+ 1.0f-8)
+
+    if n_node_types(meta) == 1
+        if length(meta["input_features"]) == 2
+            node_features = device(
+                vcat(gns.n_norm["position"](position), gns.n_norm["velocity"](velocity))
+            )
+        else
+            node_features = device(gns.n_norm["velocity"](velocity))
+        end
     else
-        node_features = device(vcat(
-            gns.n_norm["velocity"](velocity),
-            dist_bound,
-            gns.n_norm["node_type"](node_type),
-        ))
+        if length(meta["input_features"]) == 2
+            node_features = device(
+                vcat(
+                    gns.n_norm["position"](position),
+                    gns.n_norm["velocity"](velocity),
+                    dist_bound,
+                    node_type,
+                ),
+            )
+        else
+            node_features = device(
+                vcat(gns.n_norm["velocity"](velocity), dist_bound, node_type)
+            )
+        end
     end
 
     return GraphNetCore.FeatureGraph(

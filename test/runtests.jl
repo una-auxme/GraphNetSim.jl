@@ -9,6 +9,6 @@ using Aqua
         @testset "Method ambiguity" begin
             Aqua.test_ambiguities([GraphNetSim])
         end
-        Aqua.test_all(GraphNetSim; ambiguities = false)
+        Aqua.test_all(GraphNetSim; ambiguities=false)
     end
 end
