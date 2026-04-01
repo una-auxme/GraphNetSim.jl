@@ -181,6 +181,24 @@ function calc_norms(dataset, device, args)
                         dataset.meta["features"][feature]["data_max"] -
                         dataset.meta["features"][feature]["data_min"] + 1
                 end
+
+                if haskey(dataset.meta["features"][feature], "target_min") &&
+                    haskey(dataset.meta["features"][feature], "target_max")
+                    n_norms[feature] = NormaliserOfflineMinMax(
+                        0.0f0,
+                        1.0f0,
+                        Float32(dataset.meta["features"][feature]["target_min"]),
+                        Float32(dataset.meta["features"][feature]["target_max"]),
+                    )
+                    if feature in output_features
+                        o_norms[feature] = NormaliserOfflineMinMax(
+                            0.0f0,
+                            1.0f0,
+                            Float32(dataset.meta["features"][feature]["target_min"]),
+                            Float32(dataset.meta["features"][feature]["target_max"]),
+                        )
+                    end
+                end
             else
                 throw(
                     ErrorException(
