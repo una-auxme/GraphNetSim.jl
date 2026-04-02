@@ -6,6 +6,10 @@ jobs:
   code-style:
     runs-on: ubuntu-latest
     steps:
+      - run: |
+          pwd
+          ls -la
+          cat .JuliaFormatter.toml
       - uses: julia-actions/julia-format@v4
         with:
           version: '1'
