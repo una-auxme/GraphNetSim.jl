@@ -12,9 +12,7 @@ include("generate_fixtures.jl")
         @testset "Method ambiguity" begin
             Aqua.test_ambiguities([GraphNetSim])
         end
-        # stale_deps: JuliaFormatter in [deps] but unused (pre-existing)
-        # persistent_tasks: csvToh5.jl runs top-level code on include (pre-existing)
-        Aqua.test_all(GraphNetSim; ambiguities = false, stale_deps = false, persistent_tasks = false)
+        Aqua.test_all(GraphNetSim; ambiguities=false)
     end
 
     include("test_normalizer.jl")

@@ -398,7 +398,7 @@ function update_meta!(path::String, norm_type::Symbol)
     if norm_type ∉ (:online, :minmax, :meanstd)
         throw(
             ArgumentError(
-                "Invalid norm_type=:$norm_type. Must be one of :online, :minmax, :meanstd.",
+                "Invalid norm_type=:$norm_type. Must be one of :online, :minmax, :meanstd."
             ),
         )
     end
