@@ -9,7 +9,7 @@ jobs:
       - run: |
           pwd
           ls -la
-          cat .JuliaFormatter.toml
+          cat ../.JuliaFormatter.toml
       - uses: julia-actions/julia-format@v4
         with:
           version: '1'
