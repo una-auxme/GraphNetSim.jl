@@ -4,6 +4,23 @@
 #
 
 import Printf: @sprintf
+import JSON: print as json_print, parsefile as json_parsefile
+
+"""
+    n_node_types(meta)
+
+Returns the number of distinct node types in the dataset.
+
+## Arguments
+- `meta`: Feature metadata dictionary containing `node_type` feature spec.
+
+## Returns
+- `Int`: `data_max - data_min + 1` for the `node_type` feature.
+"""
+function n_node_types(meta)
+    meta["features"]["node_type"]["data_max"] - meta["features"]["node_type"]["data_min"] +
+    1
+end
 
 """
     n_node_types(meta)
@@ -133,21 +150,9 @@ function data_minmax(path)
                 end
             end
         end
-        for tf in target_features #TODO as target features are part of the data no FD has to be computed
+        for tf in target_features
             if !haskey(ds_train.meta["features"][tf], "onehot") &&
                 isnumber(ds_train.meta, tf)
-                # ddiff = data[tf][:, :, 2:end] - data[tf][:, :, 1:(end - 1)]
-                # if size(data["dt"]) == 1
-                #     dts = data["dt"]
-                # else
-                #     dts = Float32.(data["dt"][2:end] - data["dt"][1:(end - 1)])
-                # end
-                # for i in eachindex(dts)
-                #     ddiff[:, :, i] ./= dts[i]
-                # end
-                # ddiff_min = minimum(ddiff)
-                # ddiff_max = maximum(ddiff)
-
                 ddiff_min = minimum(data[tf])
                 ddiff_max = maximum(data[tf])
                 if ddiff_min < result["target|$tf"][1]
@@ -380,4 +385,100 @@ function clear_log(lines::Integer, move_up=true)
     for _ in 1:lines
         clear_line()
     end
+end
+
+"""
+    update_meta!(path, norm_type)
+
+Compute normalization statistics and write them into the dataset's `meta.json`.
+
+Calls [`data_minmax`](@ref) or [`data_meanstd`](@ref) depending on `norm_type`,
+then updates the per-feature entries in `meta.json` with the computed statistics.
+Conflicting statistics from a different normalization type are removed.
+
+## Arguments
+- `path::String`: Dataset directory containing `meta.json`, `train.h5`, `valid.h5`, `test.h5`.
+- `norm_type::Symbol`: One of `:online`, `:minmax`, or `:meanstd`.
+  `:online` is a no-op (no precomputed statistics needed).
+
+## Returns
+- `String`: Path to the written `meta.json` file.
+"""
+function update_meta!(path::String, norm_type::Symbol)
+    if norm_type ∉ (:online, :minmax, :meanstd)
+        throw(
+            ArgumentError(
+                "Invalid norm_type=:$norm_type. Must be one of :online, :minmax, :meanstd."
+            ),
+        )
+    end
+
+    meta_path = joinpath(path, "meta.json")
+    if !isfile(meta_path)
+        throw(ArgumentError("meta.json not found at \"$meta_path\"."))
+    end
+
+    if norm_type == :online
+        @info "norm_type=:online requires no precomputed statistics. meta.json unchanged."
+        return meta_path
+    end
+
+    meta = json_parsefile(meta_path)
+
+    conflicting_minmax = ("data_min", "data_max", "output_min", "output_max")
+    conflicting_meanstd = ("data_mean", "data_std")
+
+    if norm_type == :minmax
+        stats = data_minmax(path)
+
+        for (key, val) in stats
+            if startswith(key, "target|")
+                feat = key[8:end]
+                if !haskey(meta["features"], feat)
+                    continue
+                end
+                # Write output-specific keys only if they differ from input stats
+                if haskey(stats, feat) && val != stats[feat]
+                    meta["features"][feat]["output_min"] = Float64(val[1])
+                    meta["features"][feat]["output_max"] = Float64(val[2])
+                end
+            else
+                if !haskey(meta["features"], key)
+                    continue
+                end
+                meta["features"][key]["data_min"] = Float64(val[1])
+                meta["features"][key]["data_max"] = Float64(val[2])
+                # Remove conflicting meanstd keys
+                for ck in conflicting_meanstd
+                    delete!(meta["features"][key], ck)
+                end
+            end
+        end
+
+    elseif norm_type == :meanstd
+        stats = data_meanstd(path)
+
+        for (key, val) in stats
+            if startswith(key, "target|")
+                # meanstd has no separate output keys; skip target entries
+                continue
+            end
+            if !haskey(meta["features"], key)
+                continue
+            end
+            meta["features"][key]["data_mean"] = Float64.(val[1])
+            meta["features"][key]["data_std"] = Float64.(val[2])
+            # Remove conflicting minmax keys
+            for ck in conflicting_minmax
+                delete!(meta["features"][key], ck)
+            end
+        end
+    end
+
+    open(meta_path, "w") do f
+        json_print(f, meta, 2)
+    end
+
+    @info "Updated meta.json with $norm_type statistics at \"$meta_path\"."
+    return meta_path
 end
