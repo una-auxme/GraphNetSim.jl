@@ -20,8 +20,8 @@ using Lux
 using CUDA
 using JLD2
 using MLUtils
-import Optimisers
-import OrdinaryDiffEq
+using Optimisers: Optimisers
+using OrdinaryDiffEq: OrdinaryDiffEq
 
 const NORM_DATA_PATH = joinpath(@__DIR__, "fixtures", "ballistic_small")
 device = cpu_device()
@@ -35,45 +35,45 @@ device = cpu_device()
         println("Running: A — NormaliserOfflineMinMax unit math")
         @testset "A1: data_min→0, data_max→1, midpoint→0.5" begin
             n = NormaliserOfflineMinMax(-3.0f0, 5.0f0)
-            @test only(n([-3.0f0])) ≈ 0.0f0  atol=1f-6
-            @test only(n([5.0f0]))  ≈ 1.0f0  atol=1f-6
-            @test only(n([1.0f0]))  ≈ 0.5f0  atol=1f-6   # midpoint: (-3+5)/2 = 1
+            @test only(n([-3.0f0])) ≈ 0.0f0 atol=1.0f-6
+            @test only(n([5.0f0])) ≈ 1.0f0 atol=1.0f-6
+            @test only(n([1.0f0])) ≈ 0.5f0 atol=1.0f-6   # midpoint: (-3+5)/2 = 1
         end
 
         @testset "A2: inverse_data is exact left-inverse" begin
             n = NormaliserOfflineMinMax(-3.0f0, 5.0f0)
             x = Float32[-3.0, -1.0, 0.0, 2.5, 5.0]
-            @test all(isapprox.(inverse_data(n, n(x)), x; atol=1f-6))
+            @test all(isapprox.(inverse_data(n, n(x)), x; atol=1.0f-6))
         end
 
         @testset "A3: non-default target range [-1, 1]" begin
             n = NormaliserOfflineMinMax(0.0f0, 10.0f0, -1.0f0, 1.0f0)
-            @test only(n([0.0f0]))  ≈ -1.0f0 atol=1f-6
-            @test only(n([10.0f0])) ≈  1.0f0 atol=1f-6
-            @test only(n([5.0f0]))  ≈  0.0f0 atol=1f-6
+            @test only(n([0.0f0])) ≈ -1.0f0 atol=1.0f-6
+            @test only(n([10.0f0])) ≈ 1.0f0 atol=1.0f-6
+            @test only(n([5.0f0])) ≈ 0.0f0 atol=1.0f-6
             x = Float32[0.0, 3.0, 7.0, 10.0]
-            @test all(isapprox.(inverse_data(n, n(x)), x; atol=1f-6))
+            @test all(isapprox.(inverse_data(n, n(x)), x; atol=1.0f-6))
         end
 
         @testset "A4: NormaliserOfflineMeanStd mean→0, mean±std→±1" begin
             n = NormaliserOfflineMeanStd(2.0f0, 3.0f0, device)
-            @test only(n([2.0f0]))  ≈  0.0f0 atol=1f-6   # mean → 0
-            @test only(n([5.0f0]))  ≈  1.0f0 atol=1f-6   # mean + std → +1
-            @test only(n([-1.0f0])) ≈ -1.0f0 atol=1f-6   # mean - std → -1
+            @test only(n([2.0f0])) ≈ 0.0f0 atol=1.0f-6   # mean → 0
+            @test only(n([5.0f0])) ≈ 1.0f0 atol=1.0f-6   # mean + std → +1
+            @test only(n([-1.0f0])) ≈ -1.0f0 atol=1.0f-6   # mean - std → -1
         end
 
         @testset "A5: NormaliserOfflineMeanStd inverse_data is exact left-inverse" begin
             n = NormaliserOfflineMeanStd(2.0f0, 3.0f0, device)
             x = Float32[-5.0, -1.0, 2.0, 5.0, 8.0]
-            @test all(isapprox.(inverse_data(n, n(x)), x; atol=1f-6))
+            @test all(isapprox.(inverse_data(n, n(x)), x; atol=1.0f-6))
         end
 
         @testset "A6: std_epsilon prevents div-by-zero when std=0" begin
             n = NormaliserOfflineMeanStd(1.0f0, 0.0f0, device)
             result = n([1.0f0])
             @test all(isfinite, result)
-            @test only(result) ≈ 0.0f0 atol=1f-6        # (1 - 1) / eps ≈ 0
-            @test only(inverse_data(n, result)) ≈ 1.0f0 atol=1f-5
+            @test only(result) ≈ 0.0f0 atol=1.0f-6        # (1 - 1) / eps ≈ 0
+            @test only(inverse_data(n, result)) ≈ 1.0f0 atol=1.0f-5
         end
     end
 
@@ -85,7 +85,7 @@ device = cpu_device()
         @testset "B1: fresh normalizer has zero counters" begin
             n = NormaliserOnline(3, cpu_device())
             @test n.num_accumulations == 0.0f0
-            @test n.acc_count         == 0.0f0
+            @test n.acc_count == 0.0f0
             @test all(iszero, n.acc_sum)
             @test all(iszero, n.acc_sum_squared)
         end
@@ -93,8 +93,10 @@ device = cpu_device()
         @testset "B2: one call accumulates correct acc_count and acc_sum" begin
             n = NormaliserOnline(2, cpu_device(); max_acc=10.0f0)
             # Shape (2, 4): 2-dim feature, 4 samples
-            data = Float32[1.0 3.0 5.0 7.0;
-                           2.0 4.0 6.0 8.0]
+            data = Float32[
+                1.0 3.0 5.0 7.0;
+                2.0 4.0 6.0 8.0
+            ]
             n(data)
             @test n.num_accumulations ≈ 1.0f0
             @test n.acc_count ≈ 4.0f0
@@ -125,7 +127,7 @@ device = cpu_device()
             data = Float32[1.0 2.0; 3.0 4.0]
             n(data)
             count_before = n.num_accumulations
-            sum_before   = copy(n.acc_sum)
+            sum_before = copy(n.acc_sum)
             n(data, false)
             @test n.num_accumulations == count_before
             @test n.acc_sum == sum_before
@@ -134,15 +136,16 @@ device = cpu_device()
         @testset "B6: serialize/deserialize round-trip is lossless" begin
             n = NormaliserOnline(3, cpu_device(); max_acc=5.0f0)
             data = Float32[1.0 2.0 3.0; 4.0 5.0 6.0; 7.0 8.0 9.0]
-            n(data); n(data .* 2)
+            n(data);
+            n(data .* 2)
 
-            d  = GraphNetCore.serialize(n)
+            d = GraphNetCore.serialize(n)
             n2 = GraphNetCore.deserialize(d, cpu_device())
 
-            @test n2.max_accumulations  == n.max_accumulations
-            @test n2.num_accumulations  == n.num_accumulations
-            @test n2.acc_count          == n.acc_count
-            @test n2.acc_sum         == n.acc_sum
+            @test n2.max_accumulations == n.max_accumulations
+            @test n2.num_accumulations == n.num_accumulations
+            @test n2.acc_count == n.acc_count
+            @test n2.acc_sum == n.acc_sum
             @test n2.acc_sum_squared == n.acc_sum_squared
 
             # Applying both to the same input should give identical output
@@ -161,7 +164,9 @@ device = cpu_device()
             show_progress_bars=false,
             norm_steps=50,
             norm_type=:meanstd,
-            mps=2, layer_size=16, hidden_layers=1,
+            mps=2,
+            layer_size=16,
+            hidden_layers=1,
             training_strategy=DerivativeTraining(),
             solver_valid=OrdinaryDiffEq.Tsit5(),
             solver_valid_dt=0.002f0,
@@ -171,9 +176,9 @@ device = cpu_device()
         )
         ds = GraphNetSim.Dataset(:train, NORM_DATA_PATH, args)
         ds.meta["types_updated"] = args.types_updated
-        ds.meta["types_noisy"]   = args.types_noisy
+        ds.meta["types_noisy"] = args.types_noisy
         ds.meta["noise_stddevs"] = args.noise_stddevs
-        ds.meta["device"]        = cpu_device()
+        ds.meta["device"] = cpu_device()
         ds.meta["training_strategy"] = nothing
 
         _, e_norms, n_norms, o_norms = GraphNetSim.calc_norms(ds, cpu_device(), args)
@@ -208,14 +213,23 @@ device = cpu_device()
 
         @testset "C6: norm_type=:online forces NormaliserOnline" begin
             args_online = GraphNetSim.Args(;
-                use_cuda=false, show_progress_bars=false, norm_steps=50,
+                use_cuda=false,
+                show_progress_bars=false,
+                norm_steps=50,
                 norm_type=:online,
-                mps=2, layer_size=16, hidden_layers=1,
+                mps=2,
+                layer_size=16,
+                hidden_layers=1,
                 training_strategy=DerivativeTraining(),
-                solver_valid=OrdinaryDiffEq.Tsit5(), solver_valid_dt=0.002f0,
-                types_updated=[1], types_noisy=[1], noise_stddevs=[0.0f0],
+                solver_valid=OrdinaryDiffEq.Tsit5(),
+                solver_valid_dt=0.002f0,
+                types_updated=[1],
+                types_noisy=[1],
+                noise_stddevs=[0.0f0],
             )
-            _, _, n_norms_ol, o_norms_ol = GraphNetSim.calc_norms(ds, cpu_device(), args_online)
+            _, _, n_norms_ol, o_norms_ol = GraphNetSim.calc_norms(
+                ds, cpu_device(), args_online
+            )
             @test n_norms_ol["velocity"] isa NormaliserOnline
             @test o_norms_ol["acceleration"] isa NormaliserOnline
         end
@@ -227,12 +241,19 @@ device = cpu_device()
 
         @testset "C8: norm_type=:minmax errors on missing stats" begin
             args_mm = GraphNetSim.Args(;
-                use_cuda=false, show_progress_bars=false, norm_steps=50,
+                use_cuda=false,
+                show_progress_bars=false,
+                norm_steps=50,
                 norm_type=:minmax,
-                mps=2, layer_size=16, hidden_layers=1,
+                mps=2,
+                layer_size=16,
+                hidden_layers=1,
                 training_strategy=DerivativeTraining(),
-                solver_valid=OrdinaryDiffEq.Tsit5(), solver_valid_dt=0.002f0,
-                types_updated=[1], types_noisy=[1], noise_stddevs=[0.0f0],
+                solver_valid=OrdinaryDiffEq.Tsit5(),
+                solver_valid_dt=0.002f0,
+                types_updated=[1],
+                types_noisy=[1],
+                noise_stddevs=[0.0f0],
             )
             @test_throws ArgumentError GraphNetSim.calc_norms(ds, cpu_device(), args_mm)
         end
@@ -248,7 +269,9 @@ device = cpu_device()
             show_progress_bars=false,
             norm_steps=20,
             norm_type=:meanstd,
-            mps=2, layer_size=16, hidden_layers=1,
+            mps=2,
+            layer_size=16,
+            hidden_layers=1,
             training_strategy=DerivativeTraining(),
             solver_valid=OrdinaryDiffEq.Tsit5(),
             solver_valid_dt=0.002f0,
@@ -258,15 +281,15 @@ device = cpu_device()
         )
         ds = GraphNetSim.Dataset(:train, NORM_DATA_PATH, args)
         ds.meta["types_updated"] = args.types_updated
-        ds.meta["types_noisy"]   = args.types_noisy
+        ds.meta["types_noisy"] = args.types_noisy
         ds.meta["noise_stddevs"] = args.noise_stddevs
-        ds.meta["device"]        = cpu_device()
+        ds.meta["device"] = cpu_device()
         ds.meta["training_strategy"] = nothing
 
         _, e_norms, n_norms, o_norms = GraphNetSim.calc_norms(ds, cpu_device(), args)
 
         traj = MLUtils.getobs(ds, 1)
-        vel  = traj["velocity"][:, :, 5]     # (3, 10) at timestep 5
+        vel = traj["velocity"][:, :, 5]     # (3, 10) at timestep 5
 
         @testset "D1: e_norm accumulates when called with default acc=true" begin
             n_before = e_norms.num_accumulations
@@ -305,7 +328,9 @@ device = cpu_device()
             show_progress_bars=false,
             norm_steps=0,
             norm_type=:meanstd,
-            mps=2, layer_size=16, hidden_layers=1,
+            mps=2,
+            layer_size=16,
+            hidden_layers=1,
             training_strategy=DerivativeTraining(),
             solver_valid=OrdinaryDiffEq.Tsit5(),
             solver_valid_dt=0.002f0,
@@ -315,13 +340,13 @@ device = cpu_device()
         )
         ds = GraphNetSim.Dataset(:train, NORM_DATA_PATH, args)
         ds.meta["types_updated"] = args.types_updated
-        ds.meta["types_noisy"]   = args.types_noisy
+        ds.meta["types_noisy"] = args.types_noisy
         ds.meta["noise_stddevs"] = args.noise_stddevs
-        ds.meta["device"]        = cpu_device()
+        ds.meta["device"] = cpu_device()
         ds.meta["training_strategy"] = DerivativeTraining()
 
         _, _, _, o_norms = GraphNetSim.calc_norms(ds, cpu_device(), args)
-        traj   = MLUtils.getobs(ds, 1)
+        traj = MLUtils.getobs(ds, 1)
         target = traj["target|acceleration"][:, :, 5]   # (3, 10) at timestep 5
 
         @testset "E1: o_norm[acceleration] changes value (not identity)" begin
@@ -331,14 +356,14 @@ device = cpu_device()
         end
 
         @testset "E2: inverse_data recovers original target within atol=1f-5" begin
-            normed    = o_norms["acceleration"](target)
+            normed = o_norms["acceleration"](target)
             recovered = inverse_data(o_norms["acceleration"], normed)
-            @test all(isapprox.(recovered, target; atol=1f-5))
+            @test all(isapprox.(recovered, target; atol=1.0f-5))
         end
 
         @testset "E3: double-normalization is NOT identity" begin
             # Applying the normalizer twice does not recover the original
-            normed_once  = o_norms["acceleration"](target)
+            normed_once = o_norms["acceleration"](target)
             normed_twice = o_norms["acceleration"](normed_once)
             @test !all(isapprox.(normed_twice, target; atol=5.0f0))
         end
@@ -372,9 +397,7 @@ device = cpu_device()
                 checkpoint=20,
             )
 
-            cp_files = sort(filter(
-                f -> endswith(f, ".jld2"), readdir(cp_path; join=true)
-            ))
+            cp_files = sort(filter(f -> endswith(f, ".jld2"), readdir(cp_path; join=true)))
             @assert !isempty(cp_files) "No checkpoint files found in $cp_path"
 
             @testset "F1: checkpoint contains e_norm, n_norm, o_norm keys" begin
@@ -407,5 +430,4 @@ device = cpu_device()
             end
         end
     end
-
 end

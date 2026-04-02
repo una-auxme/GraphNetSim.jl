@@ -172,15 +172,16 @@ for cfg in CONFIGS
                 ds.meta["training_strategy"] = nothing
                 traj = MLUtils.getobs(ds, 1)
 
-                @test size(traj["position"])     == (cfg.dims, cfg.n_particles, cfg.traj_length)
-                @test size(traj["velocity"])     == (cfg.dims, cfg.n_particles, cfg.traj_length)
-                @test size(traj["acceleration"]) == (cfg.dims, cfg.n_particles, cfg.traj_length)
-                @test size(traj["node_type"])    == (1, cfg.n_particles, 1)
-                @test eltype(traj["position"])   == Float32
-                @test eltype(traj["velocity"])   == Float32
-                @test eltype(traj["node_type"])  == Int32
-                @test traj["n_particles"]        == cfg.n_particles
-                @test traj["trajectory_length"]  == cfg.traj_length
+                @test size(traj["position"]) == (cfg.dims, cfg.n_particles, cfg.traj_length)
+                @test size(traj["velocity"]) == (cfg.dims, cfg.n_particles, cfg.traj_length)
+                @test size(traj["acceleration"]) ==
+                    (cfg.dims, cfg.n_particles, cfg.traj_length)
+                @test size(traj["node_type"]) == (1, cfg.n_particles, 1)
+                @test eltype(traj["position"]) == Float32
+                @test eltype(traj["velocity"]) == Float32
+                @test eltype(traj["node_type"]) == Int32
+                @test traj["n_particles"] == cfg.n_particles
+                @test traj["trajectory_length"] == cfg.traj_length
             end
 
             @testset "A4: mask includes correct particles" begin
@@ -247,8 +248,7 @@ for cfg in CONFIGS
 
             @testset "C2: PointNeighbors finds neighbors" begin
                 nhs = GridNeighborhoodSearch{size(pos, 1)}(;
-                    search_radius=cr,
-                    n_points=size(pos, 2),
+                    search_radius=cr, n_points=size(pos, 2)
                 )
                 initialize!(nhs, pos, pos)
                 n_edges = Ref(0)
@@ -278,12 +278,8 @@ for cfg in CONFIGS
 
             @testset "D3: batchTrajectory" begin
                 batch_steps = 20
-                bs = BatchingStrategy(
-                    0.0f0, cfg.dt * batch_steps, Euler(), batch_steps
-                )
-                data = Dict{String,Any}(
-                    "dt" => cfg.dt, "trajectory_length" => tl
-                )
+                bs = BatchingStrategy(0.0f0, cfg.dt * batch_steps, Euler(), batch_steps)
+                data = Dict{String,Any}("dt" => cfg.dt, "trajectory_length" => tl)
                 batches = batchTrajectory(bs, data)
                 expected_min = div(tl - 1, batch_steps)
                 @test length(batches) >= expected_min
@@ -350,9 +346,7 @@ for cfg in CONFIGS
                     cfg.path,
                     cp_path;
                     make_train_kwargs(cfg)...,
-                    training_strategy=SingleShooting(
-                        0.0f0, cfg.dt, tstop, Tsit5(),
-                    ),
+                    training_strategy=SingleShooting(0.0f0, cfg.dt, tstop, Tsit5()),
                     steps=3,
                     checkpoint=3,
                 )
@@ -375,9 +369,7 @@ for cfg in CONFIGS
                     cfg.path,
                     cp_path;
                     make_train_kwargs(cfg)...,
-                    training_strategy=MultipleShooting(
-                        0.0f0, cfg.dt, tstop, Tsit5(), 5,
-                    ),
+                    training_strategy=MultipleShooting(0.0f0, cfg.dt, tstop, Tsit5(), 5),
                     steps=3,
                     checkpoint=3,
                 )
@@ -436,9 +428,7 @@ for cfg in CONFIGS
             println("Running: I — Two-arg Dataset constructor bug ($(cfg.name))")
             args = make_args(cfg)
             @test_throws ArgumentError GraphNetSim.Dataset(
-                joinpath(cfg.path, "train.h5"),
-                joinpath(cfg.path, "meta.json"),
-                args,
+                joinpath(cfg.path, "train.h5"), joinpath(cfg.path, "meta.json"), args
             )
         end
 
@@ -477,40 +467,35 @@ for cfg in CONFIGS
                     @test isfile(cfg_path)
 
                     d = JSON.parsefile(cfg_path)
-                    @test d["architecture"]["mps"]           == 2
-                    @test d["architecture"]["layer_size"]    == 32
+                    @test d["architecture"]["mps"] == 2
+                    @test d["architecture"]["layer_size"] == 32
                     @test d["architecture"]["hidden_layers"] == 1
-                    @test d["training"]["norm_steps"]        == 0
-                    @test d["training"]["types_updated"]     == cfg.types_updated
+                    @test d["training"]["norm_steps"] == 0
+                    @test d["training"]["types_updated"] == cfg.types_updated
                 end
 
                 @testset "J2: load_model_config round-trip" begin
                     mc = load_model_config(cp_path)
                     @test !isnothing(mc)
-                    @test mc.mps           == 2
-                    @test mc.layer_size    == 32
+                    @test mc.mps == 2
+                    @test mc.layer_size == 32
                     @test mc.hidden_layers == 1
-                    @test mc.norm_steps    == 0
+                    @test mc.norm_steps == 0
                     @test mc.noise_stddevs == Float32[3.0f-7]
                 end
 
                 @testset "J3: Phase 2 without arch params" begin
-                    train_network(
-                        Adam(1.0f-6),
-                        cfg.path,
-                        cp_path;
-                        j_base...,
-                    )
+                    train_network(Adam(1.0f-6), cfg.path, cp_path; j_base...)
                     mc = load_model_config(cp_path)
-                    @test mc.mps           == 2
-                    @test mc.layer_size    == 32
+                    @test mc.mps == 2
+                    @test mc.layer_size == 32
                     @test mc.hidden_layers == 1
                 end
 
                 @testset "J4: eval_network without arch params" begin
                     tstart = 0.0f0
-                    tstop  = cfg.dt * 10
-                    saves  = collect(tstart:cfg.dt:tstop)
+                    tstop = cfg.dt * 10
+                    saves = collect(tstart:cfg.dt:tstop)
                     eval_path = mktempdir()
                     eval_network(
                         cfg.path,
@@ -556,7 +541,7 @@ for cfg in CONFIGS
             end
 
             lr_start = 1.0f-4
-            lr_stop  = 1.0f-6
+            lr_stop = 1.0f-6
 
             @testset "K1: step=0 → lr_start" begin
                 @test gns_decay_lr(0, lr_start, lr_stop) ≈ lr_start atol = 1.0f-8
@@ -613,6 +598,5 @@ for cfg in CONFIGS
                 end
             end
         end
-
     end  # @testset cfg.name
 end  # for cfg

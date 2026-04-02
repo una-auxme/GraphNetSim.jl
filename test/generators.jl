@@ -28,22 +28,22 @@ module _GenBallistic
 using HDF5, JSON, Statistics, Random
 
 const N_PARTICLES = 10
-const T_LENGTH    = 67
-const DT          = 0.002f0
-const G           = 9.81f0
-const GAMMA       = 0.5f0
-const CR          = 0.00004f0
+const T_LENGTH = 67
+const DT = 0.002f0
+const G = 9.81f0
+const GAMMA = 0.5f0
+const CR = 0.00004f0
 
 const N_TRAIN = 5
 const N_VALID = 2
-const N_TEST  = 2
+const N_TEST = 2
 
 function simulate(seed::Int)
     rng = MersenneTwister(seed)
 
-    cx  = randn(rng, Float32) * 0.10f0
-    cy  = randn(rng, Float32) * 0.05f0
-    cz  = randn(rng, Float32) * 0.05f0
+    cx = randn(rng, Float32) * 0.10f0
+    cy = randn(rng, Float32) * 0.05f0
+    cz = randn(rng, Float32) * 0.05f0
     cvx = 5.0f0 + randn(rng, Float32) * 2.0f0
     cvy = randn(rng, Float32) * 1.0f0
     cvz = randn(rng, Float32) * 1.0f0
@@ -106,9 +106,9 @@ function compute_stats(seeds::Vector{Int})
     for seed in seeds
         pos, vel, acc = simulate(seed)
         n = N_PARTICLES * T_LENGTH
-        all_pos[:, offset+1:offset+n] = reshape(pos, 3, :)
-        all_vel[:, offset+1:offset+n] = reshape(vel, 3, :)
-        all_acc[:, offset+1:offset+n] = reshape(acc, 3, :)
+        all_pos[:, (offset + 1):(offset + n)] = reshape(pos, 3, :)
+        all_vel[:, (offset + 1):(offset + n)] = reshape(vel, 3, :)
+        all_acc[:, (offset + 1):(offset + n)] = reshape(acc, 3, :)
         offset += n
     end
 
@@ -125,8 +125,8 @@ end
 function generate(outdir::String)
     mkpath(outdir)
     train_seeds = collect(1:N_TRAIN)
-    valid_seeds = collect(100:100:N_VALID * 100)
-    test_seeds = collect(200:100:N_TEST * 100)
+    valid_seeds = collect(100:100:(N_VALID * 100))
+    test_seeds = collect(200:100:(N_TEST * 100))
 
     write_split(joinpath(outdir, "train.h5"), train_seeds)
     write_split(joinpath(outdir, "valid.h5"), valid_seeds)
@@ -151,24 +151,34 @@ function generate(outdir::String)
         "solver_target_features" => ["position"],
         "features" => Dict(
             "node_type" => Dict(
-                "type" => "static", "key" => "type", "dim" => 1,
-                "dtype" => "int32", "onehot" => true,
-                "data_min" => 1, "data_max" => 1,
+                "type" => "static",
+                "key" => "type",
+                "dim" => 1,
+                "dtype" => "int32",
+                "onehot" => true,
+                "data_min" => 1,
+                "data_max" => 1,
             ),
             "position" => Dict(
-                "key" => "pos[\$t]", "dim" => 3, "dtype" => "float32",
+                "key" => "pos[\$t]",
+                "dim" => 3,
+                "dtype" => "float32",
                 "type" => "dynamic",
                 "data_mean" => round.(Float64.(s.pos_mean); digits=6),
                 "data_std" => round.(Float64.(s.pos_std); digits=6),
             ),
             "velocity" => Dict(
-                "key" => "vel[\$t]", "dim" => 3, "dtype" => "float32",
+                "key" => "vel[\$t]",
+                "dim" => 3,
+                "dtype" => "float32",
                 "type" => "dynamic",
                 "data_mean" => round.(Float64.(s.vel_mean); digits=6),
                 "data_std" => round.(Float64.(s.vel_std); digits=6),
             ),
             "acceleration" => Dict(
-                "key" => "acc[\$t]", "dim" => 3, "dtype" => "float32",
+                "key" => "acc[\$t]",
+                "dim" => 3,
+                "dtype" => "float32",
                 "type" => "dynamic",
                 "data_mean" => round.(Float64.(s.acc_mean); digits=6),
                 "data_std" => round.(Float64.(s.acc_std); digits=6),
@@ -190,32 +200,32 @@ module _GenDamBreak
 
 using HDF5, JSON, Statistics, LinearAlgebra, Random
 
-const DP     = 0.03f0
-const H_SPH  = 1.2f0 * DP
-const CR     = 2.0f0 * H_SPH
-const RHO0   = 1000.0f0
+const DP = 0.03f0
+const H_SPH = 1.2f0 * DP
+const CR = 2.0f0 * H_SPH
+const RHO0 = 1000.0f0
 const G_GRAV = 9.81f0
-const ALPHA  = 0.1f0
-const C_SND  = 10.0f0 * sqrt(2.0f0 * G_GRAV * 3.0f0 * DP)
-const B_EOS  = RHO0 * C_SND^2 / 7.0f0
+const ALPHA = 0.1f0
+const C_SND = 10.0f0 * sqrt(2.0f0 * G_GRAV * 3.0f0 * DP)
+const B_EOS = RHO0 * C_SND^2 / 7.0f0
 const PART_M = RHO0 * DP^2
 
-const DT       = 0.001f0
+const DT = 0.001f0
 const T_LENGTH = 150
 
 const N_TRAIN = 4
 const N_VALID = 2
-const N_TEST  = 2
+const N_TEST = 2
 
 const NX_FLOOR = 11
-const NY_WALL  = 4
+const NY_WALL = 4
 const N_LAYERS = 2
-const N_FLOOR  = NX_FLOOR * N_LAYERS        # 22
-const N_LWALL  = N_LAYERS * NY_WALL          # 8
-const N_RWALL  = N_LAYERS * NY_WALL          # 8
-const N_BND    = N_FLOOR + N_LWALL + N_RWALL # 38
-const N_FLD    = 9
-const N_TOT    = N_BND + N_FLD               # 47
+const N_FLOOR = NX_FLOOR * N_LAYERS        # 22
+const N_LWALL = N_LAYERS * NY_WALL          # 8
+const N_RWALL = N_LAYERS * NY_WALL          # 8
+const N_BND = N_FLOOR + N_LWALL + N_RWALL # 38
+const N_FLD = 9
+const N_TOT = N_BND + N_FLD               # 47
 
 function W_kernel(r::Float32, h::Float32)::Float32
     q = r / h
@@ -395,9 +405,9 @@ function compute_stats(seeds::Vector{Int})
     for seed in seeds
         pos, vel, acc, _ = simulate(seed)
         m = N_TOT * T_LENGTH
-        all_pos[:, offset+1:offset+m] = reshape(pos, 2, :)
-        all_vel[:, offset+1:offset+m] = reshape(vel, 2, :)
-        all_acc[:, offset+1:offset+m] = reshape(acc, 2, :)
+        all_pos[:, (offset + 1):(offset + m)] = reshape(pos, 2, :)
+        all_vel[:, (offset + 1):(offset + m)] = reshape(vel, 2, :)
+        all_acc[:, (offset + 1):(offset + m)] = reshape(acc, 2, :)
         offset += m
     end
     return (
@@ -425,8 +435,10 @@ function generate(outdir::String)
     meta = Dict(
         "dt" => "dt",
         "n_particles" => "n_particles",
-        "bounds" => [[0, Float64(NX_FLOOR - 1) * Float64(DP)],
-                      [0, Float64(NY_WALL + 1) * Float64(DP)]],
+        "bounds" => [
+            [0, Float64(NX_FLOOR - 1) * Float64(DP)],
+            [0, Float64(NY_WALL + 1) * Float64(DP)],
+        ],
         "trajectory_length" => T_LENGTH,
         "n_trajectories" => N_TRAIN,
         "default_connectivity_radius" => Float64(CR),
@@ -440,24 +452,34 @@ function generate(outdir::String)
         "solver_target_features" => ["position"],
         "features" => Dict(
             "node_type" => Dict(
-                "type" => "static", "key" => "type", "dim" => 1,
-                "dtype" => "int32", "onehot" => true,
-                "data_min" => 1, "data_max" => 2,
+                "type" => "static",
+                "key" => "type",
+                "dim" => 1,
+                "dtype" => "int32",
+                "onehot" => true,
+                "data_min" => 1,
+                "data_max" => 2,
             ),
             "position" => Dict(
-                "key" => "pos[\$t]", "dim" => 2, "dtype" => "float32",
+                "key" => "pos[\$t]",
+                "dim" => 2,
+                "dtype" => "float32",
                 "type" => "dynamic",
                 "data_mean" => round.(Float64.(s.pos_mean); digits=6),
                 "data_std" => round.(Float64.(s.pos_std); digits=6),
             ),
             "velocity" => Dict(
-                "key" => "vel[\$t]", "dim" => 2, "dtype" => "float32",
+                "key" => "vel[\$t]",
+                "dim" => 2,
+                "dtype" => "float32",
                 "type" => "dynamic",
                 "data_mean" => round.(Float64.(s.vel_mean); digits=6),
                 "data_std" => round.(Float64.(s.vel_std); digits=6),
             ),
             "acceleration" => Dict(
-                "key" => "acc[\$t]", "dim" => 2, "dtype" => "float32",
+                "key" => "acc[\$t]",
+                "dim" => 2,
+                "dtype" => "float32",
                 "type" => "dynamic",
                 "data_mean" => round.(Float64.(s.acc_mean); digits=6),
                 "data_std" => round.(Float64.(s.acc_std); digits=6),

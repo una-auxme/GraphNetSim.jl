@@ -210,9 +210,9 @@ function validate_type_args(meta::Dict{String,Any})
     unknown_noisy = filter(t -> t ∉ valid_types, meta["types_noisy"])
     if !isempty(unknown_noisy)
         @warn "types_noisy contains type(s) $unknown_noisy not present in the dataset " *
-              "(valid types: $(collect(valid_types))). " *
-              "No noise will be applied. If this is intentional (e.g. types_noisy=[0] " *
-              "as a 'no noise' sentinel), you can ignore this warning."
+            "(valid types: $(collect(valid_types))). " *
+            "No noise will be applied. If this is intentional (e.g. types_noisy=[0] " *
+            "as a 'no noise' sentinel), you can ignore this warning."
     end
 end
 

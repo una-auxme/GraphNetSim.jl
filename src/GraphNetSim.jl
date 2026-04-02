@@ -630,7 +630,7 @@ function train_gns!(
                                     (
                                         args.optimizer_learning_rate_start -
                                         args.optimizer_learning_rate_stop
-                                    ) * 0.1^((step + datapoint) / 5f6),
+                                    ) * 0.1^((step + datapoint) / 5.0f6),
                                 ),
                             ) # Learn rate decay from GNS paper
                         end

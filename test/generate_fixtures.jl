@@ -11,8 +11,7 @@ include(joinpath(@__DIR__, "generators.jl"))
 const FIXTURE_DIR = joinpath(@__DIR__, "fixtures")
 
 for (name, gen_fn) in [
-    ("ballistic_small", _GenBallistic.generate),
-    ("dam_break_small", _GenDamBreak.generate),
+    ("ballistic_small", _GenBallistic.generate), ("dam_break_small", _GenDamBreak.generate)
 ]
     ds_dir = joinpath(FIXTURE_DIR, name)
     if _needs_generation(ds_dir)

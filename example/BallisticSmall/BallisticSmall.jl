@@ -25,17 +25,17 @@ end
 # Network parameters #
 ######################
 
-message_steps   = 5
-layer_size      = 64
-hidden_layers   = 2
-batch           = 1
-epo             = 1
-nder            = 40000   # derivative training steps
-ns              = 500 + nder  # total steps incl. batching fine-tune
-norm_steps      = 20      # small: only 5 train trajectories × ~67 steps each
-cuda            = true
-cp_derivative   = 2000
-cp_solver       = 100
+message_steps = 5
+layer_size = 64
+hidden_layers = 2
+batch = 1
+epo = 1
+nder = 40000   # derivative training steps
+ns = 500 + nder  # total steps incl. batching fine-tune
+norm_steps = 20      # small: only 5 train trajectories × ~67 steps each
+cuda = true
+cp_derivative = 2000
+cp_solver = 100
 
 ########################
 # Node type parameters #
@@ -43,13 +43,13 @@ cp_solver       = 100
 
 noise_stddevs = [3.0f-7]
 types_updated = [1]   # only fluid particles (no boundary in this dataset)
-types_noisy   = [1]
+types_noisy = [1]
 
 ########################
 # Optimiser parameters #
 ########################
 
-learning_rate_start  = 1.0f-4
+learning_rate_start = 1.0f-4
 learning_rate_finish = 1.0f-6
 opt = Adam(learning_rate_start)
 
@@ -58,8 +58,8 @@ opt = Adam(learning_rate_start)
 #######################
 
 tstart = 0.0f0
-dt     = 0.002f0
-tstop  = 0.132f0   # (T_LENGTH - 1) * dt = 66 * 0.002
+dt = 0.002f0
+tstop = 0.132f0   # (T_LENGTH - 1) * dt = 66 * 0.002
 
 stepsPerTrajectory = 66   # covers the full trajectory in one batch
 
@@ -70,19 +70,29 @@ mse_steps = tstart:dt:tstop
 # Paths to data folders #
 #########################
 
-ds_path  = "data/ballistic_small"
+ds_path = "data/ballistic_small"
 chk_path = "data/ballistic_small/checkpoints"
 eval_path = "data/ballistic_small/eval"
 
-data_minmax(ds_path; types_updated=types_updated, types_noisy=types_noisy, noise_stddevs=noise_stddevs)
-data_meanstd(ds_path; types_updated=types_updated, types_noisy=types_noisy, noise_stddevs=noise_stddevs)
+data_minmax(
+    ds_path;
+    types_updated=types_updated,
+    types_noisy=types_noisy,
+    noise_stddevs=noise_stddevs,
+)
+data_meanstd(
+    ds_path;
+    types_updated=types_updated,
+    types_noisy=types_noisy,
+    noise_stddevs=noise_stddevs,
+)
 
 ###########
 # Solvers #
 ###########
 
 solver_train = Tsit5()
-solver_eval  = Tsit5()
+solver_eval = Tsit5()
 
 #################
 # Train network #
@@ -117,7 +127,7 @@ train_network(
 
 # Phase 2: BatchingStrategy fine-tuning (ODE-based loss, lower learning rate)
 
-learning_rate_start  = 1.0f-6
+learning_rate_start = 1.0f-6
 learning_rate_finish = nothing
 opt = Adam(learning_rate_start)
 

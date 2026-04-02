@@ -226,38 +226,21 @@ prepares ground truth data for ODE problem setup.
 """
 function init_train_step(strategy::SolverStrategy, t::Tuple)
     gns,
-    data,
-    meta,
-    output_fields,
-    target_fields,
-    node_type,
-    mask,
-    val_mask,
-    device,
-    _,
-    _,
+    data, meta, output_fields, target_fields, node_type, mask, val_mask, device, _, _,
     show_progress_bars = t
 
-    initial_state = Dict("position" => data["position"][:, :, 1],
-        "velocity" => data["velocity"][:, :, 1],)
+    initial_state = Dict(
+        "position" => data["position"][:, :, 1], "velocity" => data["velocity"][:, :, 1]
+    )
 
     x0 = initial_state["position"]
     dx0 = initial_state["velocity"]
 
     u0 = device(ComponentArray(; x=initial_state["position"], dx=initial_state["velocity"]))
-    gt = vcat([data[tf][:,mask,:] for tf in target_fields]...)
+    gt = vcat([data[tf][:, mask, :] for tf in target_fields]...)
 
     return (
-        gns,
-        meta,
-        output_fields,
-        target_fields,
-        node_type,
-        mask,
-        val_mask,
-        u0,
-        gt,
-        device,
+        gns, meta, output_fields, target_fields, node_type, mask, val_mask, u0, gt, device
     )
 end
 
@@ -884,26 +867,31 @@ end
 
 function init_train_step(::MultipleShooting, t::Tuple)
     gns,
-    data,
-    meta,
-    output_fields,
-    target_fields,
-    node_type,
-    mask,
-    val_mask,
-    device,
-    _,
-    _,
+    data, meta, output_fields, target_fields, node_type, mask, val_mask, device, _, _,
     _ = t
 
     u0 = device(ComponentArray(; x=data["position"][:, :, 1], dx=data["velocity"][:, :, 1]))
     gt = vcat([data[tf][:, mask, :] for tf in target_fields]...)
 
-    return (gns, data, meta, output_fields, target_fields, node_type, mask, val_mask, u0, gt, device)
+    return (
+        gns,
+        data,
+        meta,
+        output_fields,
+        target_fields,
+        node_type,
+        mask,
+        val_mask,
+        u0,
+        gt,
+        device,
+    )
 end
 
 function train_step(strategy::MultipleShooting, t::Tuple)
-    gns, data, meta, output_fields, target_fields, node_type, mask, val_mask, u0, gt, device = t
+    gns,
+    data, meta, output_fields, target_fields, node_type, mask, val_mask, u0, gt,
+    device = t
 
     pr = ProgressUnknown(; desc="Solver progress: ", showspeed=true)
     print("\n\n\n\n\n\n\n\n")
@@ -911,14 +899,24 @@ function train_step(strategy::MultipleShooting, t::Tuple)
     ff = ODEFunction{false}(
         (x, ps, t) -> ode_func_train(
             x,
-            (gns, ps, output_fields, meta, target_fields, node_type, pr, mask, val_mask, device),
+            (
+                gns,
+                ps,
+                output_fields,
+                meta,
+                target_fields,
+                node_type,
+                pr,
+                mask,
+                val_mask,
+                device,
+            ),
             t,
         ),
     )
     prob = ODEProblem(ff, u0, (strategy.tstart, strategy.tstop), gns.ps)
     shoot_loss, shoot_gs = Zygote.withgradient(
-        ps -> train_loss(strategy, (prob, ps, data, gt, mask, device)),
-        gns.ps,
+        ps -> train_loss(strategy, (prob, ps, data, gt, mask, device)), gns.ps
     )
     return shoot_gs, shoot_loss
 end
@@ -950,10 +948,12 @@ function train_loss(strategy::MultipleShooting, t::Tuple)
                 prob;
                 p=ps,
                 tspan=(tsteps[first(rg)], tsteps[last(rg)]),
-                u0=device(ComponentArray(;
-                    x=data["position"][:, :, first(rg)],
-                    dx=data["velocity"][:, :, first(rg)],
-                )),
+                u0=device(
+                    ComponentArray(;
+                        x=data["position"][:, :, first(rg)],
+                        dx=data["velocity"][:, :, first(rg)],
+                    ),
+                ),
             ),
             strategy.solver;
             saveat=tsteps[rg],
@@ -967,10 +967,7 @@ function train_loss(strategy::MultipleShooting, t::Tuple)
         return Inf
     end
 
-    group_predictions = [
-        cat([u.x for u in sol.u]...; dims=3)[:, mask, :]
-        for sol in sols
-    ]
+    group_predictions = [cat([u.x for u in sol.u]...; dims=3)[:, mask, :] for sol in sols]
 
     loss = 0
     for (i, rg) in enumerate(ranges)
