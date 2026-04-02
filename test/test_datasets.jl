@@ -85,7 +85,7 @@ const CONFIGS = [
         0.001f0, # dt
         [(:train, 4), (:valid, 2), (:test, 1)],
         [2],     # types_updated
-        [0],     # types_noisy
+        [2],     # types_noisy
         [0.0f0], # noise_stddevs
         Euler(),
         0.001f0, # solver_valid_dt

@@ -66,7 +66,7 @@ function der_minmax(path)
 end
 
 """
-    data_minmax(path)
+    data_minmax(path; kws...)
 
 Calculates the minimum and maximum values for each numeric feature across all dataset partitions.
 
@@ -76,11 +76,15 @@ for all numeric features (Int32 and Float32 types).
 ## Arguments
 - `path`: Path to the dataset files.
 
+## Keyword Arguments
+All keyword arguments are forwarded to [`Args`](@ref) to configure dataset loading
+(e.g. `types_updated`, `types_noisy`, `noise_stddevs`).
+
 ## Returns
 - `Dict`: Dictionary mapping feature names to [min, max] value pairs computed from all datasets.
 """
-function data_minmax(path)
-    args = Args()
+function data_minmax(path; kws...)
+    args = Args(; kws...)
     ds_train = Dataset(:train, path, args)
     ds_train.meta["types_updated"] = args.types_updated
     ds_train.meta["types_noisy"] = args.types_noisy
@@ -172,18 +176,22 @@ function data_minmax(path)
 end
 
 """
-    data_meanstd(path)
+    data_meanstd(path; kws...)
 
 Calculates the mean and standard deviation for each feature in the given part of the dataset.
 
 ## Arguments
 - `path`: Path to the dataset files.
 
+## Keyword Arguments
+All keyword arguments are forwarded to [`Args`](@ref) to configure dataset loading
+(e.g. `types_updated`, `types_noisy`, `noise_stddevs`).
+
 ## Returns
 - Mean and standard deviation in training, validation and test set
 """
-function data_meanstd(path)
-    args = Args()
+function data_meanstd(path; kws...)
+    args = Args(; kws...)
     ds_train = Dataset(:train, path, args)
     ds_train.meta["types_updated"] = args.types_updated
     ds_train.meta["types_noisy"] = args.types_noisy

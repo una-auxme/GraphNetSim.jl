@@ -15,6 +15,16 @@ using GraphNetSim
 import OrdinaryDiffEq: Euler, Tsit5
 import Optimisers: Adam
 
+# Generate dataset into data/dam_break_small if not already present
+include(joinpath(dirname(dirname(@__DIR__)), "test", "generators.jl"))
+let _gen_dir = joinpath(dirname(dirname(@__DIR__)), "data", "dam_break_small")
+    if _needs_generation(_gen_dir)
+        @info "Generating dataset: dam_break_small"
+        _GenDamBreak.generate(_gen_dir)
+        @info "  Done."
+    end
+end
+
 ######################
 # Network parameters #
 ######################
@@ -68,8 +78,8 @@ ds_path   = "data/dam_break_small"
 chk_path  = "data/dam_break_small/checkpoints"
 eval_path = "data/dam_break_small/eval"
 
-data_minmax(ds_path)
-data_meanstd(ds_path)
+data_minmax(ds_path; types_updated=types_updated, types_noisy=types_noisy, noise_stddevs=noise_stddevs)
+data_meanstd(ds_path; types_updated=types_updated, types_noisy=types_noisy, noise_stddevs=noise_stddevs)
 
 ###########
 # Solvers #

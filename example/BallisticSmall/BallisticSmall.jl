@@ -11,6 +11,16 @@ using GraphNetSim
 import OrdinaryDiffEq: Euler, Tsit5
 import Optimisers: Adam
 
+# Generate dataset into data/ballistic_small if not already present
+include(joinpath(dirname(dirname(@__DIR__)), "test", "generators.jl"))
+let _gen_dir = joinpath(dirname(dirname(@__DIR__)), "data", "ballistic_small")
+    if _needs_generation(_gen_dir)
+        @info "Generating dataset: ballistic_small"
+        _GenBallistic.generate(_gen_dir)
+        @info "  Done."
+    end
+end
+
 ######################
 # Network parameters #
 ######################
@@ -20,7 +30,7 @@ layer_size      = 64
 hidden_layers   = 2
 batch           = 1
 epo             = 1
-nder            = 10000   # derivative training steps
+nder            = 40000   # derivative training steps
 ns              = 500 + nder  # total steps incl. batching fine-tune
 norm_steps      = 20      # small: only 5 train trajectories × ~67 steps each
 cuda            = true
@@ -64,8 +74,8 @@ ds_path  = "data/ballistic_small"
 chk_path = "data/ballistic_small/checkpoints"
 eval_path = "data/ballistic_small/eval"
 
-data_minmax(ds_path)
-data_meanstd(ds_path)
+data_minmax(ds_path; types_updated=types_updated, types_noisy=types_noisy, noise_stddevs=noise_stddevs)
+data_meanstd(ds_path; types_updated=types_updated, types_noisy=types_noisy, noise_stddevs=noise_stddevs)
 
 ###########
 # Solvers #

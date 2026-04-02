@@ -166,7 +166,7 @@ device = cpu_device()
             solver_valid=OrdinaryDiffEq.Tsit5(),
             solver_valid_dt=0.002f0,
             types_updated=[1],
-            types_noisy=[0],
+            types_noisy=[1],
             noise_stddevs=[0.0f0],
         )
         ds = GraphNetSim.Dataset(:train, NORM_DATA_PATH, args)
@@ -213,7 +213,7 @@ device = cpu_device()
                 mps=2, layer_size=16, hidden_layers=1,
                 training_strategy=DerivativeTraining(),
                 solver_valid=OrdinaryDiffEq.Tsit5(), solver_valid_dt=0.002f0,
-                types_updated=[1], types_noisy=[0], noise_stddevs=[0.0f0],
+                types_updated=[1], types_noisy=[1], noise_stddevs=[0.0f0],
             )
             _, _, n_norms_ol, o_norms_ol = GraphNetSim.calc_norms(ds, cpu_device(), args_online)
             @test n_norms_ol["velocity"] isa NormaliserOnline
@@ -232,7 +232,7 @@ device = cpu_device()
                 mps=2, layer_size=16, hidden_layers=1,
                 training_strategy=DerivativeTraining(),
                 solver_valid=OrdinaryDiffEq.Tsit5(), solver_valid_dt=0.002f0,
-                types_updated=[1], types_noisy=[0], noise_stddevs=[0.0f0],
+                types_updated=[1], types_noisy=[1], noise_stddevs=[0.0f0],
             )
             @test_throws ArgumentError GraphNetSim.calc_norms(ds, cpu_device(), args_mm)
         end
@@ -253,7 +253,7 @@ device = cpu_device()
             solver_valid=OrdinaryDiffEq.Tsit5(),
             solver_valid_dt=0.002f0,
             types_updated=[1],
-            types_noisy=[0],
+            types_noisy=[1],
             noise_stddevs=[0.0f0],
         )
         ds = GraphNetSim.Dataset(:train, NORM_DATA_PATH, args)
@@ -310,7 +310,7 @@ device = cpu_device()
             solver_valid=OrdinaryDiffEq.Tsit5(),
             solver_valid_dt=0.002f0,
             types_updated=[1],
-            types_noisy=[0],
+            types_noisy=[1],
             noise_stddevs=[0.0f0],
         )
         ds = GraphNetSim.Dataset(:train, NORM_DATA_PATH, args)
@@ -365,7 +365,7 @@ device = cpu_device()
                 solver_valid=OrdinaryDiffEq.Tsit5(),
                 solver_valid_dt=0.002f0,
                 types_updated=[1],
-                types_noisy=[0],
+                types_noisy=[1],
                 noise_stddevs=[0.0f0],
                 steps=20,
                 norm_steps=10,
