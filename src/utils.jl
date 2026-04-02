@@ -17,8 +17,10 @@ Returns the number of distinct node types in the dataset.
 ## Returns
 - `Int`: `data_max - data_min + 1` for the `node_type` feature.
 """
-n_node_types(meta) =
-    meta["features"]["node_type"]["data_max"] - meta["features"]["node_type"]["data_min"] + 1
+function n_node_types(meta)
+    meta["features"]["node_type"]["data_max"] - meta["features"]["node_type"]["data_min"] +
+    1
+end
 
 """
     n_node_types(meta)
@@ -406,7 +408,7 @@ function update_meta!(path::String, norm_type::Symbol)
     if norm_type ∉ (:online, :minmax, :meanstd)
         throw(
             ArgumentError(
-                "Invalid norm_type=:$norm_type. Must be one of :online, :minmax, :meanstd.",
+                "Invalid norm_type=:$norm_type. Must be one of :online, :minmax, :meanstd."
             ),
         )
     end
