@@ -85,12 +85,12 @@ function build_graph(
     if device == cpu_device()
         cur_pos_cpu = cpu_device()(position)
         tree = KDTree(cur_pos_cpu; reorder=false)
-        receivers_list = device(inrange(
-            tree, cur_pos_cpu, Float32(meta["default_connectivity_radius"]), false
-        ))
-        senders = device(vcat(
-            [repeat([i], length(j)) for (i, j) in enumerate(receivers_list)]...
-        ))
+        receivers_list = device(
+            inrange(tree, cur_pos_cpu, Float32(meta["default_connectivity_radius"]), false)
+        )
+        senders = device(
+            vcat([repeat([i], length(j)) for (i, j) in enumerate(receivers_list)]...)
+        )
         receivers = vcat(receivers_list...)
         rel_displacement =
             (position[:, receivers] - position[:, senders]) ./

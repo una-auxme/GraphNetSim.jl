@@ -62,80 +62,114 @@ csv_to_hdf5("data/input.csv", "output.h5";
             extra_fields=[:Mass, :Pressure])
 ```
 """
-function csv_to_hdf5(source::String, output::String; 
-                     dt::Float64=0.01, 
-                     n_trajectories::Int=1,
-                     dims::Vector{Int}=[1, 2],
-                     groupby_col::Symbol=:Idp,
-                     interpolation_scheme::String="pchip",
-                     pos_col_prefix::String="Points",
-                     vel_col_prefix::String="Vel",
-                     type_col::Symbol=:Type,
-                     extra_fields::Vector{Symbol}=Symbol[])
-    
+function csv_to_hdf5(
+    source::String,
+    output::String;
+    dt::Float64=0.01,
+    n_trajectories::Int=1,
+    dims::Vector{Int}=[1, 2],
+    groupby_col::Symbol=:Idp,
+    interpolation_scheme::String="pchip",
+    pos_col_prefix::String="Points",
+    vel_col_prefix::String="Vel",
+    type_col::Symbol=:Type,
+    extra_fields::Vector{Symbol}=Symbol[],
+)
+
     # Validate inputs
-    all(d ∈ [1, 2, 3] for d in dims) || throw(ArgumentError("dims must contain values in [1, 2, 3]"))
+    all(d in [1, 2, 3] for d in dims) ||
+        throw(ArgumentError("dims must contain values in [1, 2, 3]"))
     length(dims) > 0 || throw(ArgumentError("dims must not be empty"))
-    
-    valid_schemes = ["central_diff", "forward_diff", "backward_diff", "from_pos", 
-                     "pchip", "linear", "quadratic", "cubic_spline", "quadratic_spline",
-                     "cubic_hermite", "lagrange", "akima"]
-    interpolation_scheme in valid_schemes ||
-        throw(ArgumentError("Invalid interpolation_scheme: $interpolation_scheme. Valid options: $valid_schemes"))
-    
+
+    valid_schemes = [
+        "central_diff",
+        "forward_diff",
+        "backward_diff",
+        "from_pos",
+        "pchip",
+        "linear",
+        "quadratic",
+        "cubic_spline",
+        "quadratic_spline",
+        "cubic_hermite",
+        "lagrange",
+        "akima",
+    ]
+    interpolation_scheme in valid_schemes || throw(
+        ArgumentError(
+            "Invalid interpolation_scheme: $interpolation_scheme. Valid options: $valid_schemes",
+        ),
+    )
+
     # Read CSV file
     data_df = DataFrame(CSV.File(source))
-    
+
     # Group by particle ID
     grp = groupby(data_df, groupby_col)
-    
+
     # Open HDF5 file for writing
     fid = h5open(output, "w")
-    
+
     try
-        for traj_id = 1:n_trajectories
+        for traj_id in 1:n_trajectories
             tra = "trajectory_$traj_id"
             create_group(fid, tra)
             fid["$tra/n_particles"] = length(grp)
             fid["$tra/dt"] = dt
-            
+
             # Store trajectory length and initialize arrays (determined from first particle)
             trajectory_length = 0
             position_arrays = nothing
             velocity_arrays = nothing
             acceleration_arrays = nothing
             particle_types = nothing
-            
+
             # Process each particle
             for (j, prtl) in enumerate(grp)
                 # Extract velocity data for selected dimensions
-                vel_data = [collect(prtl[!, Symbol("$vel_col_prefix:$(d-1)")]) for d in dims]
-                
+                vel_data = [
+                    collect(prtl[!, Symbol("$vel_col_prefix:$(d-1)")]) for d in dims
+                ]
+
                 # Extract position data for selected dimensions
-                pos_data = [collect(prtl[!, Symbol("$pos_col_prefix:$(d-1)")]) for d in dims]
-                
+                pos_data = [
+                    collect(prtl[!, Symbol("$pos_col_prefix:$(d-1)")]) for d in dims
+                ]
+
                 # Calculate acceleration based on selected scheme
-                acc_data = _calculate_acceleration(pos_data, vel_data, dt, interpolation_scheme)
-                
+                acc_data = _calculate_acceleration(
+                    pos_data, vel_data, dt, interpolation_scheme
+                )
+
                 # Get the slice indices for acceleration (may be shorter than input)
-                acc_slice = _get_acceleration_slice(length(vel_data[1]), interpolation_scheme)
-                
+                acc_slice = _get_acceleration_slice(
+                    length(vel_data[1]), interpolation_scheme
+                )
+
                 # Apply slice to all data arrays for consistency
                 pos_data_sliced = [pos_data[i][acc_slice] for i in 1:length(pos_data)]
                 vel_data_sliced = [vel_data[i][acc_slice] for i in 1:length(vel_data)]
-                acc_data_final = [acc_data[i][1:length(pos_data_sliced[1])] for i in 1:length(acc_data)]
-                
+                acc_data_final = [
+                    acc_data[i][1:length(pos_data_sliced[1])] for i in 1:length(acc_data)
+                ]
+
                 # Set trajectory length and initialize arrays from first particle
                 if j == 1
                     trajectory_length = length(pos_data_sliced[1])
                     n_dims = length(dims)
                     n_particles = length(grp)
-                    position_arrays = Array{Float32,3}(undef, n_dims, n_particles, trajectory_length)
-                    velocity_arrays = Array{Float32,3}(undef, n_dims, n_particles, trajectory_length)
-                    acceleration_arrays = Array{Float32,3}(undef, n_dims, n_particles, trajectory_length)
+                    position_arrays = Array{Float32,3}(
+                        undef, n_dims, n_particles, trajectory_length
+                    )
+                    velocity_arrays = Array{Float32,3}(
+                        undef, n_dims, n_particles, trajectory_length
+                    )
+                    acceleration_arrays = Array{Float32,3}(
+                        undef, n_dims, n_particles, trajectory_length
+                    )
                     particle_types = Array{Int}(undef, n_particles)
                 end
-                
+
                 # Populate 3D arrays
                 for idx in 1:length(dims)
                     position_arrays[idx, j, :] = pos_data_sliced[idx]
@@ -144,17 +178,17 @@ function csv_to_hdf5(source::String, output::String;
                 end
                 particle_types[j] = prtl[!, type_col][1]
             end
-            
+
             # Remap particle types to sequential integers (1, 2, 3, ...) to minimize one-hot encoding size
             unique_types = unique(particle_types)
             sort!(unique_types)
             type_mapping = Dict(zip(unique_types, 1:length(unique_types)))
             particle_types_remapped = [type_mapping[t] for t in particle_types]
-            
+
             # Store trajectory length and metadata
             fid["$tra/trajectory_length"] = trajectory_length
             fid["$tra/type"] = particle_types_remapped
-            
+
             # Store data in timestep-based format (dimensions × particles)
             for t in 1:trajectory_length
                 fid["$tra/pos[$t]"] = convert(Matrix{Float32}, position_arrays[:, :, t])
@@ -166,7 +200,6 @@ function csv_to_hdf5(source::String, output::String;
         close(fid)
     end
 end
-
 
 """
     _get_acceleration_slice(n_points::Int, scheme::String)::UnitRange
@@ -184,10 +217,10 @@ Different schemes shorten acceleration arrays differently, and extra fields shou
 function _get_acceleration_slice(n_points::Int, scheme::String)::UnitRange
     if scheme == "central_diff" || scheme == "from_pos"
         # These remove first and last point
-        return 2:n_points-1
+        return 2:(n_points - 1)
     elseif scheme == "forward_diff"
         # Forward difference: removes last point (estimates at times 0:n-2)
-        return 1:n_points-1
+        return 1:(n_points - 1)
     elseif scheme == "backward_diff"
         # Backward difference: removes first point (estimates at times 1:n-1)
         return 2:n_points
@@ -196,7 +229,6 @@ function _get_acceleration_slice(n_points::Int, scheme::String)::UnitRange
         return 1:n_points
     end
 end
-
 
 """
     _calculate_acceleration(pos_data::Vector, vel_data::Vector, dt::Float64, 
@@ -216,47 +248,50 @@ Supports both analytical difference schemes and DataInterpolations.jl methods.
 # Returns
 - `Vector`: Vector of acceleration arrays (one per dimension)
 """
-function _calculate_acceleration(pos_data::Vector, vel_data::Vector, dt::Float64, 
-                                scheme::String)::Vector
-    
+function _calculate_acceleration(
+    pos_data::Vector, vel_data::Vector, dt::Float64, scheme::String
+)::Vector
     n_dims = length(vel_data)
     acc_data = Vector{Vector{Float64}}(undef, n_dims)
-    
+
     if scheme == "central_diff"
         # Central difference: a[i] = (v[i+1] - v[i-1]) / (2*dt)
         for dim in 1:n_dims
-            acc_data[dim] = (vel_data[dim][3:end] .- vel_data[dim][1:end-2]) ./ (2 * dt)
+            acc_data[dim] = (vel_data[dim][3:end] .- vel_data[dim][1:(end - 2)]) ./ (2 * dt)
         end
-        
+
     elseif scheme == "forward_diff"
         # Forward difference: a[i] = (v[i+1] - v[i]) / dt
         for dim in 1:n_dims
-            acc_data[dim] = (vel_data[dim][2:end] .- vel_data[dim][1:end-1]) ./ dt
+            acc_data[dim] = (vel_data[dim][2:end] .- vel_data[dim][1:(end - 1)]) ./ dt
         end
-        
+
     elseif scheme == "backward_diff"
         # Backward difference: a[i] = (v[i] - v[i-1]) / dt  
         # Same computation as forward, but represents acceleration at different time points
         for dim in 1:n_dims
-            acc_data[dim] = (vel_data[dim][2:end] .- vel_data[dim][1:end-1]) ./ dt
+            acc_data[dim] = (vel_data[dim][2:end] .- vel_data[dim][1:(end - 1)]) ./ dt
         end
-        
+
     elseif scheme == "from_pos"
         # Calculate from position: a[i] = (x[i+1] - 2*x[i] + x[i-1]) / dt^2
         for dim in 1:n_dims
-            acc_data[dim] = (pos_data[dim][3:end] .- 2 .* pos_data[dim][2:end-1] .+ 
-                           pos_data[dim][1:end-2]) ./ (dt * dt)
+            acc_data[dim] =
+                (
+                    pos_data[dim][3:end] .- 2 .* pos_data[dim][2:(end - 1)] .+
+                    pos_data[dim][1:(end - 2)]
+                ) ./ (dt * dt)
         end
-        
+
     else
         # All other schemes use DataInterpolations
         n_points = length(vel_data[1])
         t = 0.0:dt:((n_points - 1) * dt)
-        
+
         for dim in 1:n_dims
             # Create interpolation object based on scheme
             vel_interp = _create_interpolation(vel_data[dim], collect(t), scheme)
-            
+
             # Calculate velocity derivatives (acceleration)
             acc_temp = Float64[]
             for time in t
@@ -265,10 +300,9 @@ function _calculate_acceleration(pos_data::Vector, vel_data::Vector, dt::Float64
             acc_data[dim] = acc_temp
         end
     end
-    
+
     return acc_data
 end
-
 
 """
     _create_interpolation(y::Vector, t::Vector, scheme::String)
@@ -308,7 +342,6 @@ function _create_interpolation(y::Vector, t::Vector, scheme::String)
     end
 end
 
-
 """
     _estimate_derivatives(y::Vector, t::Vector)::Vector
 
@@ -324,31 +357,30 @@ Estimate derivatives using central differences, with forward/backward at boundar
 function _estimate_derivatives(y::Vector, t::Vector)::Vector
     n = length(y)
     dy = zeros(n)
-    
+
     if n < 2
         return dy
     end
-    
+
     # Use average time step (assumed mostly uniform)
     dt_avg = (t[end] - t[1]) / (n - 1)
-    
+
     # Interior points: central difference
-    for i in 2:n-1
-        dy[i] = (y[i+1] - y[i-1]) / (2 * dt_avg)
+    for i in 2:(n - 1)
+        dy[i] = (y[i + 1] - y[i - 1]) / (2 * dt_avg)
     end
-    
+
     # Boundary points: forward/backward differences
     dy[1] = (y[2] - y[1]) / dt_avg
-    dy[n] = (y[n] - y[n-1]) / dt_avg
-    
+    dy[n] = (y[n] - y[n - 1]) / dt_avg
+
     return dy
 end
-
 
 # Example usage:
 # 2D simulation with PCHIP
 # csv_to_hdf5(pwd() * "/data/dam_break.csv", "data/dam_break_first_new.h5"; 
-            # dt=0.01, dims=[1, 3], interpolation_scheme="pchip")
+# dt=0.01, dims=[1, 3], interpolation_scheme="pchip")
 # 
 # 3D simulation with cubic spline
 # csv_to_hdf5(pwd() * "/data/dam_break.csv", "data/dam_break_second.h5"; 
@@ -357,7 +389,6 @@ end
 # 2D (skip y-dimension) with extra fields
 # csv_to_hdf5(pwd() * "/data/dam_break_mini/dam_break.csv", "output.h5";
 #             dims=[1, 3], interpolation_scheme="pchip")
-
 
 function particleToArray(
     inputPath::String,
@@ -378,7 +409,7 @@ function particleToArray(
         top = inputFile[trajectory]
         numberParticles = HDF5.read(top, "n_particles")
         trajectory_length = HDF5.read(top, "trajectory_length")
-        
+
         # Determine dimension by checking available position data
         dimension = 0
         for d in 1:3
@@ -439,7 +470,7 @@ function particleToArray(
             type[p] = HDF5.read(top, "particle[$p].type")
 
             for n in timesteps
-                println(size(pos[n,:]))
+                println(size(pos[n, :]))
                 println(size(position[p, :, n]))
                 position[p, :, n] = pos[n, :]
                 velocity[p, :, n] = vel[n, :]
