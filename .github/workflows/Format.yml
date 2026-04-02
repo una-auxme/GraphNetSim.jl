@@ -7,6 +7,9 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4 
+      - name: Debug
+        run: |
+          cat .JuliaFormatter.toml
       - uses: julia-actions/julia-format@v4
         with:
           version: '1'
