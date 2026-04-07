@@ -82,25 +82,9 @@ function build_graph(
     #     velocity = hcat(velocity, zeros(Float32, meta["dims"], size(boundaries,2)))
     # end
 
-    if device == cpu_device()
-        cur_pos_cpu = cpu_device()(position)
-        tree = KDTree(cur_pos_cpu; reorder=false)
-        receivers_list = device(
-            inrange(tree, cur_pos_cpu, Float32(meta["default_connectivity_radius"]), false)
-        )
-        senders = device(
-            vcat([repeat([i], length(j)) for (i, j) in enumerate(receivers_list)]...)
-        )
-        receivers = vcat(receivers_list...)
-        rel_displacement =
-            (position[:, receivers] - position[:, senders]) ./
-            Float32(meta["default_connectivity_radius"])
-        rel_dist_norm = sqrt.(sum(abs2, rel_displacement; dims=1))
-    else
-        senders, receivers, rel_displacement, rel_dist_norm = point_neighbor_ns(
-            position, Float32(meta["default_connectivity_radius"])
-        ) # experimental
-    end
+    senders, receivers, rel_displacement, rel_dist_norm = point_neighbor_ns(
+        position, Float32(meta["default_connectivity_radius"])
+    )
     # if size(boundaries,2) != 0
     # #     # sender_old, receiver_old, senders, receivers, _, b_particle = check_and_delete_filtered(senders, receivers, size(position, 2), true)
     # #     # rel_displacement = (position[:, receiver_old] - position[:, sender_old]) ./ Float32(meta["default_connectivity_radius"])
@@ -373,6 +357,134 @@ function point_neighbor_ns(pos::CuArray, radius::Float32)
     # rel_displacement = rel_displacement ./ (Float32(radius))
     # rel_dist_norm = rel_dist_norm ./ (Float32(radius))
     senders, receivers, rel_displacement, rel_dist_norm
+end
+
+"""
+    point_neighbor_ns(pos::Array, radius::Float32)
+
+CPU version of particle neighbor search using PointNeighbors.jl GridNeighborhoodSearch.
+
+Mirrors the GPU version but operates on plain Julia Arrays instead of CuArrays.
+Together with the CuArray method, this allows `build_graph` to call
+`point_neighbor_ns` unconditionally and rely on multiple dispatch.
+
+## Arguments
+- `pos::Array`: Particle positions, shape (dims, n_particles).
+- `radius::Float32`: Search radius (connectivity radius).
+
+## Returns
+- `Tuple`: (senders, receivers, rel_displacement, rel_dist_norm) — all plain Arrays.
+"""
+function point_neighbor_ns(pos::Array, radius::Float32)
+    system = pos
+    min_corner = minimum(pos; dims=2)
+    max_corner = maximum(pos; dims=2)
+    nhs = GridNeighborhoodSearch{size(pos, 1)}(;
+        search_radius=radius,
+        n_points=size(pos, 2),
+        cell_list=FullGridCellList(; min_corner, max_corner, search_radius=radius),
+    )
+    initialize!(nhs, system, pos)
+
+    # First pass: count neighbors per particle
+    n_neighbors = zeros(Int, size(pos, 2))
+    foreach_point_neighbor(system, pos, nhs) do i, _, _, _
+        n_neighbors[i] += 1
+    end
+
+    n_edges = sum(n_neighbors)
+    senders = Vector{Int32}(undef, n_edges)
+    receivers = Vector{Int32}(undef, n_edges)
+    rel_displacement = Array{Float32}(undef, size(pos, 1), n_edges)
+    rel_dist_norm = Array{Float32}(undef, 1, n_edges)
+
+    # Second pass: populate edge arrays
+    offset = cumsum(n_neighbors) .- n_neighbors .+ 1
+    foreach_point_neighbor(system, pos, nhs) do i, j, pos_diff, distance
+        receivers[offset[i]] = i
+        senders[offset[i]] = j
+        for d in 1:size(pos, 1)
+            rel_displacement[d, offset[i]] = pos_diff[d] / radius
+        end
+        rel_dist_norm[offset[i]] = distance / radius
+        offset[i] += 1
+    end
+
+    return senders, receivers, rel_displacement, rel_dist_norm
+end
+
+"""
+    ChainRulesCore.rrule(::typeof(point_neighbor_ns), pos::Array, radius::Float32)
+
+Define the reverse-mode automatic differentiation rule for `point_neighbor_ns` on CPU.
+
+Mirrors the GPU rrule but operates on plain Arrays. Enables gradient computation
+through the neighbor search for CPU-based ODE training (SingleShooting, MultipleShooting).
+
+## Arguments
+- `::typeof(point_neighbor_ns)`: Function identifier.
+- `pos::Array`: Particle positions.
+- `radius::Float32`: Search radius.
+
+## Returns
+- `Tuple`: (primal_output, pullback_function)
+"""
+function ChainRulesCore.rrule(::typeof(point_neighbor_ns), pos::Array, radius::Float32)
+    senders, receivers, rel_displacement, rel_dist_norm = point_neighbor_ns(pos, radius)
+
+    function point_neighbor_ns_cpu_pullback(Δ)
+        Δrel_disp_raw = Δ[3]
+        Δrel_dist_raw = Δ[4]
+
+        grad_pos = zeros(eltype(pos), size(pos))
+
+        Δdisp = if Δrel_disp_raw isa ChainRulesCore.AbstractZero
+            zeros(Float32, size(rel_displacement))
+        elseif Δrel_disp_raw isa AbstractArray
+            Δrel_disp_raw
+        else
+            convert(Array{Float32}, Δrel_disp_raw)
+        end
+
+        Δdist = if Δrel_dist_raw isa ChainRulesCore.AbstractZero
+            zeros(Float32, size(rel_dist_norm))
+        elseif Δrel_dist_raw isa AbstractArray
+            Δrel_dist_raw
+        else
+            convert(Array{Float32}, Δrel_dist_raw)
+        end
+
+        if !(
+            Δrel_disp_raw isa ChainRulesCore.NoTangent &&
+            Δrel_dist_raw isa ChainRulesCore.NoTangent
+        )
+            for idx in eachindex(senders)
+                i = Int(receivers[idx])
+                j = Int(senders[idx])
+
+                for d in 1:size(grad_pos, 1)
+                    val_disp = Δdisp[d, idx] / radius
+                    grad_pos[d, j] += val_disp
+                    grad_pos[d, i] -= val_disp
+                end
+
+                d_norm = rel_dist_norm[1, idx]
+                if d_norm > 1.0f-8
+                    for d in 1:size(grad_pos, 1)
+                        grad_val =
+                            (Δdist[1, idx] * rel_displacement[d, idx]) / (d_norm * radius)
+                        grad_pos[d, j] += grad_val
+                        grad_pos[d, i] -= grad_val
+                    end
+                end
+            end
+        end
+
+        return (NoTangent(), grad_pos, NoTangent(), NoTangent())
+    end
+
+    return (senders, receivers, rel_displacement, rel_dist_norm),
+    point_neighbor_ns_cpu_pullback
 end
 
 """

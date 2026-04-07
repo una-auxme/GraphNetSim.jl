@@ -21,7 +21,6 @@ KernelAbstractions = "63c18a36-062a-441e-b654-da1e3ab1ce7c"
 Lux = "b2108857-7c20-44ae-9111-449ecde12c47"
 LuxCUDA = "d0bbae9a-e099-4d5b-a835-1c6931763bda"
 MLUtils = "f1d291b0-491e-4a28-83b9-f70985020b54"
-NearestNeighbors = "b8a86587-4115-5ab1-83bc-aa920d37bbce"
 Optimisers = "3bd65402-5787-11e9-1adc-39752487f4e2"
 OrdinaryDiffEq = "1dea7af3-3e70-54e6-95c3-0bf5283fa5ed"
 Plots = "91a5bcdd-55d7-5caf-9e0b-520d859cae80"
@@ -59,7 +58,6 @@ KernelAbstractions = "0.9.39"
 Lux = "1.4 - 1"
 LuxCUDA = "0.3"
 MLUtils = "0.4.4 - 0.4"
-NearestNeighbors = "0.4.27"
 Optimisers = "0.4, 1"
 OrdinaryDiffEq = "6.85 - 6"
 Plots = "1.40.18"
@@ -79,7 +77,8 @@ julia = "1.10"
 
 [extras]
 Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
+Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Aqua", "Test"]
+test = ["Aqua", "Statistics", "Test"]

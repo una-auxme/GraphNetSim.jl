@@ -22,7 +22,6 @@ import ProgressMeter: Progress
 
 import Base: @kwdef
 import SciMLBase: solve, remake
-import NearestNeighbors: KDTree, inrange
 import HDF5: h5open, create_group, open_group
 import ProgressMeter: next!, update!, finish!
 import Statistics: mean
@@ -65,7 +64,7 @@ Configuration structure for training and evaluating Graph Neural Network simulat
 
 ### Data Augmentation
 - `types_updated::Vector{Integer}=[1]`: Node types whose features are predicted
-- `types_noisy::Vector{Integer}=[0]`: Node types to which noise is added during training
+- `types_noisy::Vector{Integer}=Int[]`: Node types to which noise is added during training
 - `noise_stddevs::Vector{Float32}=[0.0f0]`: Standard deviations for Gaussian noise (per type or broadcast)
 
 ### Training Strategy
@@ -100,7 +99,7 @@ Configuration structure for training and evaluating Graph Neural Network simulat
     checkpoint::Integer = 10000
     norm_steps::Integer = 1000
     types_updated::Vector{Integer} = [1]
-    types_noisy::Vector{Integer} = [0]
+    types_noisy::Vector{Integer} = Int[]
     noise_stddevs::Vector{Float32} = [0.0f0]
     training_strategy::TrainingStrategy = DerivativeTraining()
     use_cuda::Bool = true
@@ -343,7 +342,7 @@ periodically on validation set and saves checkpoints for the best model.
 - `checkpoint::Int=10000`: Create checkpoint every N steps.
 - `norm_steps::Int=1000`: Steps for accumulating normalization statistics without updates.
 - `types_updated::Vector{Int}=[1]`: Node types whose features are predicted.
-- `types_noisy::Vector{Int}=[0]`: Node types to which noise is added.
+- `types_noisy::Vector{Int}=Int[]`: Node types to which noise is added.
 - `noise_stddevs::Vector{Float32}=[0.0f0]`: Standard deviations for Gaussian noise.
 - `training_strategy::TrainingStrategy=DerivativeTraining()`: Training method to use.
 - `use_cuda::Bool=true`: Use CUDA GPU if available.
@@ -627,11 +626,11 @@ function train_gns!(
                             Optimisers.adjust!(
                                 opt_state,
                                 Float32(
-                                    args.optimizer_learning_rate_start +
+                                    args.optimizer_learning_rate_stop +
                                     (
                                         args.optimizer_learning_rate_start -
                                         args.optimizer_learning_rate_stop
-                                    )*0.1^(step*5e6),
+                                    ) * 0.1^((step + datapoint) / 5.0f6),
                                 ),
                             ) # Learn rate decay from GNS paper
                         end
