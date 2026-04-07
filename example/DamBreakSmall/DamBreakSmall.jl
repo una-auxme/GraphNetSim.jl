@@ -36,10 +36,12 @@ batch = 1
 epo = 1
 nder = 5000    # derivative training steps
 ns = 500 + nder  # total steps incl. batching fine-tune
+nms = 500 + ns   # total steps incl. multiple-shooting fine-tune
 norm_steps = 0       # offline stats available in meta.json
 cuda = true
 cp_derivative = 1000
 cp_solver = 100
+cp_ms = 100
 
 ########################
 # Node type parameters #
@@ -153,6 +155,41 @@ train_network(
     noise_stddevs=noise_stddevs,
     training_strategy=BatchingStrategy(
         tstart, tstop, solver_train, stepsPerTrajectory; loss_function=:mae, adaptive=false
+    ),
+    solver_valid=solver_eval,
+    solver_valid_dt=dt,
+    optimizer_learning_rate_start=learning_rate_start,
+    optimizer_learning_rate_stop=learning_rate_finish,
+    show_progress_bars=true,
+)
+
+# Phase 3: MultipleShooting fine-tuning (splits trajectory into intervals
+# with continuity penalty — helps escape local minima from SingleShooting)
+
+learning_rate_start = 1.0f-6
+learning_rate_finish = nothing
+opt = Adam(learning_rate_start)
+
+ms_interval_size = 20   # 4 intervals across the 80-step trajectory
+
+train_network(
+    opt,
+    ds_path,
+    chk_path;
+    mps=message_steps,
+    layer_size=layer_size,
+    hidden_layers=hidden_layers,
+    batchsize=batch,
+    epochs=epo,
+    steps=Int(nms),
+    use_cuda=cuda,
+    checkpoint=cp_ms,
+    norm_steps=norm_steps,
+    types_updated=types_updated,
+    types_noisy=types_noisy,
+    noise_stddevs=noise_stddevs,
+    training_strategy=MultipleShooting(
+        tstart, dt, tstop, solver_train, ms_interval_size, 100
     ),
     solver_valid=solver_eval,
     solver_valid_dt=dt,
