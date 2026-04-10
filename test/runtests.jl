@@ -25,4 +25,5 @@ include("generate_fixtures.jl")
     include("test_wall_distance.jl")
     include("test_trajectory_mask.jl")
     include("test_visualize.jl")
+    include("test_callbacks.jl")
 end

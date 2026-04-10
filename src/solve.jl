@@ -76,7 +76,8 @@ function rollout(
     dt,
     saves,
     device,
-    pr=nothing,
+    pr=nothing;
+    cache=nothing,
 )
     interval = (start, stop)
     x0 = initial_state["position"]
@@ -99,14 +100,13 @@ function rollout(
             mask,
             val_mask,
             device,
+            cache,
         ),
     )
     if isnothing(dt)
         sol = solve(prob, solver; saveat=saves)
-        # sol = solve(prob, solver; saveat = saves, tstops = saves)
     else
         sol = solve(prob, solver; saveat=saves, dt=dt)
-        # sol = solve(prob, solver; saveat = saves, tstops = saves)
     end
 
     if !isnothing(pr)
@@ -147,7 +147,19 @@ Simplifies the interface by wrapping the full parameter tuple, delegating to `od
 """
 function ode_func_train(
     x,
-    (gns, ps, output_fields, meta, target_fields, node_type, pr, mask, val_mask, device),
+    (
+        gns,
+        ps,
+        output_fields,
+        meta,
+        target_fields,
+        node_type,
+        pr,
+        mask,
+        val_mask,
+        device,
+        cache,
+    ),
     t,
 ) #TODO add dx
     return ode_step(
@@ -163,6 +175,7 @@ function ode_func_train(
             mask,
             val_mask,
             device,
+            cache,
         ),
         t,
     ) # TODO for test made ODE instead of SOODE
@@ -199,7 +212,19 @@ Simplifies the interface by wrapping the full parameter tuple, delegating to `od
 """
 function ode_func_eval(
     x,
-    (gns, ps, output_fields, meta, target_fields, node_type, pr, mask, val_mask, device),
+    (
+        gns,
+        ps,
+        output_fields,
+        meta,
+        target_fields,
+        node_type,
+        pr,
+        mask,
+        val_mask,
+        device,
+        cache,
+    ),
     t,
 )
     return ode_step_eval(
@@ -215,6 +240,7 @@ function ode_func_eval(
             mask,
             val_mask,
             device,
+            cache,
         ),
         t,
     )
@@ -263,13 +289,32 @@ returns time derivatives (velocities and accelerations). Includes optional progr
 """
 function ode_step(
     x,
-    (gns, ps, output_fields, meta, target_fields, node_type, pr, mask, val_mask, device),
+    (
+        gns,
+        ps,
+        output_fields,
+        meta,
+        target_fields,
+        node_type,
+        pr,
+        mask,
+        val_mask,
+        device,
+        cache,
+    ),
     t,
 )
-    # graph = nothing
-    # @ignore_derivatives begin
-    graph = build_graph(gns, x.x, x.dx, meta, node_type, mask, device)
-    # end
+    @ignore_derivatives begin
+        if cache !== nothing
+            maybe_rebuild_topology!(cache, x.x)
+        end
+    end
+
+    graph = if cache === nothing
+        build_graph(gns, x.x, x.dx, meta, node_type, mask, device)
+    else
+        build_graph_cached(gns, cache, x.x, x.dx, meta, node_type, mask, device)
+    end
 
     # GraphNetCore >= 0.4: model/state live inside the TrainState. Our layers
     # (Dense + LayerNorm) are stateless under a forward pass, so the returned
@@ -338,10 +383,30 @@ potential future inference optimizations.
 """
 function ode_step_eval(
     x,
-    (gns, ps, output_fields, meta, target_fields, node_type, pr, mask, val_mask, device),
+    (
+        gns,
+        ps,
+        output_fields,
+        meta,
+        target_fields,
+        node_type,
+        pr,
+        mask,
+        val_mask,
+        device,
+        cache,
+    ),
     t,
 ) # TODO if rework is finished only one ode_step function is needed
-    graph = build_graph(gns, x.x, x.dx, meta, node_type, mask, device)
+    if cache !== nothing
+        maybe_rebuild_topology!(cache, x.x)
+    end
+
+    graph = if cache === nothing
+        build_graph(gns, x.x, x.dx, meta, node_type, mask, device)
+    else
+        build_graph_cached(gns, cache, x.x, x.dx, meta, node_type, mask, device)
+    end
 
     # GraphNetCore >= 0.4: model/state live inside the TrainState. Our layers
     # (Dense + LayerNorm) are stateless under a forward pass, so the returned
