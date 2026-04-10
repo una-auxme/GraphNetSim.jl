@@ -127,7 +127,9 @@ Inner function for validation of a single trajectory.
 - Ground truth data with `data_interval` as timesteps.
 - Prediction data with `data_interval` as timesteps.
 """
-function _validation_step(t::Tuple, sim_interval, data_interval)
+function _validation_step(
+    t::Tuple, sim_interval, data_interval; use_graph_callback=false, safety_factor=4.0f0
+)
     gns, data, meta, _, solver, solver_dt, node_type, pr = t
 
     initial_state = Dict(
@@ -142,6 +144,19 @@ function _validation_step(t::Tuple, sim_interval, data_interval)
     gt = vcat([data[tf] for tf in meta["solver_target_features"]]...)[
         :, data["mask"], data_interval
     ]
+
+    # Optional graph-reconstruction cache for validation rollouts. Built
+    # from the validation initial state so the watched-pair set matches the
+    # particles being simulated. The cache lives only for this single solve.
+    # Topology rebuilds happen inside the ODE RHS via maybe_rebuild_topology!.
+    cache = nothing
+    if use_graph_callback
+        radius = Float32(meta["default_connectivity_radius"])
+        u0_pos = meta["device"](initial_state["position"])
+        cache = GraphCache(u0_pos, radius; safety_factor=safety_factor)
+        rebuild_topology!(cache, u0_pos)
+    end
+
     sol = rollout(
         solver,
         gns,
@@ -157,7 +172,8 @@ function _validation_step(t::Tuple, sim_interval, data_interval)
         solver_dt,
         sim_interval,
         meta["device"],
-        pr,
+        pr;
+        cache=cache,
     )
     GC.gc()         # Run Julia's garbage collector first
     if CUDA.functional()
@@ -272,6 +288,20 @@ function train_step(strategy::SolverStrategy, t::Tuple)
     pr = ProgressUnknown(; desc="Solver progress: ", showspeed=true)
     print("\n\n\n\n\n\n\n\n") # display solver progress after main progress
 
+    # Optional graph-reconstruction cache: when enabled, build a
+    # `GraphCache` from the initial positions. The ODE RHS calls
+    # `maybe_rebuild_topology!` inside `@ignore_derivatives` at each
+    # evaluation, so no callback is passed to `solve()` and ZygoteVJP
+    # works on GPU without issues.
+    local cache
+    if strategy.use_graph_callback
+        radius = Float32(meta["default_connectivity_radius"])
+        cache = GraphCache(u0.x, radius; safety_factor=strategy.graph_callback_safety)
+        rebuild_topology!(cache, u0.x)
+    else
+        cache = nothing
+    end
+
     ff = ODEFunction{false}(
         (x, ps, t) -> ode_func_train(
             x,
@@ -286,11 +316,13 @@ function train_step(strategy::SolverStrategy, t::Tuple)
                 mask,
                 val_mask,
                 device,
+                cache,
             ),
             t,
         ),
     )
     prob = ODEProblem(ff, u0, (strategy.tstart, strategy.tstop), gns.ps)
+
     shoot_loss, shoot_gs = Zygote.withgradient(
         ps -> train_loss(
             strategy,
@@ -298,7 +330,6 @@ function train_step(strategy::SolverStrategy, t::Tuple)
                 prob,
                 ps,
                 u0,
-                nothing,
                 gt,
                 mask,
                 gns.n_norm,
@@ -358,7 +389,13 @@ function validation_step(strategy::SolverStrategy, t::Tuple)
     end
     # data_interval = 1:t[2]["trajectory_length"]
     data_interval = 1:(length(sim_interval) - 1)
-    return _validation_step(t, sim_interval, data_interval)
+    return _validation_step(
+        t,
+        sim_interval,
+        data_interval;
+        use_graph_callback=strategy.use_graph_callback,
+        safety_factor=strategy.graph_callback_safety,
+    )
 end
 
 """
@@ -376,6 +413,8 @@ struct BatchingStrategy <: SolverStrategy
     sense::AbstractSensitivityAlgorithm
     steps::Int64
     loss_function::Any
+    use_graph_callback::Bool
+    graph_callback_safety::Float32
     solargs::Any
 end
 
@@ -428,12 +467,25 @@ function BatchingStrategy(
     solver::OrdinaryDiffEqAlgorithm,
     steps;
     loss_function=:mae,
-    sense::AbstractSensitivityAlgorithm=InterpolatingAdjoint(;
-        autojacvec=ZygoteVJP(), checkpointing=true
-    ),
+    sense::Union{AbstractSensitivityAlgorithm,Nothing}=nothing,
+    use_graph_callback::Bool=false,
+    graph_callback_safety::Float32=4.0f0,
     solargs...,
 )
-    BatchingStrategy(tstart, intervall, solver, sense, steps, loss_function, solargs)
+    if isnothing(sense)
+        sense = InterpolatingAdjoint(; autojacvec=ZygoteVJP(), checkpointing=true)
+    end
+    BatchingStrategy(
+        tstart,
+        intervall,
+        solver,
+        sense,
+        steps,
+        loss_function,
+        use_graph_callback,
+        graph_callback_safety,
+        solargs,
+    )
 end
 
 """
@@ -605,6 +657,19 @@ function train_step(strategy::BatchingStrategy, t::Tuple)
     )
     print("\n\n\n\n\n\n\n\n") # display solver progress after main progress
 
+    # Optional graph-reconstruction cache (see SingleShooting train_step
+    # for the design rationale). The cache is built per batch from the
+    # batch's initial position because positions jump at batch boundaries.
+    # Topology rebuilds happen inside the ODE RHS via maybe_rebuild_topology!.
+    local cache
+    if strategy.use_graph_callback
+        radius = Float32(meta["default_connectivity_radius"])
+        cache = GraphCache(u0.x, radius; safety_factor=strategy.graph_callback_safety)
+        rebuild_topology!(cache, u0.x)
+    else
+        cache = nothing
+    end
+
     ff = ODEFunction{false}(
         (x, ps, t) -> ode_func_train(
             x,
@@ -619,6 +684,7 @@ function train_step(strategy::BatchingStrategy, t::Tuple)
                 mask,
                 val_mask,
                 device,
+                cache,
             ),
             t,
         ),
@@ -629,9 +695,12 @@ function train_step(strategy::BatchingStrategy, t::Tuple)
         (round(batches[b].batchStart; digits=4), round(batches[b].batchStop; digits=4)),
         gns.ps,
     )
+
     shoot_loss, shoot_gs = Zygote.withgradient(
-        ps ->
-            train_loss(strategy, (prob, ps, u0, nothing, gt, mask, data["dt"], batches[b])),
+        ps -> train_loss(
+            strategy,
+            (prob, ps, u0, gt, mask, data["dt"], batches[b]),
+        ),
         gns.ps,
     )
     batches[b].loss = shoot_loss
@@ -651,15 +720,13 @@ with ground truth using the configured loss function.
 - `t::Tuple`: Tuple containing problem, parameters, and ground truth data.
 """
 function train_loss(strategy::BatchingStrategy, t::Tuple)
-    prob, ps, u0, callback_solve, gt, mask, dt, batch = t
+    prob, ps, u0, gt, mask, dt, batch = t
     sol = solve(
         remake(prob; p=ps),
         strategy.solver;
         u0=u0,
         dt=dt,
         sensealg=strategy.sense,
-        callback=callback_solve,
-        # tstops = batch.batchStart:dt:batch.batchStop,
         saveat=(batch.batchStart:dt:batch.batchStop),
         strategy.solargs...,
     )
@@ -698,6 +765,8 @@ struct SingleShooting <: SolverStrategy
     solver::OrdinaryDiffEqAlgorithm
     sense::AbstractSensitivityAlgorithm
     loss_function::Any
+    use_graph_callback::Bool
+    graph_callback_safety::Float32
     solargs::Any
 end
 
@@ -721,13 +790,29 @@ function SingleShooting(
     dt::Float32,
     tstop::Float32,
     solver::OrdinaryDiffEqAlgorithm;
-    sense::AbstractSensitivityAlgorithm=InterpolatingAdjoint(;
-        autojacvec=ZygoteVJP(), checkpointing=true
-    ),
+    sense::Union{AbstractSensitivityAlgorithm,Nothing}=nothing,
     loss_function=:mae,
+    use_graph_callback::Bool=false,
+    graph_callback_safety::Float32=4.0f0,
     solargs...,
 )
-    SingleShooting(tstart, dt, tstop, solver, sense, loss_function, solargs)
+    # The graph-reconstruction cache is handled entirely inside the ODE
+    # RHS via maybe_rebuild_topology! (wrapped in @ignore_derivatives),
+    # so no callback is passed to solve() and ZygoteVJP works on GPU.
+    if isnothing(sense)
+        sense = InterpolatingAdjoint(; autojacvec=ZygoteVJP(), checkpointing=true)
+    end
+    SingleShooting(
+        tstart,
+        dt,
+        tstop,
+        solver,
+        sense,
+        loss_function,
+        use_graph_callback,
+        graph_callback_safety,
+        solargs,
+    )
 end
 
 """
@@ -743,7 +828,7 @@ trajectory with ground truth data.
 - `t::Tuple`: Tuple containing problem, parameters, and ground truth data.
 """
 function train_loss(strategy::SingleShooting, t::Tuple)
-    prob, ps, u0, callback_solve, gt, mask, n_norm, target_fields, target_dims = t # TODO add du0 TODO vary ps
+    prob, ps, u0, gt, mask, n_norm, target_fields, target_dims = t # TODO add du0 TODO vary ps
     tstop_data = strategy.tstart + (size(gt, 3) - 1) * strategy.dt
     sol = solve(
         remake(prob; p=ps),
@@ -751,7 +836,6 @@ function train_loss(strategy::SingleShooting, t::Tuple)
         u0=u0,
         dt=strategy.dt,
         sensealg=strategy.sense,
-        callback=callback_solve,
         saveat=(strategy.tstart:strategy.dt:tstop_data),
         strategy.solargs...,
     ) # TODO remake du0=du0 currently not implemented Chris what are u doing?
@@ -828,6 +912,8 @@ struct MultipleShooting <: SolverStrategy
     sense::AbstractSensitivityAlgorithm
     interval_size::Integer                  # Number of observations in one interval
     continuity_term::Integer
+    use_graph_callback::Bool
+    graph_callback_safety::Float32
     solargs::Any
 end
 
@@ -855,13 +941,25 @@ function MultipleShooting(
     solver::OrdinaryDiffEqAlgorithm,
     interval_size,
     continuity_term=100;
-    sense::AbstractSensitivityAlgorithm=InterpolatingAdjoint(
-        autojacvec=ZygoteVJP(), checkpointing=true
-    ),
+    sense::Union{AbstractSensitivityAlgorithm,Nothing}=nothing,
+    use_graph_callback::Bool=false,
+    graph_callback_safety::Float32=4.0f0,
     solargs...,
 )
+    if isnothing(sense)
+        sense = InterpolatingAdjoint(; autojacvec=ZygoteVJP(), checkpointing=true)
+    end
     MultipleShooting(
-        tstart, dt, tstop, solver, sense, interval_size, continuity_term, solargs
+        tstart,
+        dt,
+        tstop,
+        solver,
+        sense,
+        interval_size,
+        continuity_term,
+        use_graph_callback,
+        graph_callback_safety,
+        solargs,
     )
 end
 
@@ -910,13 +1008,33 @@ function train_step(strategy::MultipleShooting, t::Tuple)
                 mask,
                 val_mask,
                 device,
+                nothing,
             ),
             t,
         ),
     )
     prob = ODEProblem(ff, u0, (strategy.tstart, strategy.tstop), gns.ps)
+
     shoot_loss, shoot_gs = Zygote.withgradient(
-        ps -> train_loss(strategy, (prob, ps, data, gt, mask, device)), gns.ps
+        ps -> train_loss(
+            strategy,
+            (
+                prob,
+                ps,
+                data,
+                gt,
+                mask,
+                device,
+                gns,
+                meta,
+                output_fields,
+                target_fields,
+                node_type,
+                val_mask,
+                pr,
+            ),
+        ),
+        gns.ps,
     )
     return shoot_gs, shoot_loss
 end
@@ -934,7 +1052,8 @@ for mismatches between interval endpoints.
 - `t::Tuple`: Tuple containing problem, parameters, data, ground truth, mask, and device.
 """
 function train_loss(strategy::MultipleShooting, t::Tuple)
-    prob, ps, data, gt, mask, device = t
+    prob, ps, data, gt, mask, device, gns, meta, output_fields, target_fields, node_type,
+    val_mask, pr = t
 
     tstop_data = strategy.tstart + (size(gt, 3) - 1) * strategy.dt
     tsteps = strategy.tstart:strategy.dt:tstop_data
@@ -942,25 +1061,67 @@ function train_loss(strategy::MultipleShooting, t::Tuple)
         i:min(length(tsteps), i + strategy.interval_size - 1) for
         i in 1:(strategy.interval_size - 1):(length(tsteps) - 1)
     ]
-    sols = [
-        solve(
-            remake(
-                prob;
-                p=ps,
-                tspan=(tsteps[first(rg)], tsteps[last(rg)]),
-                u0=device(
-                    ComponentArray(;
-                        x=data["position"][:, :, first(rg)],
-                        dx=data["velocity"][:, :, first(rg)],
-                    ),
-                ),
+
+    # Per-interval solve. When the graph cache is enabled, we build a
+    # fresh GraphCache + ODEFunction for each interval so the RHS-based
+    # maybe_rebuild_topology! operates on the correct per-interval cache.
+    sols = map(ranges) do rg
+        u0_i = device(
+            ComponentArray(;
+                x=data["position"][:, :, first(rg)],
+                dx=data["velocity"][:, :, first(rg)],
             ),
-            strategy.solver;
-            saveat=tsteps[rg],
-            sensealg=strategy.sense,
-            strategy.solargs...,
-        ) for rg in ranges
-    ]
+        )
+
+        if strategy.use_graph_callback
+            cache_i = nothing
+            @ignore_derivatives begin
+                radius = Float32(meta["default_connectivity_radius"])
+                pos_init = data["position"][:, :, first(rg)]
+                cache_i = GraphCache(
+                    pos_init, radius; safety_factor=strategy.graph_callback_safety
+                )
+                rebuild_topology!(cache_i, pos_init)
+            end
+
+            ff_i = ODEFunction{false}(
+                (x, ps_inner, t) -> ode_func_train(
+                    x,
+                    (
+                        gns,
+                        ps_inner,
+                        output_fields,
+                        meta,
+                        target_fields,
+                        node_type,
+                        pr,
+                        mask,
+                        val_mask,
+                        device,
+                        cache_i,
+                    ),
+                    t,
+                ),
+            )
+            prob_i = ODEProblem(ff_i, u0_i, (tsteps[first(rg)], tsteps[last(rg)]), ps)
+
+            return solve(
+                prob_i,
+                strategy.solver;
+                saveat=tsteps[rg],
+                sensealg=strategy.sense,
+                strategy.solargs...,
+            )
+        else
+            return solve(
+                remake(prob; p=ps, tspan=(tsteps[first(rg)], tsteps[last(rg)]), u0=u0_i),
+                strategy.solver;
+                saveat=tsteps[rg],
+                sensealg=strategy.sense,
+                strategy.solargs...,
+            )
+        end
+    end
 
     retcodes = [sol.retcode for sol in sols]
     if any(retcodes .!= ReturnCode.Success)

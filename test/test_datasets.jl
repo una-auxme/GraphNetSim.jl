@@ -25,6 +25,7 @@ using JSON
 using PointNeighbors
 import OrdinaryDiffEq: Tsit5, Euler
 import Optimisers: Adam
+import GraphNetCore
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Device detection
@@ -595,6 +596,256 @@ for cfg in CONFIGS
                         optimizer_learning_rate_stop=1.0f-6,
                     )
                     @test isfinite(loss)
+                end
+            end
+        end
+
+        # ─────────────────────────────────────────────────────────────────
+        # Group L: Graph-callback equivalence
+        #
+        # On a short rollout where no particle pair crosses the search
+        # radius, the callback path (`build_graph_cached` on a frozen
+        # topology) and the legacy path (`build_graph` rebuilding every
+        # step) must produce identical predictions to within float
+        # tolerance. The callback's `affect!` should never fire because
+        # `condition!` returns no zero crossings.
+        #
+        # Strategy: train one tiny model with DerivativeTraining, then run
+        # `eval_network` twice over the same checkpoint — once with the
+        # default no-callback eval path, once with a SolverStrategy that
+        # carries `use_graph_callback=true`. Compare returned trajectory
+        # arrays.
+        # ─────────────────────────────────────────────────────────────────
+        @testset "L: Graph-callback equivalence" begin
+            println("Running: L — Graph-callback equivalence ($(cfg.name))")
+            mktempdir() do cp_path
+                # Tiny training run just to produce a checkpoint.
+                n_steps = cfg.traj_length + 1
+                train_network(
+                    Adam(1.0f-4),
+                    cfg.path,
+                    cp_path;
+                    make_train_kwargs(cfg)...,
+                    training_strategy=DerivativeTraining(),
+                    steps=n_steps,
+                    checkpoint=n_steps,
+                )
+
+                # Short eval window: 5 steps. Few enough that no crossings
+                # occur on the test fixtures (verified empirically — if
+                # this test ever flips to crossings, the assertion below
+                # would still hold *only* if the callback's edge math
+                # tracks the topology rebuild correctly, which is a
+                # stronger property we don't claim here).
+                tstart = 0.0f0
+                tstop = cfg.dt * 5
+                saves = collect(tstart:cfg.dt:tstop)
+                ms = saves
+
+                # Path A: legacy (use_graph_callback=false on the strategy
+                # — also the default when no SolverStrategy is passed).
+                eval_path_a = mktempdir()
+                traj_a, _ = eval_network(
+                    cfg.path,
+                    cp_path,
+                    eval_path_a,
+                    cfg.solver_valid;
+                    start=tstart,
+                    stop=tstop,
+                    dt=cfg.dt,
+                    saves=saves,
+                    mse_steps=ms,
+                    types_updated=cfg.types_updated,
+                    use_cuda=HAS_CUDA,
+                    training_strategy=SingleShooting(
+                        tstart, cfg.dt, tstop, cfg.solver_valid; use_graph_callback=false
+                    ),
+                )
+
+                # Path B: callback enabled.
+                eval_path_b = mktempdir()
+                traj_b, _ = eval_network(
+                    cfg.path,
+                    cp_path,
+                    eval_path_b,
+                    cfg.solver_valid;
+                    start=tstart,
+                    stop=tstop,
+                    dt=cfg.dt,
+                    saves=saves,
+                    mse_steps=ms,
+                    types_updated=cfg.types_updated,
+                    use_cuda=HAS_CUDA,
+                    training_strategy=SingleShooting(
+                        tstart, cfg.dt, tstop, cfg.solver_valid; use_graph_callback=true
+                    ),
+                )
+
+                # Compare predictions across all test trajectories.
+                @test !isempty(traj_a)
+                @test keys(traj_a) == keys(traj_b)
+                for k in keys(traj_a)
+                    k[2] == "prediction" || continue
+                    pred_a = traj_a[k]
+                    pred_b = traj_b[k]
+                    @test size(pred_a.pos) == size(pred_b.pos)
+                    # Tight tolerance: legitimate floating-point reordering
+                    # in the cached path comes only from the
+                    # `position[:, idx] .- position[:, idx]` indexing,
+                    # which is the same arithmetic just laid out
+                    # differently — `≈` with default rtol is generous.
+                    @test pred_a.pos ≈ pred_b.pos rtol = 1.0f-4
+                    @test pred_a.vel ≈ pred_b.vel rtol = 1.0f-4
+                end
+            end
+        end
+
+        # ─────────────────────────────────────────────────────────────────
+        # Group M: Gradient equivalence (callback ON vs OFF)
+        #
+        # The strongest correctness claim of the graph-callback work: when
+        # no particle pair crosses the search radius during a solve, the
+        # adjoint backward pass through the cached topology must produce
+        # gradients identical (within float tolerance) to those from the
+        # legacy `build_graph` path that re-runs neighbor search every
+        # step. If they diverge, then either:
+        #   - the cached differentiable edge-feature math is wrong, or
+        #   - the InterpolatingAdjoint reverse pass is reading stale cache
+        #     state during the backward sweep,
+        # both of which would silently corrupt training gradients.
+        #
+        # This builds on Group L's prediction equivalence: with predictions
+        # already shown to match, gradient equivalence pins down the
+        # remaining (more important) half — that *training* with the
+        # callback gives the same parameter updates as without.
+        # ─────────────────────────────────────────────────────────────────
+        @testset "M: Gradient equivalence (callback ON vs OFF)" begin
+            println("Running: M — Gradient equivalence ($(cfg.name))")
+            mktempdir() do cp_path
+                # Train just enough to populate normalizers and have a
+                # checkpoint to load from. We don't actually use the
+                # trained weights for accuracy — only as a non-trivial
+                # parameter set so gradients are non-zero.
+                n_steps = cfg.traj_length + 1
+                train_network(
+                    Adam(1.0f-4),
+                    cfg.path,
+                    cp_path;
+                    make_train_kwargs(cfg)...,
+                    training_strategy=DerivativeTraining(),
+                    steps=n_steps,
+                    checkpoint=n_steps,
+                )
+
+                # Reload via the same path eval_network uses, but stop
+                # short of running an eval. We need a `gns`, a dataset
+                # tuple shaped like the one `init_train_step` consumes,
+                # and to call `train_step` directly with two strategies.
+                args = make_args(cfg)
+                ds = GraphNetSim.Dataset(:train, cfg.path, args)
+                ds.meta["device"] = DEVICE
+                ds.meta["training_strategy"] = nothing
+                quantities, e_norms, n_norms, o_norms = GraphNetSim.calc_norms(
+                    ds, DEVICE, args
+                )
+                outputs = sum(
+                    ds.meta["features"][tf]["dim"] for tf in ds.meta["output_features"]
+                )
+                gns_dim = ds.meta["dims"] isa AbstractArray ? length(ds.meta["dims"]) :
+                    ds.meta["dims"]
+                gns, _, _, _ = GraphNetSim.load(
+                    quantities,
+                    gns_dim,
+                    e_norms,
+                    n_norms,
+                    o_norms,
+                    outputs,
+                    args.mps,
+                    args.layer_size,
+                    args.hidden_layers,
+                    nothing,
+                    DEVICE,
+                    cp_path,
+                )
+
+                # Pull one trajectory and build node_type / mask just like
+                # the training loop would.
+                data = MLUtils.getobs(ds, 1)
+                node_type = DEVICE(
+                    Float32.(
+                        GraphNetCore.one_hot(
+                            vec(data["node_type"][:, :, 1]),
+                            ds.meta["features"]["node_type"]["data_max"] -
+                            ds.meta["features"]["node_type"]["data_min"] + 1,
+                            1 - ds.meta["features"]["node_type"]["data_min"],
+                        ),
+                    ),
+                )
+
+                # Short window: 3 steps to stay within solver stability
+                # for untrained models. With a freshly trained tiny model
+                # the predicted accelerations are small, so no particle pair
+                # should cross the radius.
+                tstart = 0.0f0
+                tstop = cfg.dt * 3
+
+                function run_train_step(use_cb::Bool)
+                    # Always use Tsit5 for adjoint-based training: Euler()
+                    # is incompatible with InterpolatingAdjoint (backward
+                    # solve doesn't receive dt). Same approach as Groups F/G.
+                    strategy = SingleShooting(
+                        tstart,
+                        cfg.dt,
+                        tstop,
+                        Tsit5();
+                        use_graph_callback=use_cb,
+                    )
+                    init_in = (
+                        gns,
+                        data,
+                        ds.meta,
+                        ds.meta["output_features"],
+                        ds.meta["solver_target_features"],
+                        node_type,
+                        data["mask"],
+                        data["val_mask"],
+                        DEVICE,
+                        nothing,
+                        nothing,
+                        false,  # show_progress_bars
+                    )
+                    init_out = GraphNetSim.init_train_step(strategy, init_in)
+                    return GraphNetSim.train_step(strategy, init_out)
+                end
+
+                gs_off, loss_off = run_train_step(false)
+                gs_on, loss_on = run_train_step(true)
+
+                # Both paths must produce the same (possibly Inf) loss.
+                @test loss_off ≈ loss_on rtol = 1.0f-4 nans = true
+
+                # Walk both gradient pytrees in lockstep. Use the same
+                # leaf iteration as Optimisers/Zygote: ComponentArrays
+                # flatten cleanly via `Array(...)`.
+                g_off_flat = vec(Array(gs_off[1]))
+                g_on_flat = vec(Array(gs_on[1]))
+                @test length(g_off_flat) == length(g_on_flat)
+
+                # If both losses are finite AND gradients are non-trivial,
+                # compare them tightly. An unstable ODE solve (untrained
+                # tiny model) can produce Inf loss and zero gradients —
+                # that's a solver issue, not a graph-cache bug. We still
+                # verify the two paths agree (both zero).
+                if isfinite(loss_off) && maximum(abs, g_off_flat) > 0
+                    @test all(isfinite, g_off_flat)
+                    @test all(isfinite, g_on_flat)
+                    @test maximum(abs, g_off_flat) > 0
+                    # Tight tolerance: same arithmetic, same sensitivity
+                    # algorithm, just a different topology source.
+                    @test isapprox(g_off_flat, g_on_flat; rtol=1.0f-3, atol=1.0f-6)
+                else
+                    # Solver went unstable — just verify both paths agree.
+                    @test isapprox(g_off_flat, g_on_flat; atol=1.0f-6)
                 end
             end
         end

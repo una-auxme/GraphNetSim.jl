@@ -10,6 +10,161 @@ using PointNeighbors
 using ChainRulesCore
 
 """
+    GraphCache{S,W}
+
+Mutable cache holding the current graph topology and the list of particle
+pairs whose normalized distance is within the "watch band" `[0.9, 1.1]` of
+the search radius. Used by the graph-reconstruction callback: topology is
+held constant between callback events so the ODE RHS is differentiable with
+a fixed edge set, and `rebuild_topology!` refreshes it whenever a watched
+pair crosses the radius.
+
+## Fields
+- `senders`, `receivers`: current edge index arrays (device-resident).
+- `watched_pairs`: `2 × n_watched_max` host-side `Int32` matrix of
+  undirected pairs `(i, j)` with `i < j`. Only columns `1:n_watched` are
+  active; the rest are ignored.
+- `n_watched`: number of currently active watched pairs.
+- `n_watched_max`: preallocated capacity. If a rebuild would exceed this,
+  `overflow` is set and the caller is expected to terminate+retry the solve
+  with a larger capacity.
+- `overflow`: set to `true` by `rebuild_topology!` if more than
+  `n_watched_max` pairs fell into the watch band.
+- `radius`: search radius (same units as positions).
+"""
+mutable struct GraphCache{S,W}
+    senders::S
+    receivers::S
+    watched_pairs::W
+    n_watched::Int
+    n_watched_max::Int
+    overflow::Bool
+    radius::Float32
+end
+
+"""
+    GraphCache(position, radius; safety_factor=4.0f0)
+
+Build an empty `GraphCache` sized from the initial particle positions.
+
+Runs one neighbor search at `1.1 * radius` (the upper edge of the watch
+band), counts how many undirected pairs land in `[0.9, 1.1] * radius`, and
+sets `n_watched_max = max(ceil(safety_factor * initial_watched), 16)`.
+Does **not** populate `senders`/`receivers`/`watched_pairs` — call
+`rebuild_topology!` next.
+
+The wider search radius is essential: at the true radius `R`, neighbor
+search only returns pairs with `d ≤ R`, so a particle about to *enter* the
+neighborhood (currently at `d ∈ (R, 1.1R]`) would never be watched and
+would silently join the graph without a callback firing. Searching at
+`1.1R` ensures both entering and exiting candidates are seen.
+"""
+function GraphCache(position, radius::Float32; safety_factor::Float32=4.0f0)
+    search_radius = 1.1f0 * radius
+    senders, receivers, _, rel_dist_norm = point_neighbor_ns(position, search_radius)
+
+    # rel_dist_norm from point_neighbor_ns is distance/search_radius.
+    # Convert to true distance for band comparison.
+    dists_host = vec(Array(rel_dist_norm)) .* search_radius
+
+    s_host = Array(senders)
+    r_host = Array(receivers)
+    initial_watched = 0
+    @inbounds for k in eachindex(s_host)
+        s_host[k] < r_host[k] || continue  # undirected, skip self-edges
+        d = dists_host[k]
+        if 0.9f0 * radius <= d <= 1.1f0 * radius
+            initial_watched += 1
+        end
+    end
+    n_watched_max = max(ceil(Int, safety_factor * initial_watched), 16)
+
+    is_gpu = position isa CuArray
+    senders_init = is_gpu ? CUDA.zeros(Int32, 0) : Int32[]
+    receivers_init = is_gpu ? CUDA.zeros(Int32, 0) : Int32[]
+    watched_pairs = zeros(Int32, 2, n_watched_max)
+    return GraphCache(
+        senders_init, receivers_init, watched_pairs, 0, n_watched_max, false, radius
+    )
+end
+
+"""
+    rebuild_topology!(cache::GraphCache, position) -> Bool
+
+Refresh `cache.senders`, `cache.receivers`, and `cache.watched_pairs` from
+the current particle `position`.
+
+Runs `point_neighbor_ns` at the **widened** radius `1.1 * cache.radius` so
+both in-neighborhood pairs (`d ≤ R`) and about-to-enter pairs (`d ∈ (R,
+1.1R]`) are visible. Distances are recomputed directly from `position` and
+used to split the edge list into:
+
+- **Topology**: pairs with `d ≤ R` → stored in `cache.senders`/`receivers`
+  (device-resident, in both directions as `point_neighbor_ns` returns them).
+- **Watched**: undirected pairs (`i < j`) with `0.9R ≤ d ≤ 1.1R` → stored
+  host-side in `cache.watched_pairs[:, 1:n_watched]` so the callback's
+  `condition!` can index them with plain scalar Julia.
+
+If the number of watched pairs exceeds `cache.n_watched_max`,
+`cache.overflow` is set to `true`, `n_watched` is clamped to
+`n_watched_max`, and the function returns `false`. Callers should then
+terminate the solve, grow `n_watched_max`, and retry.
+
+Returns `true` on success (no overflow).
+"""
+function rebuild_topology!(cache::GraphCache, position)
+    radius = cache.radius
+    search_radius = 1.1f0 * radius
+    senders_wide, receivers_wide, _, rel_dist_norm = point_neighbor_ns(
+        position, search_radius
+    )
+
+    # rel_dist_norm from point_neighbor_ns is distance/search_radius (1×n_edges).
+    # Topology filtering on GPU: keep pairs whose true distance ≤ R,
+    # i.e. (dist_norm * search_radius) ≤ R ⟺ dist_norm ≤ R/search_radius.
+    topo_threshold = radius / search_radius  # = 1/1.1 ≈ 0.909
+    topo_mask = vec(rel_dist_norm) .<= topo_threshold
+    cache.senders = senders_wide[topo_mask]
+    cache.receivers = receivers_wide[topo_mask]
+
+    # Watched pairs: undirected (i < j), true distance in [0.9R, 1.1R].
+    # Convert thresholds to normalized units: d/search_radius.
+    lo = 0.9f0 * radius / search_radius
+    hi = 1.0f0  # 1.1R / search_radius = 1.0 (by definition)
+    dist_norm_vec = vec(rel_dist_norm)
+
+    # Transfer only senders/receivers/dists to host for the watched-pair
+    # scalar loop. This is a single bulk transfer rather than per-element
+    # scalar indexing, and avoids recomputing distances.
+    s_host = Array(senders_wide)
+    r_host = Array(receivers_wide)
+    d_host = Array(dist_norm_vec)
+
+    n_watched = 0
+    overflow = false
+    @inbounds for k in eachindex(s_host)
+        i = s_host[k]
+        j = r_host[k]
+        i < j || continue  # undirected
+        dn = d_host[k]
+        if lo <= dn <= hi
+            if n_watched < cache.n_watched_max
+                n_watched += 1
+                cache.watched_pairs[1, n_watched] = i
+                cache.watched_pairs[2, n_watched] = j
+            else
+                overflow = true
+                break
+            end
+        end
+    end
+
+    cache.n_watched = n_watched
+    cache.overflow = overflow
+    return !overflow
+end
+
+"""
     build_graph(gns::GraphNetCore.GraphNetwork, data::Dict{String,Any}, datapoint::Integer, meta, node_type, device)
 
 Construct a [FeatureGraph](https://una-auxme.github.io/MeshGraphNets.jl/dev/graph_net_core/#GraphNetCore.FeatureGraph) from trajectory data at a specific time step.
@@ -75,27 +230,98 @@ All features are normalized using the normalizers stored in the model.
 function build_graph(
     gns::GraphNetCore.GraphNetwork, position, velocity, meta, node_type, mask, device
 ) # TODO check ODE solve and if this is really repeatedly done
-    # if size(boundaries,2)== 0
-    #     current_position = position
-    # else
-    #     current_position = hcat(position, boundaries)
-    #     velocity = hcat(velocity, zeros(Float32, meta["dims"], size(boundaries,2)))
-    # end
-
     senders, receivers, rel_displacement, rel_dist_norm = point_neighbor_ns(
         position, Float32(meta["default_connectivity_radius"])
     )
-    # if size(boundaries,2) != 0
-    # #     # sender_old, receiver_old, senders, receivers, _, b_particle = check_and_delete_filtered(senders, receivers, size(position, 2), true)
-    # #     # rel_displacement = (position[:, receiver_old] - position[:, sender_old]) ./ Float32(meta["default_connectivity_radius"])
-    # #     # rel_dist_norm = sqrt.(sum(abs2, rel_displacement; dims = 1))
-    #     dist_bound = compute_clostest_dist_bound(Array(senders), Array(receivers), Array(rel_dist_norm), Array(rel_displacement), size(position,2), length(unique(Array(b_particle))))
-    #     particles = unique(Array(senders))
-    # else
-    #     dist_bound = cu(ones(Float32, size(position)...))
-    #     particles = Colon()
-    # end
+    return _assemble_feature_graph(
+        gns,
+        position,
+        velocity,
+        rel_displacement,
+        rel_dist_norm,
+        senders,
+        receivers,
+        meta,
+        node_type,
+        mask,
+        device,
+    )
+end
 
+"""
+    build_graph_cached(gns, cache::GraphCache, position, velocity, meta, node_type, mask, device)
+
+Construct a `FeatureGraph` using the topology stored in `cache` instead of
+running a fresh neighbor search.
+
+Computes `rel_displacement` and `rel_dist_norm` directly from
+`cache.senders`/`cache.receivers` via plain (Zygote-differentiable) array
+indexing, then delegates feature assembly to `_assemble_feature_graph`.
+This is the path used inside the ODE RHS when the graph-reconstruction
+callback is active: between callback events the topology is held constant
+so gradients flow cleanly through the cached edge set without ever calling
+the custom `point_neighbor_ns` rrule.
+
+The caller is responsible for keeping `cache` in sync with `position`
+(typically via `maybe_rebuild_topology!` called from the ODE RHS).
+"""
+function build_graph_cached(
+    gns::GraphNetCore.GraphNetwork,
+    cache::GraphCache,
+    position,
+    velocity,
+    meta,
+    node_type,
+    mask,
+    device,
+)
+    radius = cache.radius
+    senders = cache.senders
+    receivers = cache.receivers
+
+    # Differentiable edge features from cached topology. Direction matches
+    # `point_neighbor_ns`: pos_diff = pos[receiver] - pos[sender].
+    rel_displacement = (position[:, receivers] .- position[:, senders]) ./ radius
+    rel_dist_norm = sqrt.(sum(abs2, rel_displacement; dims=1) .+ 1.0f-12)
+
+    return _assemble_feature_graph(
+        gns,
+        position,
+        velocity,
+        rel_displacement,
+        rel_dist_norm,
+        senders,
+        receivers,
+        meta,
+        node_type,
+        mask,
+        device,
+    )
+end
+
+"""
+    _assemble_feature_graph(gns, position, velocity, rel_displacement, rel_dist_norm,
+                            senders, receivers, meta, node_type, mask, device)
+
+Internal helper that builds a `FeatureGraph` from already-computed edge
+topology and edge geometry. Shared between `build_graph` (which sources its
+topology from `point_neighbor_ns`) and `build_graph_cached` (which sources
+it from a `GraphCache`). All node-feature/edge-feature normalization and
+the boundary distance bound logic live here.
+"""
+function _assemble_feature_graph(
+    gns::GraphNetCore.GraphNetwork,
+    position,
+    velocity,
+    rel_displacement,
+    rel_dist_norm,
+    senders,
+    receivers,
+    meta,
+    node_type,
+    mask,
+    device,
+)
     if n_node_types(meta) > 1
         if length(mask) == size(position, 2)
             dist_bound = device(ones(Float32, size(position)...))

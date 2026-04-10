@@ -28,6 +28,7 @@ import Statistics: mean
 
 include("utils.jl")
 include("graph.jl")
+include("callbacks.jl")
 include("solve.jl")
 include("dataset.jl")
 include("visualize.jl")
@@ -1026,6 +1027,23 @@ function eval_network!(
             enabled=args.show_progress_bars,
         )
 
+        # Optional graph-reconstruction cache for eval rollouts. Mirrors
+        # the training-side wiring: only solver-based strategies carry the
+        # `use_graph_callback` flag, so we feature-detect via `hasproperty`.
+        # Topology rebuilds happen inside the ODE RHS via maybe_rebuild_topology!.
+        cache_eval = nothing
+        if hasproperty(args.training_strategy, :use_graph_callback) &&
+            args.training_strategy.use_graph_callback
+            radius = Float32(ds_test.meta["default_connectivity_radius"])
+            u0_pos = device(initial_state["position"])
+            cache_eval = GraphCache(
+                u0_pos,
+                radius;
+                safety_factor=args.training_strategy.graph_callback_safety,
+            )
+            rebuild_topology!(cache_eval, u0_pos)
+        end
+
         sol = rollout(
             solver,
             gns,
@@ -1041,7 +1059,8 @@ function eval_network!(
             dt,
             saves,
             device,
-            pr,
+            pr;
+            cache=cache_eval,
         )
 
         sol_acc = sol(sol.t, Val{1})
