@@ -16,7 +16,7 @@
 #   Physics:       connectivity_radius
 #
 # Usage:
-#   julia --project example/DamBreakSmall/DamBreakSmall_optuna.jl
+#   julia --project=example/DamBreakSmall example/DamBreakSmall/DamBreakSmall_optuna.jl
 #
 # The study is persisted in a SQLite database, so re-running the script
 # continues from where it left off.

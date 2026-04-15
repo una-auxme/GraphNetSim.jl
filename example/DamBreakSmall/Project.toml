@@ -1,0 +1,13 @@
+[deps]
+GraphNetSim = "5ff66f56-808c-48e7-ac84-dd29877231f8"
+Optimisers = "3bd65402-5787-11e9-1adc-39752487f4e2"
+Optuna = "a5d0552b-b2dc-4f08-ac5c-85ca7d701b92"
+OrdinaryDiffEq = "1dea7af3-3e70-54e6-95c3-0bf5283fa5ed"
+
+[sources.GraphNetSim]
+path = "../.."
+
+[compat]
+Optimisers = "0.4, 1"
+Optuna = "0.2.1"
+OrdinaryDiffEq = "6.85 - 6"
