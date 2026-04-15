@@ -1096,13 +1096,19 @@ function train_loss(strategy::DerivativeStrategy, t::Tuple)
     output, st = gns.model(graph, ps, gns.st)
     gns.st = st
 
-    # error = loss_function(target, output)
-    # error = loss_function(target, output[:, mask])
-    # println(maximum(output))
-    # println(maximum(target))
-    error = (target .- output[:, mask]) .^ 2
+    diff = target .- output[:, mask]
+    error = if strategy.loss_function == :mse
+        diff .^ 2
+    elseif strategy.loss_function == :mae
+        abs.(diff)
+    else
+        throw(
+            ArgumentError(
+                "Unknown loss_function=$(strategy.loss_function). Use :mse or :mae."
+            ),
+        )
+    end
 
-    # loss = mean(error[mask])
     loss = mean(error)
 
     return loss
@@ -1178,17 +1184,21 @@ and optional random shuffling.
 struct DerivativeTraining <: DerivativeStrategy
     window_size::Integer
     random::Bool
+    loss_function::Symbol
 end
 
 """
-    DerivativeTraining(; window_size=0, random=true)
+    DerivativeTraining(; window_size=0, random=true, loss_function=:mse)
 
 Constructor for DerivativeTraining strategy.
 
 ## Keyword Arguments
 - `window_size::Integer=0`: Number of timesteps per trajectory (0 means use all).
 - `random::Bool=true`: Whether to shuffle timesteps within the window.
+- `loss_function::Symbol=:mse`: Loss function type (`:mse` or `:mae`).
 """
-function DerivativeTraining(; window_size::Integer=0, random=true)
-    DerivativeTraining(window_size, random)
+function DerivativeTraining(;
+    window_size::Integer=0, random=true, loss_function::Symbol=:mse
+)
+    DerivativeTraining(window_size, random, loss_function)
 end

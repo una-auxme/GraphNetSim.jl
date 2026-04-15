@@ -70,6 +70,11 @@ Configuration structure for training and evaluating Graph Neural Network simulat
 ### Training Strategy
 - `training_strategy::TrainingStrategy=DerivativeTraining()`: Method for computing loss
 
+### Physics
+- `connectivity_radius::Union{Nothing,Float64}=nothing`: Override the default connectivity radius from `meta.json`.
+  When `nothing`, uses `meta["default_connectivity_radius"]`. Set this to vary the radius as a hyperparameter
+  without modifying the dataset's `meta.json` file.
+
 ### Hardware and Optimization
 - `use_cuda::Bool=true`: Enable CUDA GPU acceleration (if available)
 - `gpu_device::Union{Nothing,CuDevice}`: CUDA device to use (auto-selected if CUDA functional)
@@ -102,6 +107,7 @@ Configuration structure for training and evaluating Graph Neural Network simulat
     types_noisy::Vector{Integer} = Int[]
     noise_stddevs::Vector{Float32} = [0.0f0]
     training_strategy::TrainingStrategy = DerivativeTraining()
+    connectivity_radius::Union{Nothing,Float64} = nothing
     use_cuda::Bool = true
     gpu_device::Union{Nothing,CuDevice} = CUDA.functional() ? CUDA.device() : nothing
     show_progress_bars::Bool = true
@@ -312,7 +318,7 @@ function calc_norms(dataset, device, args)
         end
     end
     if n_node_types(dataset.meta) > 1
-        quantities += length(dataset.meta["bounds"]) * 2
+        quantities += dataset.meta["dims"]
     end
 
     return quantities, e_norms, n_norms, o_norms
@@ -423,12 +429,18 @@ function train_network(opt, ds_path, cp_path; kws...)
     ds_train.meta["types_noisy"] = args.types_noisy
     ds_train.meta["noise_stddevs"] = args.noise_stddevs
     ds_train.meta["device"] = device
+    if !isnothing(args.connectivity_radius)
+        ds_train.meta["default_connectivity_radius"] = args.connectivity_radius
+    end
     ds_valid = Dataset(:valid, ds_path, args)
     ds_valid.meta["types_updated"] = args.types_updated
     ds_valid.meta["types_noisy"] = args.types_noisy
     ds_valid.meta["noise_stddevs"] = args.noise_stddevs
     ds_valid.meta["device"] = device
     ds_valid.meta["training_strategy"] = nothing
+    if !isnothing(args.connectivity_radius)
+        ds_valid.meta["default_connectivity_radius"] = args.connectivity_radius
+    end
 
     @info "Training data loaded!"
     Threads.nthreads() < 2 &&
@@ -880,6 +892,9 @@ function eval_network(
     ds_test = Dataset(:test, ds_path, args)
     ds_test.meta["device"] = device
     ds_test.meta["training_strategy"] = nothing
+    if !isnothing(args.connectivity_radius)
+        ds_test.meta["default_connectivity_radius"] = args.connectivity_radius
+    end
 
     # clear_log(1, false)
     @info "Evaluation data loaded!"

@@ -630,49 +630,47 @@ Stores edge information (senders, receivers, features, bounds) in the trajectory
 
 ## Stores in traj_dict
 - `senders`: List of sender node indices for each time step.
-- `senders_old`: List of old sender indices (for potential filtering).
 - `receivers`: List of receiver node indices for each time step.
 - `edge_features`: Relative displacement and distance normalized by connectivity radius.
-- `dist_bounds`: Distance bounds for each edge.
+- `dist_bounds`: Displacement to closest boundary particle for each time step.
 """
 function create_edges(traj_dict::Dict{String,Any}, meta::Dict{String,Any})
     local senders = []
-    local senders_old = []
     local receivers = []
     local edge_features = []
     local dist_bounds = []
     sender = nothing
     receiver = nothing
-    sender_old = []
     dist_bound = []
     position = traj_dict["position"]
 
     for i in axes(position)[3]
-        fluid_position = position[:, traj_dict["mask"], i]
         current_position = position[:, :, i]
         sender, receiver, rel_displacement, rel_dist_norm = point_neighbor_ns(
             current_position, Float32(meta["default_connectivity_radius"])
         )
-        # if meta["features"]["node_type"]["data_max"] - meta["features"]["node_type"]["data_min"] != 0
-        #     sender_old, receiver_old, sender, receiver, _, b_particle = check_and_delete_filtered(sender, receiver, size(fluid_position, 2), true)
-        #     rel_displacement = (current_position[:, receiver_old] - current_position[:, sender_old]) ./ Float32(meta["default_connectivity_radius"])
-        #     rel_dist_norm = sqrt.(sum(abs2, rel_displacement; dims = 1))
-        #     dist_bound = compute_clostest_dist_bound(Array(sender_old), Array(receiver_old), Array(rel_dist_norm), Array(rel_displacement), size(fluid_position,2), length(unique(Array(b_particle))))
-        # else
-        #     dist_bound = ones(size(fluid_position))
-        # end
-        dist_bound = ones(size(fluid_position))
+        if n_node_types(meta) > 1
+            dist_bound = compute_closest_boundary_displacement(
+                sender,
+                receiver,
+                rel_dist_norm,
+                current_position,
+                traj_dict["mask"],
+                Float32(meta["default_connectivity_radius"]),
+                identity,
+            )
+        else
+            dist_bound = ones(Float32, size(current_position))
+        end
         push!(
             edge_features,
             Array(meta["device"](vcat(rel_displacement, rel_dist_norm) .+ 1.0f-8)),
         )
         push!(senders, Array(sender))
-        push!(senders_old, Array(sender_old))
         push!(receivers, Array(receiver))
         push!(dist_bounds, dist_bound)
     end
     traj_dict["senders"] = meta["device"](senders)
-    traj_dict["senders_old"] = senders_old
     traj_dict["receivers"] = meta["device"](receivers)
     traj_dict["edge_features"] = meta["device"](edge_features)
     traj_dict["dist_bounds"] = meta["device"](dist_bounds)

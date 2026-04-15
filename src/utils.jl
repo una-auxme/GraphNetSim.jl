@@ -397,10 +397,10 @@ Conflicting statistics from a different normalization type are removed.
 - `String`: Path to the written `meta.json` file.
 """
 function update_meta!(path::String, norm_type::Symbol)
-    if norm_type ∉ (:online, :minmax, :meanstd)
+    if norm_type ∉ (:online, :minmax, :meanstd, :all)
         throw(
             ArgumentError(
-                "Invalid norm_type=:$norm_type. Must be one of :online, :minmax, :meanstd."
+                "Invalid norm_type=:$norm_type. Must be one of :online, :minmax, :meanstd, :all."
             ),
         )
     end
@@ -420,7 +420,7 @@ function update_meta!(path::String, norm_type::Symbol)
     conflicting_minmax = ("data_min", "data_max", "output_min", "output_max")
     conflicting_meanstd = ("data_mean", "data_std")
 
-    if norm_type == :minmax
+    if norm_type in (:minmax, :all)
         stats = data_minmax(path)
 
         for (key, val) in stats
@@ -440,14 +440,17 @@ function update_meta!(path::String, norm_type::Symbol)
                 end
                 meta["features"][key]["data_min"] = Float64(val[1])
                 meta["features"][key]["data_max"] = Float64(val[2])
-                # Remove conflicting meanstd keys
-                for ck in conflicting_meanstd
-                    delete!(meta["features"][key], ck)
+                if norm_type == :minmax
+                    # Remove conflicting meanstd keys only when not computing both
+                    for ck in conflicting_meanstd
+                        delete!(meta["features"][key], ck)
+                    end
                 end
             end
         end
+    end
 
-    elseif norm_type == :meanstd
+    if norm_type in (:meanstd, :all)
         stats = data_meanstd(path)
 
         for (key, val) in stats
@@ -460,9 +463,11 @@ function update_meta!(path::String, norm_type::Symbol)
             end
             meta["features"][key]["data_mean"] = Float64.(val[1])
             meta["features"][key]["data_std"] = Float64.(val[2])
-            # Remove conflicting minmax keys
-            for ck in conflicting_minmax
-                delete!(meta["features"][key], ck)
+            if norm_type == :meanstd
+                # Remove conflicting minmax keys only when not computing both
+                for ck in conflicting_minmax
+                    delete!(meta["features"][key], ck)
+                end
             end
         end
     end

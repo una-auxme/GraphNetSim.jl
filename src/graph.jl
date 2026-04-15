@@ -74,40 +74,23 @@ All features are normalized using the normalizers stored in the model.
 """
 function build_graph(
     gns::GraphNetCore.GraphNetwork, position, velocity, meta, node_type, mask, device
-) # TODO check ODE solve and if this is really repeatedly done
-    # if size(boundaries,2)== 0
-    #     current_position = position
-    # else
-    #     current_position = hcat(position, boundaries)
-    #     velocity = hcat(velocity, zeros(Float32, meta["dims"], size(boundaries,2)))
-    # end
-
+)
     senders, receivers, rel_displacement, rel_dist_norm = point_neighbor_ns(
         position, Float32(meta["default_connectivity_radius"])
     )
-    # if size(boundaries,2) != 0
-    # #     # sender_old, receiver_old, senders, receivers, _, b_particle = check_and_delete_filtered(senders, receivers, size(position, 2), true)
-    # #     # rel_displacement = (position[:, receiver_old] - position[:, sender_old]) ./ Float32(meta["default_connectivity_radius"])
-    # #     # rel_dist_norm = sqrt.(sum(abs2, rel_displacement; dims = 1))
-    #     dist_bound = compute_clostest_dist_bound(Array(senders), Array(receivers), Array(rel_dist_norm), Array(rel_displacement), size(position,2), length(unique(Array(b_particle))))
-    #     particles = unique(Array(senders))
-    # else
-    #     dist_bound = cu(ones(Float32, size(position)...))
-    #     particles = Colon()
-    # end
 
     if n_node_types(meta) > 1
         if length(mask) == size(position, 2)
             dist_bound = device(ones(Float32, size(position)...))
         else
-            boundaries = device(Float32.(vcat(permutedims.(meta["bounds"])...)))
-            dist_low_bound = position .- boundaries[:, 1]
-            dist_up_bound = boundaries[:, 2] .- position
-            dist_bound = clamp.(
-                vcat(dist_low_bound, dist_up_bound) ./
+            dist_bound = compute_closest_boundary_displacement(
+                senders,
+                receivers,
+                rel_dist_norm,
+                position,
+                mask,
                 Float32(meta["default_connectivity_radius"]),
-                -1.0f0,
-                1.0f0,
+                device,
             )
         end
     end
@@ -245,50 +228,200 @@ function replace_with_indices(arr1, arr2, refs, start_boundary)
 end
 
 """
-    compute_clostest_dist_bound(senders, receivers, rel_dist_norm, rel_displacement, len_particle, len_b_particle)::AbstractArray
+    compute_closest_boundary_displacement(senders, receivers, rel_dist_norm, position, mask, radius, device)
 
-Compute distance bounds for particles in contact with boundaries.
+Compute displacement to the closest boundary particle for every particle.
 
-For each fluid particle in contact with boundary particles, finds the closest boundary contact
-and computes a distance bound field. Returns ones for fluid-fluid interactions and the negative
-relative displacement normalized for fluid-boundary interactions.
+Uses the edge connectivity from the neighbor search to identify, for each fluid particle,
+the closest boundary particle neighbor. Returns a displacement vector per particle that is
+fully differentiable w.r.t. `position` (required for ODE-based training strategies).
+
+The discrete selection of which boundary particle is closest is wrapped in
+`@ignore_derivatives`; the actual displacement is computed from `position` directly.
 
 ## Arguments
 - `senders`: Source particle indices from edge connectivity.
 - `receivers`: Receiver particle indices from edge connectivity.
-- `rel_dist_norm`: Normalized distances for each edge.
-- `rel_displacement`: Relative displacement vectors (dims × n_edges).
-- `len_particle`: Number of fluid particles (boundary indices start after this).
-- `len_b_particle`: Number of boundary particles.
+- `rel_dist_norm`: Normalized edge distances (1 × n_edges).
+- `position`: Particle positions (dims × n_particles), tracked by Zygote.
+- `mask`: Indices of fluid particles (particles whose type is in `types_updated`).
+- `radius::Float32`: Connectivity radius for normalization.
+- `device`: Device placement function (cpu_device or gpu_device).
 
 ## Returns
-- `AbstractArray`: Distance bound field with shape (dims, len_particle + len_b_particle),
-  where 1.0 for fluid-fluid and -rel_displacement for closest fluid-boundary interactions.
+- `AbstractArray`: Distance bound field with shape (dims, n_particles).
+  - Boundary particles: `0.0` (they are the boundary).
+  - Fluid with a boundary neighbor: clamped displacement to closest boundary, normalized by radius.
+  - Fluid without a boundary neighbor: `1.0` (far from boundary).
 """
-function compute_clostest_dist_bound(
-    senders, receivers, rel_dist_norm, rel_displacement, len_particle, len_b_particle
+function compute_closest_boundary_displacement(
+    senders, receivers, rel_dist_norm, position, mask, radius, device
 )
-    indice_boundary = findall(x -> x .> len_particle, senders)
-    fluid_with_boundary = receivers[indice_boundary]
+    n_particles = size(position, 2)
 
-    save = unique(fluid_with_boundary)
-    euclid = zeros(Int, length(save))
-    for idx in indice_boundary
-        part = receivers[idx]
-        search_idx = findfirst(x -> x == part, save)
-        if euclid[search_idx] == 0
-            euclid[search_idx] = idx
-        elseif rel_dist_norm[euclid[search_idx]] > rel_dist_norm[idx]
-            euclid[search_idx] = idx
+    # --- Non-differentiable: find closest boundary particle per particle ---
+    closest_bnd_idx, has_bnd_mask, no_bnd_mask = @ignore_derivatives begin
+        if senders isa CuArray
+            _boundary_selection_gpu(
+                senders, receivers, rel_dist_norm, mask, n_particles
+            )
+        else
+            _boundary_selection_cpu(
+                senders, receivers, rel_dist_norm, mask, n_particles, device
+            )
         end
     end
 
-    z = hcat(
-        ones(size(rel_displacement, 1), len_particle),
-        zeros(size(rel_displacement, 1), len_b_particle),
+    # --- Differentiable: compute displacement from position ---
+    displacements = clamp.(
+        (position .- position[:, closest_bnd_idx]) ./ radius, -1.0f0, 1.0f0
     )
-    z[:, receivers[euclid]] = - rel_displacement[:, euclid]
-    return z
+
+    return has_bnd_mask .* displacements .+ no_bnd_mask
+end
+
+"""
+    _boundary_selection_cpu(senders, receivers, rel_dist_norm, mask, n_particles, device)
+
+CPU path for selecting the closest boundary particle per particle.
+Uses a scalar loop over edges — efficient on CPU, avoids GPU transfers.
+"""
+function _boundary_selection_cpu(
+    senders, receivers, rel_dist_norm, mask, n_particles, device
+)
+    m = mask isa Array ? mask : Array(mask)
+
+    # Boolean array for O(1) fluid lookup (avoids Set hashing + Int conversion)
+    is_fluid = falses(n_particles)
+    @inbounds for idx in m
+        is_fluid[idx] = true
+    end
+
+    # Identify boundary particle indices
+    boundary_indices = findall(.!is_fluid)
+    default_bnd = isempty(boundary_indices) ? Int32(1) : Int32(boundary_indices[1])
+
+    # For each fluid particle, find closest boundary neighbor via edges
+    best_bnd = fill(default_bnd, n_particles)
+    best_dist = fill(Inf32, n_particles)
+
+    @inbounds for e in eachindex(senders)
+        se = senders[e]
+        re = receivers[e]
+        if !is_fluid[se] && is_fluid[re]
+            d = rel_dist_norm[1, e]
+            if d < best_dist[re]
+                best_dist[re] = d
+                best_bnd[re] = Int32(se)
+            end
+        end
+    end
+
+    # Boundary particles point to themselves → displacement = 0
+    @inbounds for i in boundary_indices
+        best_bnd[i] = Int32(i)
+    end
+
+    # Build masks: (1, n_particles)
+    hbm = zeros(Float32, 1, n_particles)
+    nbm = zeros(Float32, 1, n_particles)
+    @inbounds for i in 1:n_particles
+        if is_fluid[i]
+            if best_dist[i] < Inf32
+                hbm[1, i] = 1.0f0
+            else
+                nbm[1, i] = 1.0f0
+            end
+        end
+    end
+
+    return (device(best_bnd), device(hbm), device(nbm))
+end
+
+"""
+    _boundary_selection_gpu(senders, receivers, rel_dist_norm, mask, n_particles)
+
+GPU-native path for selecting the closest boundary particle per particle.
+Uses a CUDA kernel with atomic argmin (packed Int64) to avoid GPU→CPU→GPU transfers.
+
+Only `mask` (small, n_fluid elements) is transferred to CPU for building the boolean
+fluid vector. Edge arrays stay on GPU entirely.
+"""
+function _boundary_selection_gpu(
+    senders, receivers, rel_dist_norm, mask, n_particles
+)
+    # Build is_fluid on CPU (mask is small: n_fluid ints), then upload to GPU
+    m_cpu = mask isa Array ? mask : Array(mask)
+    is_fluid_cpu = falses(n_particles)
+    @inbounds for idx in m_cpu
+        is_fluid_cpu[idx] = true
+    end
+    is_fluid = CuArray(is_fluid_cpu)
+
+    # Find default boundary index (first non-fluid particle)
+    default_bnd = Int64(1)
+    for i in 1:n_particles
+        if !is_fluid_cpu[i]
+            default_bnd = Int64(i)
+            break
+        end
+    end
+
+    # Pack (Inf32, default_bnd) as initial value for atomic argmin.
+    # High 32 bits = distance reinterpreted as Int32, low 32 bits = sender index.
+    # For positive floats, int comparison preserves float ordering.
+    inf_bits = Int64(reinterpret(Int32, Inf32))
+    inf_packed = (inf_bits << 32) | default_bnd
+
+    # Initialize: boundary particles → pack(0.0, self), fluid → pack(Inf, default)
+    packed_init = fill(inf_packed, n_particles)
+    @inbounds for i in 1:n_particles
+        if !is_fluid_cpu[i]
+            packed_init[i] = Int64(i)  # pack(0.0f0, i) = (0 << 32) | i = i
+        end
+    end
+    packed_best = CuArray(packed_init)
+
+    # Launch scatter-argmin kernel
+    n_edges = length(senders)
+    threads = 256
+    blocks = cld(n_edges, threads)
+    @cuda threads = threads blocks = blocks _scatter_bnd_argmin_kernel!(
+        packed_best, senders, receivers, rel_dist_norm, is_fluid, Int32(n_edges)
+    )
+
+    # Unpack results on GPU (vectorized, no scalar indexing)
+    best_bnd = Int32.(packed_best .& Int64(0xFFFFFFFF))
+    dist_bits = Int32.(packed_best .>> 32)
+    was_updated = dist_bits .< Int32(reinterpret(Int32, Inf32))
+
+    hbm = reshape(Float32.(is_fluid .& was_updated), 1, n_particles)
+    nbm = reshape(Float32.(is_fluid .& .!was_updated), 1, n_particles)
+
+    return (best_bnd, hbm, nbm)
+end
+
+"""
+    _scatter_bnd_argmin_kernel!(packed_best, senders, receivers, rel_dist_norm, is_fluid, n_edges)
+
+CUDA kernel for scatter-argmin of boundary→fluid edge distances.
+Uses atomic_min on packed Int64 values (distance bits << 32 | sender index)
+to find the closest boundary particle per fluid particle without race conditions.
+"""
+function _scatter_bnd_argmin_kernel!(
+    packed_best, senders, receivers, rel_dist_norm, is_fluid, n_edges
+)
+    idx = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+    if idx <= n_edges
+        s = senders[idx]
+        r = receivers[idx]
+        @inbounds if !is_fluid[s] && is_fluid[r]
+            d_bits = Int64(reinterpret(Int32, rel_dist_norm[1, idx]))
+            packed = (d_bits << 32) | Int64(s)
+            CUDA.atomic_min!(pointer(packed_best, Int64(r)), packed)
+        end
+    end
+    return nothing
 end
 
 """

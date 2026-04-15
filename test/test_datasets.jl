@@ -260,6 +260,48 @@ for cfg in CONFIGS
         end
 
         # ─────────────────────────────────────────────────────────────────
+        # Group C2: Closest boundary displacement (multi-type only)
+        # ─────────────────────────────────────────────────────────────────
+        if cfg.n_fluid < cfg.n_particles
+            @testset "C2: Closest boundary displacement" begin
+                println("Running: C2 — Closest boundary displacement ($(cfg.name))")
+                pos = h5open(joinpath(cfg.path, "train.h5"), "r") do f
+                    Float32.(read_dataset(open_group(f, "trajectory_1"), "pos[1]"))
+                end
+                types = h5open(joinpath(cfg.path, "train.h5"), "r") do f
+                    Int32.(read_dataset(open_group(f, "trajectory_1"), "type"))
+                end
+                cr = cfg.connectivity_radius
+                types_vec = ndims(types) == 1 ? types : types[1, :]
+                mask = Int32.(findall(x -> x in cfg.types_updated, types_vec))
+
+                s, r, _, rdn = GraphNetSim.point_neighbor_ns(pos, cr)
+
+                dist_bound = GraphNetSim.compute_closest_boundary_displacement(
+                    s, r, rdn, pos, mask, cr, identity
+                )
+
+                boundary_indices = setdiff(1:cfg.n_particles, mask)
+
+                @testset "C2.1: shape is (dims, n_particles)" begin
+                    @test size(dist_bound) == (cfg.dims, cfg.n_particles)
+                end
+
+                @testset "C2.2: boundary particles have zero displacement" begin
+                    @test all(dist_bound[:, boundary_indices] .== 0.0f0)
+                end
+
+                @testset "C2.3: values are clamped to [-1, 1]" begin
+                    @test all(-1.0f0 .<= dist_bound .<= 1.0f0)
+                end
+
+                @testset "C2.4: some fluid particles detect boundary neighbors" begin
+                    @test any(dist_bound[:, mask] .!= 1.0f0)
+                end
+            end
+        end
+
+        # ─────────────────────────────────────────────────────────────────
         # Group D: Strategy logic (pure logic, no ODE or GPU compute)
         # ─────────────────────────────────────────────────────────────────
         @testset "D: Strategy logic" begin
