@@ -528,6 +528,82 @@ for cfg in CONFIGS
                 @testset "J6: load_model_config returns nothing when absent" begin
                     @test isnothing(load_model_config(mktempdir()))
                 end
+
+                @testset "J7: extrapolate_network beyond GT horizon" begin
+                    tstart = 0.0f0
+                    extra_steps = 5
+                    npred = cfg.traj_length + extra_steps
+                    tstop = round(cfg.dt * (npred - 1); digits=6)
+                    saves = collect(tstart:cfg.dt:tstop)
+                    eval_path = mktempdir()
+
+                    extrapolate_network(
+                        cfg.path,
+                        cp_path,
+                        eval_path,
+                        Tsit5();
+                        start=tstart,
+                        stop=tstop,
+                        dt=cfg.dt,
+                        saves=saves,
+                        mse_steps=saves,
+                        types_updated=cfg.types_updated,
+                        use_cuda=HAS_CUDA,
+                    )
+
+                    h5path = joinpath(eval_path, "tsit5", "trajectories.h5")
+                    @test isfile(h5path)
+
+                    h5open(h5path, "r") do h
+                        tg = h["trajectory_1"]
+                        @test read(tg, "timesteps") == length(saves)
+                        pred = tg["prediction"]
+                        @test haskey(pred, "pos[$(length(saves))]")
+                        @test haskey(pred, "err[$(length(saves))]")
+                        noverlap_idx = cfg.traj_length
+                        overlap_err = read(pred, "err[$noverlap_idx]")
+                        @test all(isfinite, overlap_err)
+                        extrapolated_err = read(pred, "err[$(length(saves))]")
+                        @test all(isnan, extrapolated_err)
+
+                        @test haskey(tg, "gt")
+                        gt = tg["gt"]
+                        @test haskey(gt, "pos[$(cfg.traj_length)]")
+                        @test !haskey(gt, "pos[$(length(saves))]")
+                    end
+                end
+
+                @testset "J8: extrapolate_network with has_ground_truth=false" begin
+                    tstart = 0.0f0
+                    tstop = cfg.dt * 10
+                    saves = collect(tstart:cfg.dt:tstop)
+                    eval_path = mktempdir()
+
+                    extrapolate_network(
+                        cfg.path,
+                        cp_path,
+                        eval_path,
+                        Tsit5();
+                        start=tstart,
+                        stop=tstop,
+                        dt=cfg.dt,
+                        saves=saves,
+                        has_ground_truth=false,
+                        types_updated=cfg.types_updated,
+                        use_cuda=HAS_CUDA,
+                    )
+
+                    h5path = joinpath(eval_path, "tsit5", "trajectories.h5")
+                    @test isfile(h5path)
+
+                    h5open(h5path, "r") do h
+                        tg = h["trajectory_1"]
+                        @test !haskey(tg, "gt")
+                        pred = tg["prediction"]
+                        @test haskey(pred, "pos[$(length(saves))]")
+                        @test !haskey(pred, "err[1]")
+                    end
+                end
             end
         end
 
