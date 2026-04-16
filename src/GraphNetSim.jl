@@ -116,6 +116,8 @@ Configuration structure for training and evaluating Graph Neural Network simulat
     save_step::Bool = false
     on_grad::Union{Nothing,Function} = nothing
     on_valid::Union{Nothing,Function} = nothing
+    use_graph_cache::Bool = false
+    graph_cache_safety::Float32 = 4.0f0
 end
 
 """
@@ -414,6 +416,15 @@ function train_network(opt, ds_path, cp_path; kws...)
     else
         @info "Training on CPU..."
         device = cpu_device()
+    end
+
+    # Propagate the Args-level graph cache flag into the training strategy
+    # so that solver-based strategies (Batching, SingleShooting, MultipleShooting)
+    # use the cached graph topology during train_step and validation_step.
+    if args.use_graph_cache && args.training_strategy isa SolverStrategy
+        args.training_strategy = with_graph_cache(
+            args.training_strategy; safety=args.graph_cache_safety
+        )
     end
 
     @info "Training with $(typeof(args.training_strategy))..."
@@ -1027,20 +1038,25 @@ function eval_network!(
             enabled=args.show_progress_bars,
         )
 
-        # Optional graph-reconstruction cache for eval rollouts. Mirrors
-        # the training-side wiring: only solver-based strategies carry the
-        # `use_graph_callback` flag, so we feature-detect via `hasproperty`.
+        # Optional graph-reconstruction cache for eval rollouts.
+        # Enabled either via `args.use_graph_cache` (preferred) or via a
+        # training strategy that carries `use_graph_callback=true` (legacy).
         # Topology rebuilds happen inside the ODE RHS via maybe_rebuild_topology!.
         cache_eval = nothing
-        if hasproperty(args.training_strategy, :use_graph_callback) &&
-            args.training_strategy.use_graph_callback
-            radius = Float32(ds_test.meta["default_connectivity_radius"])
-            u0_pos = device(initial_state["position"])
-            cache_eval = GraphCache(
-                u0_pos,
-                radius;
-                safety_factor=args.training_strategy.graph_callback_safety,
+        _use_cache =
+            args.use_graph_cache || (
+                hasproperty(args.training_strategy, :use_graph_callback) &&
+                args.training_strategy.use_graph_callback
             )
+        if _use_cache
+            radius = Float32(ds_test.meta["default_connectivity_radius"])
+            safety = if hasproperty(args.training_strategy, :graph_callback_safety)
+                args.training_strategy.graph_callback_safety
+            else
+                args.graph_cache_safety
+            end
+            u0_pos = device(initial_state["position"])
+            cache_eval = GraphCache(u0_pos, radius; safety_factor=safety)
             rebuild_topology!(cache_eval, u0_pos)
         end
 

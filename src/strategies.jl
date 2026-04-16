@@ -207,6 +207,26 @@ algorithms for gradient computation.
 abstract type SolverStrategy <: TrainingStrategy end
 
 """
+    with_graph_cache(strategy::SolverStrategy; safety::Float32=4.0f0)
+
+Return a copy of `strategy` with `use_graph_callback=true` and the given safety factor.
+Because strategy structs are immutable, this reconstructs the struct via its fields.
+"""
+function with_graph_cache(s::SolverStrategy; safety::Float32=4.0f0)
+    fields = fieldnames(typeof(s))
+    vals = map(fields) do f
+        if f === :use_graph_callback
+            true
+        elseif f === :graph_callback_safety
+            safety
+        else
+            getfield(s, f)
+        end
+    end
+    return typeof(s)(vals...)
+end
+
+"""
     get_delta(::SolverStrategy, ::Integer)
 
 Returns the delta (step size) for solver-based training strategies.
@@ -697,11 +717,7 @@ function train_step(strategy::BatchingStrategy, t::Tuple)
     )
 
     shoot_loss, shoot_gs = Zygote.withgradient(
-        ps -> train_loss(
-            strategy,
-            (prob, ps, u0, gt, mask, data["dt"], batches[b]),
-        ),
-        gns.ps,
+        ps -> train_loss(strategy, (prob, ps, u0, gt, mask, data["dt"], batches[b])), gns.ps
     )
     batches[b].loss = shoot_loss
     return shoot_gs, shoot_loss
@@ -1052,8 +1068,19 @@ for mismatches between interval endpoints.
 - `t::Tuple`: Tuple containing problem, parameters, data, ground truth, mask, and device.
 """
 function train_loss(strategy::MultipleShooting, t::Tuple)
-    prob, ps, data, gt, mask, device, gns, meta, output_fields, target_fields, node_type,
-    val_mask, pr = t
+    prob,
+    ps,
+    data,
+    gt,
+    mask,
+    device,
+    gns,
+    meta,
+    output_fields,
+    target_fields,
+    node_type,
+    val_mask,
+    pr = t
 
     tstop_data = strategy.tstart + (size(gt, 3) - 1) * strategy.dt
     tsteps = strategy.tstart:strategy.dt:tstop_data
