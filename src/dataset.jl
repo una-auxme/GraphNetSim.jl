@@ -650,15 +650,29 @@ function create_edges(traj_dict::Dict{String,Any}, meta::Dict{String,Any})
             current_position, Float32(meta["default_connectivity_radius"])
         )
         if n_node_types(meta) > 1
-            dist_bound = compute_closest_boundary_displacement(
-                sender,
-                receiver,
-                rel_dist_norm,
-                current_position,
-                traj_dict["mask"],
-                Float32(meta["default_connectivity_radius"]),
-                identity,
-            )
+            method = get(meta, "boundary_distance", :closest_particle)
+            if method === :closest_particle
+                dist_bound = compute_closest_boundary_displacement(
+                    sender,
+                    receiver,
+                    rel_dist_norm,
+                    current_position,
+                    traj_dict["mask"],
+                    Float32(meta["default_connectivity_radius"]),
+                    identity,
+                )
+            elseif method === :bounding_box
+                dist_bound = compute_bounding_box_distance(
+                    current_position, meta, identity
+                )
+            else
+                throw(
+                    ArgumentError(
+                        "Unknown boundary_distance method: :$method. " *
+                        "Must be :closest_particle or :bounding_box.",
+                    ),
+                )
+            end
         else
             dist_bound = ones(Float32, size(current_position))
         end

@@ -86,6 +86,15 @@ Configuration structure for training and evaluating Graph Neural Network simulat
   `:online` (accumulate stats during training), `:minmax` (requires data_min/data_max in meta.json),
   `:meanstd` (requires data_mean/data_std in meta.json).
 
+### Boundary Distance Feature
+- `boundary_distance::Symbol=:closest_particle`: Method for the distance-to-boundary node feature
+  used when the dataset has more than one node type. `:closest_particle` (new, differentiable
+  displacement to the closest boundary particle via the neighbor graph; feature dim = `dims`) or
+  `:bounding_box` (legacy axis-aligned bounding-box distance read from `meta["bounds"]`; feature
+  dim = `2*dims`). Kept selectable so `:bounding_box` remains a full-training fallback for
+  comparison against `:closest_particle`. This is an architectural setting — feature dim changes
+  between methods, so it is validated against the saved `model_config.json` on resumption.
+
 ### Validation
 - `show_progress_bars::Bool=true`: Show training progress bars
 - `use_valid::Bool=true`: Load validation checkpoint (best loss) instead of final checkpoint
@@ -118,6 +127,7 @@ Configuration structure for training and evaluating Graph Neural Network simulat
     optimizer_learning_rate_start::Float32 = 1.0f-4
     optimizer_learning_rate_stop::Union{Nothing,Float32} = nothing
     norm_type::Symbol = :online
+    boundary_distance::Symbol = :closest_particle
     save_step::Bool = false
     on_grad::Union{Nothing,Function} = nothing
     on_valid::Union{Nothing,Function} = nothing
@@ -318,10 +328,33 @@ function calc_norms(dataset, device, args)
         end
     end
     if n_node_types(dataset.meta) > 1
-        quantities += dataset.meta["dims"]
+        quantities += dist_bound_feature_dim(args.boundary_distance, dataset.meta["dims"])
     end
 
     return quantities, e_norms, n_norms, o_norms
+end
+
+"""
+    dist_bound_feature_dim(method::Symbol, dims::Integer)
+
+Number of node-feature channels produced by the boundary-distance computation.
+
+- `:closest_particle` → `dims` (displacement vector to closest boundary particle).
+- `:bounding_box`     → `2 * dims` (low-bound + up-bound distance per axis).
+"""
+function dist_bound_feature_dim(method::Symbol, dims::Integer)
+    if method === :closest_particle
+        return dims
+    elseif method === :bounding_box
+        return 2 * dims
+    else
+        throw(
+            ArgumentError(
+                "Unknown boundary_distance method: :$method. " *
+                "Must be :closest_particle or :bounding_box.",
+            ),
+        )
+    end
 end
 
 """
@@ -390,6 +423,7 @@ function train_network(opt, ds_path, cp_path; kws...)
                 layer_size=existing_cfg.layer_size,
                 hidden_layers=existing_cfg.hidden_layers,
                 norm_type=existing_cfg.norm_type,
+                boundary_distance=existing_cfg.boundary_distance,
             ),
             NamedTuple(kws),
         )
@@ -407,6 +441,7 @@ function train_network(opt, ds_path, cp_path; kws...)
             types_noisy=args.types_noisy,
             noise_stddevs=args.noise_stddevs,
             norm_type=args.norm_type,
+            boundary_distance=args.boundary_distance,
         ),
         cp_path,
     )
@@ -429,6 +464,7 @@ function train_network(opt, ds_path, cp_path; kws...)
     ds_train.meta["types_noisy"] = args.types_noisy
     ds_train.meta["noise_stddevs"] = args.noise_stddevs
     ds_train.meta["device"] = device
+    ds_train.meta["boundary_distance"] = args.boundary_distance
     if !isnothing(args.connectivity_radius)
         ds_train.meta["default_connectivity_radius"] = args.connectivity_radius
     end
@@ -438,6 +474,7 @@ function train_network(opt, ds_path, cp_path; kws...)
     ds_valid.meta["noise_stddevs"] = args.noise_stddevs
     ds_valid.meta["device"] = device
     ds_valid.meta["training_strategy"] = nothing
+    ds_valid.meta["boundary_distance"] = args.boundary_distance
     if !isnothing(args.connectivity_radius)
         ds_valid.meta["default_connectivity_radius"] = args.connectivity_radius
     end
@@ -869,6 +906,7 @@ function eval_network(
                 mps=existing_cfg.mps,
                 layer_size=existing_cfg.layer_size,
                 hidden_layers=existing_cfg.hidden_layers,
+                boundary_distance=existing_cfg.boundary_distance,
             ),
             NamedTuple(kws),
         )
@@ -892,6 +930,7 @@ function eval_network(
     ds_test = Dataset(:test, ds_path, args)
     ds_test.meta["device"] = device
     ds_test.meta["training_strategy"] = nothing
+    ds_test.meta["boundary_distance"] = args.boundary_distance
     if !isnothing(args.connectivity_radius)
         ds_test.meta["default_connectivity_radius"] = args.connectivity_radius
     end

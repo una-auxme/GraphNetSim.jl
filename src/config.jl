@@ -27,6 +27,10 @@ as documentation and may legitimately differ between training phases.
 - `types_noisy`: Node types receiving noise injection during training.
 - `noise_stddevs`: Per-type noise standard deviations.
 - `norm_type`: Normalization strategy for Float32 features (`:online`, `:minmax`, `:meanstd`).
+- `boundary_distance`: Method for the distance-to-boundary feature
+  (`:closest_particle` — displacement to closest boundary particle, feature dim = `dims`; or
+  `:bounding_box` — axis-aligned bounding-box distance, feature dim = `2*dims`).
+  Architectural: input feature dim depends on this, so it is validated on resumption.
 """
 @kwdef struct ModelConfig
     format_version::Int = 1
@@ -38,6 +42,7 @@ as documentation and may legitimately differ between training phases.
     types_noisy::Vector{Int}
     noise_stddevs::Vector{Float32}
     norm_type::Symbol = :online
+    boundary_distance::Symbol = :closest_particle
 end
 
 """
@@ -59,14 +64,17 @@ function save_model_config(cfg::ModelConfig, cp_path::String)
         if !isnothing(existing)
             if existing.mps != cfg.mps ||
                 existing.layer_size != cfg.layer_size ||
-                existing.hidden_layers != cfg.hidden_layers
+                existing.hidden_layers != cfg.hidden_layers ||
+                existing.boundary_distance != cfg.boundary_distance
                 error(
                     "Architecture mismatch between supplied arguments and saved " *
                     "model config at \"$path\".\n" *
                     "  Saved:    mps=$(existing.mps), layer_size=$(existing.layer_size), " *
-                    "hidden_layers=$(existing.hidden_layers)\n" *
+                    "hidden_layers=$(existing.hidden_layers), " *
+                    "boundary_distance=:$(existing.boundary_distance)\n" *
                     "  Supplied: mps=$(cfg.mps), layer_size=$(cfg.layer_size), " *
-                    "hidden_layers=$(cfg.hidden_layers)\n" *
+                    "hidden_layers=$(cfg.hidden_layers), " *
+                    "boundary_distance=:$(cfg.boundary_distance)\n" *
                     "These parameters must match the existing checkpoint. " *
                     "Use a different cp_path to start a new training run.",
                 )
@@ -85,6 +93,7 @@ function save_model_config(cfg::ModelConfig, cp_path::String)
                     "mps" => cfg.mps,
                     "layer_size" => cfg.layer_size,
                     "hidden_layers" => cfg.hidden_layers,
+                    "boundary_distance" => String(cfg.boundary_distance),
                 ),
                 "training" => Dict(
                     "norm_steps" => cfg.norm_steps,
@@ -125,6 +134,7 @@ function load_model_config(cp_path::String)::Union{ModelConfig,Nothing}
             types_noisy=Int.(train["types_noisy"]),
             noise_stddevs=Float32.(train["noise_stddevs"]),
             norm_type=Symbol(get(train, "norm_type", "online")),
+            boundary_distance=Symbol(get(arch, "boundary_distance", "closest_particle")),
         )
     catch e
         @warn "Could not parse model config at \"$path\": $e. Falling back to supplied arguments."

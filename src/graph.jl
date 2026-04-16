@@ -80,17 +80,35 @@ function build_graph(
     )
 
     if n_node_types(meta) > 1
-        if length(mask) == size(position, 2)
-            dist_bound = device(ones(Float32, size(position)...))
+        method = get(meta, "boundary_distance", :closest_particle)
+        if method === :closest_particle
+            if length(mask) == size(position, 2)
+                dist_bound = device(ones(Float32, size(position)...))
+            else
+                dist_bound = compute_closest_boundary_displacement(
+                    senders,
+                    receivers,
+                    rel_dist_norm,
+                    position,
+                    mask,
+                    Float32(meta["default_connectivity_radius"]),
+                    device,
+                )
+            end
+        elseif method === :bounding_box
+            if length(mask) == size(position, 2)
+                dist_bound = device(
+                    ones(Float32, 2 * size(position, 1), size(position, 2))
+                )
+            else
+                dist_bound = compute_bounding_box_distance(position, meta, device)
+            end
         else
-            dist_bound = compute_closest_boundary_displacement(
-                senders,
-                receivers,
-                rel_dist_norm,
-                position,
-                mask,
-                Float32(meta["default_connectivity_radius"]),
-                device,
+            throw(
+                ArgumentError(
+                    "Unknown boundary_distance method: :$method. " *
+                    "Must be :closest_particle or :bounding_box.",
+                ),
             )
         end
     end
@@ -225,6 +243,39 @@ function replace_with_indices(arr1, arr2, refs, start_boundary)
         replace!(arr2, refs[i] => i+start_boundary)
     end
     return CuArray(arr1), CuArray(arr2)
+end
+
+"""
+    compute_bounding_box_distance(position, meta, device)
+
+Compute the legacy axis-aligned bounding-box distance feature.
+
+For each particle and each spatial axis, returns the signed distance to the lower and upper
+domain bound read from `meta["bounds"]`, normalized by the connectivity radius and clamped
+to `[-1, 1]`. Preserved as a fallback against `compute_closest_boundary_displacement` so a
+full training run can be compared between the two boundary-distance representations.
+
+## Arguments
+- `position`: Particle positions (dims × n_particles), differentiable.
+- `meta`: Metadata dict; must contain `bounds` (per-axis `[lo, hi]`) and
+  `default_connectivity_radius`.
+- `device`: Device placement function (cpu_device or gpu_device).
+
+## Returns
+- `AbstractArray` of shape `(2 * dims, n_particles)`:
+  rows `1:dims` are `(position - lo) / radius`, rows `dims+1:2*dims` are `(hi - position) / radius`,
+  both clamped to `[-1, 1]`.
+"""
+function compute_bounding_box_distance(position, meta, device)
+    boundaries = device(Float32.(vcat(permutedims.(meta["bounds"])...)))
+    dist_low_bound = position .- boundaries[:, 1]
+    dist_up_bound = boundaries[:, 2] .- position
+    return clamp.(
+        vcat(dist_low_bound, dist_up_bound) ./
+        Float32(meta["default_connectivity_radius"]),
+        -1.0f0,
+        1.0f0,
+    )
 end
 
 """
