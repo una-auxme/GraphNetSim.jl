@@ -35,6 +35,7 @@ include("config.jl")
 include("../convert_csv/csvToh5.jl")
 
 export SingleShooting, MultipleShooting, DerivativeTraining, BatchingStrategy
+export Scheduler, Sequential, WorstLoss, UniqueWorst
 
 export train_network, eval_network, data_minmax, data_meanstd, update_meta!
 export init_train_step, train_step, validation_step, batchTrajectory
@@ -590,7 +591,38 @@ function train_gns!(
             if args.training_strategy isa BatchingStrategy
                 batches = batchTrajectory(args.training_strategy, data)
             end
-            for datapoint in 1:delta
+
+            sched = get_scheduler(args.training_strategy)
+            n_units = isnothing(batches) ? delta : length(batches)
+
+            # During the norm-accumulation phase, force Sequential to prevent
+            # rerun steps from biasing online normalizer statistics. The real
+            # scheduler activates once norm accumulation is complete.
+            norm_phase = step + n_units <= args.norm_steps
+            effective_sched = norm_phase ? nothing : sched
+
+            outer_iters_n = outer_iters(args.training_strategy, effective_sched, n_units)
+            losses_per_dp = if (!isnothing(effective_sched) && tracks_losses(effective_sched))
+                # Inf32 init is load-bearing: for BatchingStrategy + WorstLoss
+                # the base pass picks `argmax(fill(Inf32, n))` linearly. For
+                # DerivativeTraining the losses buffer is never read on the
+                # base pass (scheduler short-circuits to `i`), so the init
+                # value is a no-op there. Test D1f guards this invariant.
+                fill(Inf32, n_units)
+            else
+                nothing
+            end
+
+            for datapoint in 1:outer_iters_n
+                norm_active = step + datapoint <= args.norm_steps
+                actual_dp = if isnothing(effective_sched)
+                    datapoint
+                else
+                    next_index(
+                        effective_sched, datapoint, n_units, losses_per_dp, norm_active
+                    )
+                end
+
                 train_tuple = init_train_step(
                     args.training_strategy,
                     (
@@ -603,18 +635,28 @@ function train_gns!(
                         data["mask"],
                         data["val_mask"],
                         ds_train.meta["device"],
-                        datapoint,
+                        actual_dp,
                         batches,
                         args.show_progress_bars,
                     ),
                 )
                 gs, losses = train_step(args.training_strategy, train_tuple)
+                if !isnothing(effective_sched)
+                    update_state!(
+                        effective_sched,
+                        datapoint,
+                        actual_dp,
+                        sum(losses),
+                        n_units,
+                        losses_per_dp,
+                    )
+                end
                 if !isnothing(args.on_grad)
                     args.on_grad(step + datapoint, gs, gns.ps, sum(losses))
                 end
                 tmp_loss += sum(losses)
                 if args.save_step
-                    push!(df_step, [datapoint, sum(losses)])
+                    push!(df_step, [actual_dp, sum(losses)])
                 end
                 if step + datapoint > args.norm_steps
                     for i in eachindex(gs)
@@ -670,8 +712,8 @@ function train_gns!(
                 end
             end
 
-            cp_progress += delta
-            step += delta
+            cp_progress += outer_iters_n
+            step += outer_iters_n
             avg_loss += tmp_loss
             tmp_loss = 0.0f0
 

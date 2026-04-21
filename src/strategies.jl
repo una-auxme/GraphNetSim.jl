@@ -15,6 +15,8 @@ using JLD2
 
 abstract type TrainingStrategy end
 
+include("schedulers.jl")
+
 """
     prepare_training(strategy)
 
@@ -377,37 +379,20 @@ struct BatchingStrategy <: SolverStrategy
     steps::Int64
     loss_function::Any
     solargs::Any
+    scheduler::Scheduler
 end
 
-mutable struct Batch
+get_scheduler(s::BatchingStrategy) = s.scheduler
+outer_iters(s::BatchingStrategy, ::Scheduler, ::Integer) = s.steps
+outer_iters(s::BatchingStrategy, ::Nothing, ::Integer) = s.steps
+
+struct Batch
     batchStart::Float32
     batchStop::Float32
-    loss::Float32
 end
 
 """
-    Batch(start::Float32, stop::Float32; loss=Inf32)
-
-Constructs a batch for sequential trajectory training.
-
-Represents a contiguous time interval for ODE solving during batched training.
-
-## Arguments
-- `start::Float32`: Start time of the batch.
-- `stop::Float32`: Stop time of the batch.
-
-## Keyword Arguments
-- `loss::Float32=Inf32`: Initial loss for the batch (Inf32 means uncomputed).
-
-## Returns
-- `Batch`: Mutable struct with batch timing and loss information.
-"""
-function Batch(start, stop; loss=Inf32)
-    Batch(start, stop, loss)
-end
-
-"""
-    BatchingStrategy(tstart, intervall, solver, steps; loss_function=:mae, sense=..., solargs...)
+    BatchingStrategy(tstart, intervall, solver, steps; loss_function=:mae, sense=..., scheduler=WorstLoss(0), solargs...)
 
 Constructor for BatchingStrategy solver-based training.
 
@@ -415,11 +400,18 @@ Constructor for BatchingStrategy solver-based training.
 - `tstart::Float32`: Start time for first interval.
 - `intervall::Float32`: Duration of each batch interval.
 - `solver::OrdinaryDiffEqAlgorithm`: ODE solver algorithm.
-- `steps::Int64`: Number of steps per batch.
+- `steps::Int64`: Number of training iterations per trajectory pass
+  (total outer-loop budget; the scheduler decides which batch each iteration
+  trains on).
 
 ## Keyword Arguments
 - `loss_function::Symbol=:mae`: Loss function type.
 - `sense::AbstractSensitivityAlgorithm`: Gradient algorithm.
+- `scheduler::Scheduler=WorstLoss(0)`: Per-pass batch-selection rule. The
+  default + `Inf32`-initialised losses buffer reproduces the historical
+  "uncomputed-first-else-highest-loss" curriculum. The scheduler's own
+  `rerun_steps` field (if any) is ignored — total outer iterations always
+  equal `strategy.steps`.
 - `solargs...`: Additional ODE solver keywords.
 """
 function BatchingStrategy(
@@ -431,9 +423,12 @@ function BatchingStrategy(
     sense::AbstractSensitivityAlgorithm=InterpolatingAdjoint(;
         autojacvec=ZygoteVJP(), checkpointing=true
     ),
+    scheduler::Scheduler=WorstLoss(0),
     solargs...,
 )
-    BatchingStrategy(tstart, intervall, solver, sense, steps, loss_function, solargs)
+    BatchingStrategy(
+        tstart, intervall, solver, sense, steps, loss_function, solargs, scheduler
+    )
 end
 
 """
@@ -480,46 +475,17 @@ function batchTrajectory(strategy::BatchingStrategy, data)
 end
 
 """
-    nextBatch(batches::Vector{Batch})
-
-Selects the next batch to train on using highest-loss sampling.
-
-Returns the index of the first uncomputed batch (loss = Inf32).
-If all batches are computed, returns the index of the batch with highest loss
-(prioritizing difficult batches).
-
-## Arguments
-- `batches::Vector{Batch}`: Array of batch objects with loss information.
-
-## Returns
-- `Integer`: Index of selected batch for next training iteration.
-"""
-function nextBatch(batches)
-    maxe = 0.0
-    element = 0
-    for i in eachindex(batches)
-        if batches[i].loss == Inf32
-            return i
-        end
-        if batches[i].loss > maxe
-            maxe = batches[i].loss
-            element = i
-        end
-    end
-    return element
-end
-
-"""
     init_train_step(strategy::BatchingStrategy, t::Tuple)
 
 Initializes a training step for the BatchingStrategy.
 
-Selects the next batch via `nextBatch()`, extracts initial conditions for that
-time window, packs state into ComponentArray, and prepares ground truth data.
+Receives the scheduler-selected batch index from the caller, extracts initial
+conditions for that time window, packs state into ComponentArray, and
+prepares ground truth data.
 
 ## Arguments
 - `strategy::BatchingStrategy`: BatchingStrategy instance.
-- `t::Tuple`: Input tuple (gns, data, meta, output_fields, target_fields, node_type, mask, val_mask, device, _, batches, show_progress_bars).
+- `t::Tuple`: Input tuple (gns, data, meta, output_fields, target_fields, node_type, mask, val_mask, device, batch_index, batches, show_progress_bars).
 
 ## Returns
 - `Tuple`: Initialized batch data for training step.
@@ -534,11 +500,9 @@ function init_train_step(strategy::BatchingStrategy, t::Tuple)
     mask,
     val_mask,
     device,
-    _,
+    b,
     batches,
     show_progess_bars = t
-
-    b = nextBatch(batches)
 
     tstart = round(Int, (batches[b].batchStart/data["dt"]) + 1)
     tstop = round(Int, (batches[b].batchStop/data["dt"]) + 1)
@@ -634,7 +598,6 @@ function train_step(strategy::BatchingStrategy, t::Tuple)
             train_loss(strategy, (prob, ps, u0, nothing, gt, mask, data["dt"], batches[b])),
         gns.ps,
     )
-    batches[b].loss = shoot_loss
     return shoot_gs, shoot_loss
 end
 
@@ -1096,13 +1059,12 @@ function train_loss(strategy::DerivativeStrategy, t::Tuple)
     output, st = gns.model(graph, ps, gns.st)
     gns.st = st
 
-    # error = loss_function(target, output)
-    # error = loss_function(target, output[:, mask])
-    # println(maximum(output))
-    # println(maximum(target))
-    error = (target .- output[:, mask]) .^ 2
+    if strategy.loss_function == :mse
+        error = (target .- output[:, mask]) .^ 2
+    elseif strategy.loss_function == :mae
+        error = abs.(target .- output[:, mask])
+    end
 
-    # loss = mean(error[mask])
     loss = mean(error)
 
     return loss
@@ -1172,23 +1134,39 @@ end
 Derivative-based training strategy using finite-difference ground truth.
 
 Compares network output with finite-difference derivatives from data. Faster than
-solver-based training, useful for initial model training. Supports temporal windowing
-and optional random shuffling.
+solver-based training, useful for initial model training. Supports temporal windowing,
+optional random shuffling, and a pluggable per-pass `Scheduler`.
 """
 struct DerivativeTraining <: DerivativeStrategy
     window_size::Integer
     random::Bool
+    scheduler::Scheduler
+    loss_function::Symbol
 end
 
 """
-    DerivativeTraining(; window_size=0, random=true)
+    DerivativeTraining(; window_size=0, random=true, scheduler=Sequential(), loss_function=:mse)
 
 Constructor for DerivativeTraining strategy.
 
 ## Keyword Arguments
 - `window_size::Integer=0`: Number of timesteps per trajectory (0 means use all).
 - `random::Bool=true`: Whether to shuffle timesteps within the window.
+- `scheduler::Scheduler=Sequential()`: Per-pass selection rule.
+  Use `WorstLoss(n)` to revisit `argmax`-worst steps `n` times (repeats
+  allowed), or `UniqueWorst(n)` to revisit each of the `n` worst steps at
+  most once per pass.
+- `loss_function::Symbol=:mse`: Loss function type (`:mse` or `:mae`).
 """
-function DerivativeTraining(; window_size::Integer=0, random=true)
-    DerivativeTraining(window_size, random)
+function DerivativeTraining(;
+    window_size::Integer=0,
+    random=true,
+    scheduler::Scheduler=Sequential(),
+    loss_function::Symbol=:mse,
+)
+    loss_function in (:mse, :mae) ||
+        throw(ArgumentError("loss_function must be :mse or :mae, got :$loss_function"))
+    DerivativeTraining(window_size, random, scheduler, loss_function)
 end
+
+get_scheduler(s::DerivativeTraining) = s.scheduler

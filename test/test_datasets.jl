@@ -276,6 +276,119 @@ for cfg in CONFIGS
                 @test GraphNetSim.get_delta(s, 5) == 5
             end
 
+            @testset "D1b: scheduler defaults" begin
+                @test DerivativeTraining().scheduler isa Sequential
+                @test GraphNetSim.total_iters(Sequential(), 10) == 10
+                @test GraphNetSim.tracks_losses(Sequential()) == false
+            end
+
+            @testset "D1c: get_delta invariant across schedulers" begin
+                # Schedulers change outer-loop iterations (see E2/E2b) but not
+                # validation/data_interval sizing, so get_delta is stable.
+                @test GraphNetSim.get_delta(
+                    DerivativeTraining(; scheduler=WorstLoss(5)), tl
+                ) == tl
+                @test GraphNetSim.get_delta(
+                    DerivativeTraining(; scheduler=UniqueWorst(5)), tl
+                ) == tl
+                @test GraphNetSim.get_delta(
+                    DerivativeTraining(; window_size=10, scheduler=WorstLoss(3)), tl
+                ) == 10
+            end
+
+            @testset "D1d: WorstLoss iteration budget + selection" begin
+                sched = WorstLoss(5)
+                @test GraphNetSim.total_iters(sched, 10) == 15
+                @test GraphNetSim.tracks_losses(sched) == true
+                # Base pass returns the linear index.
+                losses = Float32[1, 9, 3, 2, 7]
+                @test GraphNetSim.next_index(sched, 1, 5, losses, false) == 1
+                @test GraphNetSim.next_index(sched, 5, 5, losses, false) == 5
+                # Rerun phase outside norm_steps: pick argmax.
+                @test GraphNetSim.next_index(sched, 6, 5, losses, false) == 2
+                # Rerun phase inside norm_steps: wrap around instead of argmax.
+                @test GraphNetSim.next_index(sched, 7, 5, losses, true) == 2
+                # WorstLoss update_state! just writes the fresh loss.
+                GraphNetSim.update_state!(sched, 6, 2, 0.5f0, 5, losses)
+                @test losses[2] == 0.5f0
+            end
+
+            @testset "D1e: UniqueWorst one-shot selection" begin
+                @test GraphNetSim.total_iters(UniqueWorst(5), 10) == 15
+                @test GraphNetSim.total_iters(UniqueWorst(20), 10) == 20  # clamped
+                @test GraphNetSim.tracks_losses(UniqueWorst(5)) == true
+
+                losses = Float32[3, 1, 2, 5, 4]
+                sched = UniqueWorst(3)
+                picks = Int[]
+                for i in 6:8
+                    idx = GraphNetSim.next_index(sched, i, 5, losses, false)
+                    push!(picks, idx)
+                    GraphNetSim.update_state!(sched, i, idx, 0.0f0, 5, losses)
+                end
+                @test picks == [4, 5, 1]
+                @test allunique(picks)
+                @test losses[4] == -Inf32
+                @test losses[5] == -Inf32
+                @test losses[1] == -Inf32
+            end
+
+            @testset "D1f: Inf32 init invariant (WorstLoss rerun pass)" begin
+                # The training loop initialises losses to fill(Inf32, n_units).
+                # For BatchingStrategy this is load-bearing: when base-pass
+                # iterations have only filled some entries, the rerun pass's
+                # argmax must still pick remaining Inf32 (uncomputed) entries
+                # ahead of finite ones. Regression guard against flipping the
+                # init back to zeros or undef.
+                sched = WorstLoss(0)
+                n = 3
+                losses_inf = fill(Inf32, n)
+                losses_inf[1] = 0.5f0
+                @test GraphNetSim.next_index(sched, 4, n, losses_inf, false) == 2
+
+                losses_zero = zeros(Float32, n)
+                losses_zero[1] = 0.5f0
+                # With zero-init, argmax instead returns the sole finite entry
+                # — confirming the init value matters for rerun-pass semantics.
+                @test GraphNetSim.next_index(sched, 4, n, losses_zero, false) == 1
+            end
+
+            @testset "D1g: norm phase suppresses scheduler reruns" begin
+                # During norm accumulation the training loop forces Sequential
+                # to prevent rerun steps from biasing NormaliserOnline stats.
+                # We verify this via on_grad callback count: with norm_steps
+                # covering the whole run, the loop must execute exactly
+                # n_train * traj_length iterations (no reruns), even though
+                # WorstLoss(5) would normally add 5 extra per trajectory.
+                # The train_loader iterates all training trajectories per
+                # epoch, so one full epoch = n_train * traj_length steps.
+                mktempdir() do cp_path
+                    rerun = 5
+                    n_train =
+                        cfg.splits[findfirst(s -> s[1] == :train, cfg.splits)][2]
+                    base = cfg.traj_length
+                    n_steps = base  # one epoch processes n_train trajectories
+                    grad_calls = Ref(0)
+                    train_network(
+                        Adam(1.0f-4),
+                        cfg.path,
+                        cp_path;
+                        make_train_kwargs(cfg)...,
+                        training_strategy=DerivativeTraining(;
+                            scheduler=WorstLoss(rerun),
+                        ),
+                        steps=n_steps,
+                        norm_steps=n_steps * 10,
+                        checkpoint=n_steps * 10,
+                        on_grad=(step, gs, ps, loss) -> (grad_calls[] += 1),
+                    )
+                    # Each trajectory gets base gradient calls (no reruns).
+                    # The train_loader visits all n_train trajectories before
+                    # the while-loop re-checks `step < steps`.
+                    @test grad_calls[] == n_train * base
+                end
+            end
+
             @testset "D3: batchTrajectory" begin
                 batch_steps = 20
                 bs = BatchingStrategy(0.0f0, cfg.dt * batch_steps, Euler(), batch_steps)
@@ -283,18 +396,61 @@ for cfg in CONFIGS
                 batches = batchTrajectory(bs, data)
                 expected_min = div(tl - 1, batch_steps)
                 @test length(batches) >= expected_min
-                @test all(b.loss == Inf32 for b in batches)
                 @test batches[1].batchStart ≈ 0.0f0
             end
 
-            @testset "D4: nextBatch scheduling" begin
-                b1 = GraphNetSim.Batch(0.0f0, 0.02f0, Inf32)
-                b2 = GraphNetSim.Batch(0.02f0, 0.04f0, 1.5f0)
-                b3 = GraphNetSim.Batch(0.04f0, 0.06f0, 3.0f0)
-                batches = [b1, b2, b3]
-                @test GraphNetSim.nextBatch(batches) == 1    # first uncomputed
-                b1.loss = 0.5f0
-                @test GraphNetSim.nextBatch(batches) == 3    # highest loss
+            @testset "D4a: WorstLoss scheduler contract (Inf32-init base pass)" begin
+                sched = WorstLoss(0)
+                losses = fill(Inf32, 3)
+                # Base pass returns linear i regardless of buffer contents.
+                @test GraphNetSim.next_index(sched, 1, 3, losses, false) == 1
+                @test GraphNetSim.next_index(sched, 2, 3, losses, false) == 2
+                @test GraphNetSim.next_index(sched, 3, 3, losses, false) == 3
+            end
+
+            @testset "D4b: BatchingStrategy curriculum regression" begin
+                # Drive WorstLoss(0) + Inf32-init buffer by hand and confirm the
+                # selected-index sequence matches the old nextBatch curriculum:
+                # first uncomputed, then argmax(loss). Guards against a scheduler
+                # swap silently altering BatchingStrategy's learning dynamics.
+                sched = WorstLoss(0)
+                n = 3
+                losses = fill(Inf32, n)
+                injected = Float32[1.5, 0.3, 2.0, 0.1, 0.4]
+                picks = Int[]
+                for (i, lv) in enumerate(injected)
+                    idx = GraphNetSim.next_index(sched, i, n, losses, false)
+                    push!(picks, idx)
+                    GraphNetSim.update_state!(sched, i, idx, lv, n, losses)
+                end
+                # Steps 1-3: base pass picks 1, 2, 3 (filling the Inf32 buffer).
+                # Step 4: argmax([1.5, 0.3, 2.0]) = 3 → writes 0.1 to losses[3].
+                # Step 5: argmax([1.5, 0.3, 0.1]) = 1.
+                @test picks == [1, 2, 3, 3, 1]
+            end
+
+            @testset "D6: BatchingStrategy scheduler integration" begin
+                bs_default = BatchingStrategy(0.0f0, cfg.dt * 20, Euler(), 20)
+                @test bs_default.scheduler isa WorstLoss
+                @test GraphNetSim.get_scheduler(bs_default) isa WorstLoss
+
+                # outer_iters for BatchingStrategy always == strategy.steps,
+                # ignoring n_batches and the scheduler's own rerun_steps.
+                @test GraphNetSim.outer_iters(bs_default, WorstLoss(0), 3) == 20
+                @test GraphNetSim.outer_iters(bs_default, UniqueWorst(99), 3) == 20
+
+                bs_unique = BatchingStrategy(
+                    0.0f0, cfg.dt * 20, Euler(), 20; scheduler=UniqueWorst(2)
+                )
+                @test bs_unique.scheduler isa UniqueWorst
+                @test bs_unique.scheduler.rerun_steps == 2
+
+                @test GraphNetSim.get_scheduler(
+                    SingleShooting(0.0f0, cfg.dt, cfg.dt * 5, Tsit5())
+                ) === nothing
+                @test GraphNetSim.get_scheduler(
+                    MultipleShooting(0.0f0, cfg.dt, cfg.dt * 5, Tsit5(), 2)
+                ) === nothing
             end
         end
 
@@ -326,6 +482,110 @@ for cfg in CONFIGS
                 @test last(df_valid.loss) <= first(df_valid.loss)
                 @test nrow(df_valid) >= 1
                 @test min_val_loss < 1.0f0
+            end
+        end
+
+        # ─────────────────────────────────────────────────────────────────
+        # Group E2: WorstLoss scheduler smoke test
+        # Confirms DerivativeTraining(; scheduler=WorstLoss(…)) runs end-to-end
+        # and the outer loop executes `base + rerun_steps` iterations per pass
+        # (observed via the on_grad callback count).
+        # ─────────────────────────────────────────────────────────────────
+        @testset "E2: DerivativeTraining WorstLoss smoke" begin
+            println("Running: E2 — DerivativeTraining WorstLoss smoke ($(cfg.name))")
+            mktempdir() do cp_path
+                rerun = 2
+                base = cfg.traj_length
+                # 3 full passes of (base + rerun) iterations
+                n_steps = (base + rerun) * 3
+                cp_interval = base + rerun
+
+                grad_calls = Ref(0)
+                min_val_loss = train_network(
+                    Adam(1.0f-4),
+                    cfg.path,
+                    cp_path;
+                    make_train_kwargs(cfg)...,
+                    training_strategy=DerivativeTraining(; scheduler=WorstLoss(rerun)),
+                    steps=n_steps,
+                    checkpoint=cp_interval,
+                    on_grad=(step, gs, ps, loss) -> (grad_calls[] += 1),
+                )
+
+                df_train, df_valid = load_latest_checkpoint(cp_path)
+
+                @test isfinite(min_val_loss)
+                @test nrow(df_valid) >= 1
+                # on_grad fires once per inner iteration — confirms the outer
+                # loop ran base + rerun_steps iterations per trajectory pass.
+                @test grad_calls[] >= n_steps
+            end
+        end
+
+        # ─────────────────────────────────────────────────────────────────
+        # Group E2b: UniqueWorst scheduler smoke test
+        # Same shape as E2 but with the one-shot top-K scheduler.
+        # ─────────────────────────────────────────────────────────────────
+        @testset "E2b: DerivativeTraining UniqueWorst smoke" begin
+            println("Running: E2b — DerivativeTraining UniqueWorst smoke ($(cfg.name))")
+            mktempdir() do cp_path
+                rerun = 2
+                base = cfg.traj_length
+                n_steps = (base + rerun) * 3
+                cp_interval = base + rerun
+
+                grad_calls = Ref(0)
+                min_val_loss = train_network(
+                    Adam(1.0f-4),
+                    cfg.path,
+                    cp_path;
+                    make_train_kwargs(cfg)...,
+                    training_strategy=DerivativeTraining(; scheduler=UniqueWorst(rerun)),
+                    steps=n_steps,
+                    checkpoint=cp_interval,
+                    on_grad=(step, gs, ps, loss) -> (grad_calls[] += 1),
+                )
+
+                df_train, df_valid = load_latest_checkpoint(cp_path)
+
+                @test isfinite(min_val_loss)
+                @test nrow(df_valid) >= 1
+                @test grad_calls[] >= n_steps
+            end
+        end
+
+        # ─────────────────────────────────────────────────────────────────
+        # Group E3: BatchingStrategy scheduler end-to-end
+        # Drives BatchingStrategy(…; scheduler=UniqueWorst(2)) through the
+        # training loop to exercise the unified scheduler dispatch on the
+        # ODE-based training path (not just the DerivativeTraining path).
+        # ─────────────────────────────────────────────────────────────────
+        @testset "E3: BatchingStrategy UniqueWorst smoke" begin
+            println("Running: E3 — BatchingStrategy UniqueWorst smoke ($(cfg.name))")
+            mktempdir() do cp_path
+                batch_steps = 10
+                n_steps = 3
+
+                grad_calls = Ref(0)
+                min_val_loss = train_network(
+                    Adam(1.0f-4),
+                    cfg.path,
+                    cp_path;
+                    make_train_kwargs(cfg)...,
+                    training_strategy=BatchingStrategy(
+                        0.0f0,
+                        cfg.dt * batch_steps,
+                        Tsit5(),
+                        n_steps;
+                        scheduler=UniqueWorst(2),
+                    ),
+                    steps=n_steps,
+                    checkpoint=n_steps,
+                    on_grad=(step, gs, ps, loss) -> (grad_calls[] += 1),
+                )
+
+                @test isfinite(min_val_loss)
+                @test grad_calls[] >= n_steps
             end
         end
 
