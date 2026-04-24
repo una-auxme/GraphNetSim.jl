@@ -227,7 +227,7 @@ prepares ground truth data for ODE problem setup.
 function init_train_step(strategy::SolverStrategy, t::Tuple)
     gns,
     data, meta, output_fields, target_fields, node_type, mask, val_mask, device, _, _,
-    show_progress_bars = t
+    show_progess_bars = t
 
     initial_state = Dict(
         "position" => data["position"][:, :, 1], "velocity" => data["velocity"][:, :, 1]
@@ -240,7 +240,17 @@ function init_train_step(strategy::SolverStrategy, t::Tuple)
     gt = vcat([data[tf][:, mask, :] for tf in target_fields]...)
 
     return (
-        gns, meta, output_fields, target_fields, node_type, mask, val_mask, u0, gt, device
+        gns,
+        meta,
+        output_fields,
+        target_fields,
+        node_type,
+        mask,
+        val_mask,
+        u0,
+        gt,
+        device,
+        show_progess_bars,
     )
 end
 
@@ -267,10 +277,16 @@ and computes gradients via sensitivity analysis (adjoint method).
 5. Return gradients and loss.
 """
 function train_step(strategy::SolverStrategy, t::Tuple)
-    gns, meta, output_fields, target_fields, node_type, mask, val_mask, u0, gt, device = t
+    gns,
+    meta, output_fields, target_fields, node_type, mask, val_mask, u0, gt, device,
+    show_progess_bars = t
 
-    pr = ProgressUnknown(; desc="Solver progress: ", showspeed=true)
-    print("\n\n\n\n\n\n\n\n") # display solver progress after main progress
+    pr = ProgressUnknown(;
+        desc="Solver progress: ", showspeed=true, enabled=show_progess_bars
+    )
+    if show_progess_bars
+        print("\n\n\n\n\n\n\n\n") # display solver progress after main progress
+    end
 
     ff = ODEFunction{false}(
         (x, ps, t) -> ode_func_train(
@@ -603,7 +619,9 @@ function train_step(strategy::BatchingStrategy, t::Tuple)
     pr = ProgressUnknown(;
         desc="Solver progress: ", showspeed=true, enabled=show_progess_bars
     )
-    print("\n\n\n\n\n\n\n\n") # display solver progress after main progress
+    if show_progess_bars
+        print("\n\n\n\n\n\n\n\n") # display solver progress after main progress
+    end
 
     ff = ODEFunction{false}(
         (x, ps, t) -> ode_func_train(
@@ -868,7 +886,7 @@ end
 function init_train_step(::MultipleShooting, t::Tuple)
     gns,
     data, meta, output_fields, target_fields, node_type, mask, val_mask, device, _, _,
-    _ = t
+    show_progess_bars = t
 
     u0 = device(ComponentArray(; x=data["position"][:, :, 1], dx=data["velocity"][:, :, 1]))
     gt = vcat([data[tf][:, mask, :] for tf in target_fields]...)
@@ -885,16 +903,21 @@ function init_train_step(::MultipleShooting, t::Tuple)
         u0,
         gt,
         device,
+        show_progess_bars,
     )
 end
 
 function train_step(strategy::MultipleShooting, t::Tuple)
     gns,
-    data, meta, output_fields, target_fields, node_type, mask, val_mask, u0, gt,
-    device = t
+    data, meta, output_fields, target_fields, node_type, mask, val_mask, u0, gt, device,
+    show_progess_bars = t
 
-    pr = ProgressUnknown(; desc="Solver progress: ", showspeed=true)
-    print("\n\n\n\n\n\n\n\n")
+    pr = ProgressUnknown(;
+        desc="Solver progress: ", showspeed=true, enabled=show_progess_bars
+    )
+    if show_progess_bars
+        print("\n\n\n\n\n\n\n\n")
+    end
 
     ff = ODEFunction{false}(
         (x, ps, t) -> ode_func_train(

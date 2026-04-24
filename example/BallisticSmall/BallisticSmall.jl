@@ -218,18 +218,4 @@ eval_network(
     use_cuda=cuda,
 )
 
-visualize(
-    eval_path * "/tsit5/trajectories.h5",
-    eval_path * "/vtkhdf/",
-    "pos",
-    "gt",
-    ["vel", "acc"],
-)
-
-visualize(
-    eval_path * "/tsit5/trajectories.h5",
-    eval_path * "/vtkhdf/",
-    "pos",
-    "prediction",
-    ["vel", "acc", "err"],
-)
+visualize_eval(eval_path * "/tsit5/trajectories.h5", eval_path * "/vtkhdf/")

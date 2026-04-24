@@ -25,6 +25,7 @@ import SciMLBase: solve, remake
 import HDF5: h5open, create_group, open_group
 import ProgressMeter: next!, update!, finish!
 import Statistics: mean
+import Printf: @sprintf
 
 include("utils.jl")
 include("graph.jl")
@@ -40,7 +41,7 @@ export train_network,
     eval_network, extrapolate_network, data_minmax, data_meanstd, update_meta!
 export init_train_step, train_step, validation_step, batchTrajectory
 # export prepare_training, get_delta
-export visualize
+export visualize, visualize_eval
 export csv_to_hdf5
 export ModelConfig, save_model_config, load_model_config
 
@@ -558,6 +559,7 @@ function train_gns!(
 
     local tmp_loss = 0.0f0
     local avg_loss = 0.0f0
+    local t_last_traj = time()
 
     output_features = ds_train.meta["output_features"]
 
@@ -674,7 +676,21 @@ function train_gns!(
             cp_progress += delta
             step += delta
             avg_loss += tmp_loss
+            traj_tmp_loss = tmp_loss
             tmp_loss = 0.0f0
+
+            if step > args.norm_steps && !args.show_progress_bars
+                n_traj = delta isa Vector ? sum(delta) : delta
+                dt_elapsed = time() - t_last_traj
+                @info @sprintf(
+                    "step=%d/%d | traj_loss=%.6g | s/step=%.3f",
+                    step,
+                    args.epochs*args.steps,
+                    traj_tmp_loss / Float32(n_traj),
+                    dt_elapsed / n_traj
+                )
+            end
+            t_last_traj = time()
 
             if step > args.norm_steps && cp_progress >= args.checkpoint
                 push!(df_train, [step, avg_loss / Float32(cp_progress)])
@@ -693,7 +709,9 @@ function train_gns!(
                 end
 
                 for data_valid in valid_loader
-                    print("\n\n\n")
+                    if args.show_progress_bars
+                        print("\n\n\n")
+                    end
                     pr_solver = ProgressUnknown(;
                         desc="Trajectory $(traj_idx)/$(length(valid_loader)): ",
                         showspeed=true,
@@ -760,12 +778,12 @@ function train_gns!(
                     args.on_valid(step, last_validation_loss)
                 end
                 if !args.show_progress_bars
-                    println("Train step: $(step)/$(args.epochs*args.steps)")
                     println(
-                        "Checkpoint: $(length(df_train.step) > 0 ? last(df_train.step) : 0)"
+                        "--- checkpoint reached at step $(step)/$(args.epochs*args.steps) ---",
                     )
-                    println("min_validation_loss: $min_validation_loss")
-                    println("last_validation_loss: $last_validation_loss")
+                    println("  avg_train_loss:      $(last(df_train.loss))")
+                    println("  min_validation_loss: $min_validation_loss")
+                    println("  last_validation_loss: $last_validation_loss")
                 end
                 save!(
                     gns,
