@@ -227,7 +227,7 @@ prepares ground truth data for ODE problem setup.
 function init_train_step(strategy::SolverStrategy, t::Tuple)
     gns,
     data, meta, output_fields, target_fields, node_type, mask, val_mask, device, _, _,
-    show_progess_bars = t
+    show_progress_bars = t
 
     initial_state = Dict(
         "position" => data["position"][:, :, 1], "velocity" => data["velocity"][:, :, 1]
@@ -250,7 +250,7 @@ function init_train_step(strategy::SolverStrategy, t::Tuple)
         u0,
         gt,
         device,
-        show_progess_bars,
+        show_progress_bars,
     )
 end
 
@@ -279,12 +279,12 @@ and computes gradients via sensitivity analysis (adjoint method).
 function train_step(strategy::SolverStrategy, t::Tuple)
     gns,
     meta, output_fields, target_fields, node_type, mask, val_mask, u0, gt, device,
-    show_progess_bars = t
+    show_progress_bars = t
 
     pr = ProgressUnknown(;
-        desc="Solver progress: ", showspeed=true, enabled=show_progess_bars
+        desc="Solver progress: ", showspeed=true, enabled=show_progress_bars
     )
-    if show_progess_bars
+    if show_progress_bars
         print("\n\n\n\n\n\n\n\n") # display solver progress after main progress
     end
 
@@ -552,7 +552,7 @@ function init_train_step(strategy::BatchingStrategy, t::Tuple)
     device,
     _,
     batches,
-    show_progess_bars = t
+    show_progress_bars = t
 
     b = nextBatch(batches)
 
@@ -584,7 +584,7 @@ function init_train_step(strategy::BatchingStrategy, t::Tuple)
         device,
         batches,
         b,
-        show_progess_bars,
+        show_progress_bars,
     )
 end
 
@@ -614,12 +614,12 @@ function train_step(strategy::BatchingStrategy, t::Tuple)
     device,
     batches,
     b,
-    show_progess_bars = t
+    show_progress_bars = t
 
     pr = ProgressUnknown(;
-        desc="Solver progress: ", showspeed=true, enabled=show_progess_bars
+        desc="Solver progress: ", showspeed=true, enabled=show_progress_bars
     )
-    if show_progess_bars
+    if show_progress_bars
         print("\n\n\n\n\n\n\n\n") # display solver progress after main progress
     end
 
@@ -886,7 +886,7 @@ end
 function init_train_step(::MultipleShooting, t::Tuple)
     gns,
     data, meta, output_fields, target_fields, node_type, mask, val_mask, device, _, _,
-    show_progess_bars = t
+    show_progress_bars = t
 
     u0 = device(ComponentArray(; x=data["position"][:, :, 1], dx=data["velocity"][:, :, 1]))
     gt = vcat([data[tf][:, mask, :] for tf in target_fields]...)
@@ -903,19 +903,19 @@ function init_train_step(::MultipleShooting, t::Tuple)
         u0,
         gt,
         device,
-        show_progess_bars,
+        show_progress_bars,
     )
 end
 
 function train_step(strategy::MultipleShooting, t::Tuple)
     gns,
     data, meta, output_fields, target_fields, node_type, mask, val_mask, u0, gt, device,
-    show_progess_bars = t
+    show_progress_bars = t
 
     pr = ProgressUnknown(;
-        desc="Solver progress: ", showspeed=true, enabled=show_progess_bars
+        desc="Solver progress: ", showspeed=true, enabled=show_progress_bars
     )
-    if show_progess_bars
+    if show_progress_bars
         print("\n\n\n\n\n\n\n\n")
     end
 

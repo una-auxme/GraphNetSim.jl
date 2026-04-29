@@ -22,6 +22,7 @@ using JLD2
 using MLUtils
 using Optimisers: Optimisers
 using OrdinaryDiffEq: OrdinaryDiffEq
+using ComponentArrays: ComponentArray
 
 const NORM_DATA_PATH = joinpath(@__DIR__, "fixtures", "ballistic_small")
 device = cpu_device()
@@ -315,6 +316,96 @@ device = cpu_device()
             normed = n_norms["velocity"](vel)
             # After mean-std normalization, values should be closer to 0
             @test mean(abs.(normed)) < mean(abs.(vel))
+        end
+    end
+
+    # ─────────────────────────────────────────────────────────────────────────
+    # Group D2 — Freeze/restore round-trip (CPU, ballistic_small)
+    # ─────────────────────────────────────────────────────────────────────────
+    @testset "D2: _freeze_online_normalisers! / _restore_online_normalisers!" begin
+        println("Running: D2 — Freeze/restore round-trip")
+        args = GraphNetSim.Args(;
+            use_cuda=false,
+            show_progress_bars=false,
+            norm_steps=20,
+            norm_type=:meanstd,
+            mps=2,
+            layer_size=16,
+            hidden_layers=1,
+            training_strategy=DerivativeTraining(),
+            solver_valid=OrdinaryDiffEq.Tsit5(),
+            solver_valid_dt=0.002f0,
+            types_updated=[1],
+            types_noisy=[1],
+            noise_stddevs=[0.0f0],
+        )
+        ds = GraphNetSim.Dataset(:train, NORM_DATA_PATH, args)
+        ds.meta["device"] = cpu_device()
+
+        _, e_norms, n_norms, o_norms = GraphNetSim.calc_norms(ds, cpu_device(), args)
+
+        # Pre-warm the edge normalizer with one accumulation so the saved
+        # count is non-zero — that's the value the restore must put back.
+        e_norms(randn(Float32, 4, 8))
+        @test e_norms.num_accumulations > 0.0f0
+
+        # Build a minimal GraphNetwork wrapper. The freeze/restore helpers
+        # only touch the normaliser fields, so a trivial model/ps/st suffices.
+        gns = GraphNetCore.GraphNetwork(
+            Chain(Dense(1 => 1)),
+            ComponentArray{Float32}(),
+            NamedTuple(),
+            e_norms,
+            n_norms,
+            o_norms,
+        )
+
+        e_before = gns.e_norm.num_accumulations
+        n_before = Dict(
+            k => v.num_accumulations for
+            (k, v) in gns.n_norm if v isa GraphNetCore.NormaliserOnline
+        )
+        o_before = Dict(
+            k => v.num_accumulations for
+            (k, v) in gns.o_norm if v isa GraphNetCore.NormaliserOnline
+        )
+
+        frozen = GraphNetSim._freeze_online_normalisers!(gns)
+
+        @testset "freeze caps each online normaliser at max_accumulations" begin
+            @test gns.e_norm.num_accumulations == gns.e_norm.max_accumulations
+            for (_, v) in gns.n_norm
+                if v isa GraphNetCore.NormaliserOnline
+                    @test v.num_accumulations == v.max_accumulations
+                end
+            end
+            for (_, v) in gns.o_norm
+                if v isa GraphNetCore.NormaliserOnline
+                    @test v.num_accumulations == v.max_accumulations
+                end
+            end
+        end
+
+        @testset "default acc=true call no longer increments after freeze" begin
+            cap = gns.e_norm.max_accumulations
+            gns.e_norm(randn(Float32, 4, 7))   # default acc=true
+            @test gns.e_norm.num_accumulations == cap
+        end
+
+        GraphNetSim._restore_online_normalisers!(frozen)
+
+        @testset "restore puts every saved count back exactly" begin
+            @test gns.e_norm.num_accumulations == e_before
+            for (k, v) in gns.n_norm
+                if v isa GraphNetCore.NormaliserOnline
+                    @test v.num_accumulations == n_before[k]
+                end
+            end
+            for (k, v) in gns.o_norm
+                if v isa GraphNetCore.NormaliserOnline
+                    @test v.num_accumulations == o_before[k]
+                end
+            end
         end
     end
 

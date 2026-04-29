@@ -708,53 +708,61 @@ function train_gns!(
                     print("\n\n\n\n\n\n\n")
                 end
 
-                for data_valid in valid_loader
-                    if args.show_progress_bars
-                        print("\n\n\n")
+                frozen_state = _freeze_online_normalisers!(gns)
+                try
+                    for data_valid in valid_loader
+                        if args.show_progress_bars
+                            print("\n\n\n")
+                        end
+                        pr_solver = ProgressUnknown(;
+                            desc="Trajectory $(traj_idx)/$(length(valid_loader)): ",
+                            showspeed=true,
+                            enabled=args.show_progress_bars,
+                        )
+
+                        node_type_valid = device(
+                            Float32.(
+                                GraphNetCore.one_hot(
+                                    vec(data_valid["node_type"][:, :, 1]),
+                                    ds_valid.meta["features"]["node_type"]["data_max"] -
+                                    ds_valid.meta["features"]["node_type"]["data_min"] + 1,
+                                    1 - ds_valid.meta["features"]["node_type"]["data_min"],
+                                ),
+                            ),
+                        )
+
+                        ve = validation_step(
+                            args.training_strategy,
+                            (
+                                gns,
+                                data_valid,
+                                ds_valid.meta,
+                                get_delta(
+                                    args.training_strategy, data_valid["trajectory_length"]
+                                ),
+                                args.solver_valid,
+                                args.solver_valid_dt,
+                                node_type_valid,
+                                pr_solver,
+                            ),
+                        )
+
+                        valid_error += ve
+
+                        next!(
+                            pr_valid;
+                            showvalues=[
+                                (
+                                    :trajectory,
+                                    "$traj_idx/$(ds_valid.meta["n_trajectories"])",
+                                ),
+                                (:valid_loss, "$(valid_error / traj_idx)"),
+                            ],
+                        )
+                        traj_idx += 1
                     end
-                    pr_solver = ProgressUnknown(;
-                        desc="Trajectory $(traj_idx)/$(length(valid_loader)): ",
-                        showspeed=true,
-                        enabled=args.show_progress_bars,
-                    )
-
-                    node_type_valid = device(
-                        Float32.(
-                            GraphNetCore.one_hot(
-                                vec(data_valid["node_type"][:, :, 1]),
-                                ds_valid.meta["features"]["node_type"]["data_max"] -
-                                ds_valid.meta["features"]["node_type"]["data_min"] + 1,
-                                1 - ds_valid.meta["features"]["node_type"]["data_min"],
-                            ),
-                        ),
-                    )
-
-                    ve = validation_step(
-                        args.training_strategy,
-                        (
-                            gns,
-                            data_valid,
-                            ds_valid.meta,
-                            get_delta(
-                                args.training_strategy, data_valid["trajectory_length"]
-                            ),
-                            args.solver_valid,
-                            args.solver_valid_dt,
-                            node_type_valid,
-                            pr_solver,
-                        ),
-                    )
-
-                    valid_error += ve
-
-                    next!(
-                        pr_valid;
-                        showvalues=[
-                            (:trajectory, "$traj_idx/$(ds_valid.meta["n_trajectories"])"),
-                            (:valid_loss, "$(valid_error / traj_idx)"),
-                        ],
-                    )
-                    traj_idx += 1
+                finally
+                    _restore_online_normalisers!(frozen_state)
                 end
 
                 if valid_error / ds_valid.meta["n_trajectories"] < min_validation_loss
