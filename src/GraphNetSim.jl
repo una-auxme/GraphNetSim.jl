@@ -25,6 +25,7 @@ import SciMLBase: solve, remake
 import HDF5: h5open, create_group, open_group
 import ProgressMeter: next!, update!, finish!
 import Statistics: mean
+import Printf: @sprintf
 
 include("utils.jl")
 include("graph.jl")
@@ -36,10 +37,11 @@ include("../convert_csv/csvToh5.jl")
 
 export SingleShooting, MultipleShooting, DerivativeTraining, BatchingStrategy
 
-export train_network, eval_network, data_minmax, data_meanstd, update_meta!
+export train_network,
+    eval_network, extrapolate_network, data_minmax, data_meanstd, update_meta!
 export init_train_step, train_step, validation_step, batchTrajectory
 # export prepare_training, get_delta
-export visualize
+export visualize, visualize_eval
 export csv_to_hdf5
 export ModelConfig, save_model_config, load_model_config
 
@@ -557,6 +559,7 @@ function train_gns!(
 
     local tmp_loss = 0.0f0
     local avg_loss = 0.0f0
+    local t_last_traj = time()
 
     output_features = ds_train.meta["output_features"]
 
@@ -673,7 +676,21 @@ function train_gns!(
             cp_progress += delta
             step += delta
             avg_loss += tmp_loss
+            traj_tmp_loss = tmp_loss
             tmp_loss = 0.0f0
+
+            if step > args.norm_steps && !args.show_progress_bars
+                n_traj = delta isa Vector ? sum(delta) : delta
+                dt_elapsed = time() - t_last_traj
+                @info @sprintf(
+                    "step=%d/%d | traj_loss=%.6g | s/step=%.3f",
+                    step,
+                    args.epochs*args.steps,
+                    traj_tmp_loss / Float32(n_traj),
+                    dt_elapsed / n_traj
+                )
+            end
+            t_last_traj = time()
 
             if step > args.norm_steps && cp_progress >= args.checkpoint
                 push!(df_train, [step, avg_loss / Float32(cp_progress)])
@@ -691,51 +708,61 @@ function train_gns!(
                     print("\n\n\n\n\n\n\n")
                 end
 
-                for data_valid in valid_loader
-                    print("\n\n\n")
-                    pr_solver = ProgressUnknown(;
-                        desc="Trajectory $(traj_idx)/$(length(valid_loader)): ",
-                        showspeed=true,
-                        enabled=args.show_progress_bars,
-                    )
+                frozen_state = _freeze_online_normalisers!(gns)
+                try
+                    for data_valid in valid_loader
+                        if args.show_progress_bars
+                            print("\n\n\n")
+                        end
+                        pr_solver = ProgressUnknown(;
+                            desc="Trajectory $(traj_idx)/$(length(valid_loader)): ",
+                            showspeed=true,
+                            enabled=args.show_progress_bars,
+                        )
 
-                    node_type_valid = device(
-                        Float32.(
-                            GraphNetCore.one_hot(
-                                vec(data_valid["node_type"][:, :, 1]),
-                                ds_valid.meta["features"]["node_type"]["data_max"] -
-                                ds_valid.meta["features"]["node_type"]["data_min"] + 1,
-                                1 - ds_valid.meta["features"]["node_type"]["data_min"],
+                        node_type_valid = device(
+                            Float32.(
+                                GraphNetCore.one_hot(
+                                    vec(data_valid["node_type"][:, :, 1]),
+                                    ds_valid.meta["features"]["node_type"]["data_max"] -
+                                    ds_valid.meta["features"]["node_type"]["data_min"] + 1,
+                                    1 - ds_valid.meta["features"]["node_type"]["data_min"],
+                                ),
                             ),
-                        ),
-                    )
+                        )
 
-                    ve = validation_step(
-                        args.training_strategy,
-                        (
-                            gns,
-                            data_valid,
-                            ds_valid.meta,
-                            get_delta(
-                                args.training_strategy, data_valid["trajectory_length"]
+                        ve = validation_step(
+                            args.training_strategy,
+                            (
+                                gns,
+                                data_valid,
+                                ds_valid.meta,
+                                get_delta(
+                                    args.training_strategy, data_valid["trajectory_length"]
+                                ),
+                                args.solver_valid,
+                                args.solver_valid_dt,
+                                node_type_valid,
+                                pr_solver,
                             ),
-                            args.solver_valid,
-                            args.solver_valid_dt,
-                            node_type_valid,
-                            pr_solver,
-                        ),
-                    )
+                        )
 
-                    valid_error += ve
+                        valid_error += ve
 
-                    next!(
-                        pr_valid;
-                        showvalues=[
-                            (:trajectory, "$traj_idx/$(ds_valid.meta["n_trajectories"])"),
-                            (:valid_loss, "$(valid_error / traj_idx)"),
-                        ],
-                    )
-                    traj_idx += 1
+                        next!(
+                            pr_valid;
+                            showvalues=[
+                                (
+                                    :trajectory,
+                                    "$traj_idx/$(ds_valid.meta["n_trajectories"])",
+                                ),
+                                (:valid_loss, "$(valid_error / traj_idx)"),
+                            ],
+                        )
+                        traj_idx += 1
+                    end
+                finally
+                    _restore_online_normalisers!(frozen_state)
                 end
 
                 if valid_error / ds_valid.meta["n_trajectories"] < min_validation_loss
@@ -759,12 +786,12 @@ function train_gns!(
                     args.on_valid(step, last_validation_loss)
                 end
                 if !args.show_progress_bars
-                    println("Train step: $(step)/$(args.epochs*args.steps)")
                     println(
-                        "Checkpoint: $(length(df_train.step) > 0 ? last(df_train.step) : 0)"
+                        "--- checkpoint reached at step $(step)/$(args.epochs*args.steps) ---",
                     )
-                    println("min_validation_loss: $min_validation_loss")
-                    println("last_validation_loss: $last_validation_loss")
+                    println("  avg_train_loss:      $(last(df_train.loss))")
+                    println("  min_validation_loss: $min_validation_loss")
+                    println("  last_validation_loss: $last_validation_loss")
                 end
                 save!(
                     gns,
@@ -1002,22 +1029,8 @@ function eval_network!(
             mse_steps = saves
         end
 
-        stepstart = round(Int, ((start/dt) + 1))
-
-        initial_state = Dict(
-            "position" => data["position"][:, :, stepstart],
-            "velocity" => data["velocity"][:, :, stepstart],
-        )
-
-        node_type = device(
-            Float32.(
-                GraphNetCore.one_hot(
-                    vec(data["node_type"][:, :, 1]),
-                    ds_test.meta["features"]["node_type"]["data_max"] -
-                    ds_test.meta["features"]["node_type"]["data_min"] + 1,
-                    1 - ds_test.meta["features"]["node_type"]["data_min"],
-                ),
-            ),
+        initial_state, node_type, stepstart = _prepare_rollout_inputs(
+            data, ds_test, start, dt, device
         )
 
         pr = ProgressUnknown(;
@@ -1044,35 +1057,10 @@ function eval_network!(
             pr,
         )
 
-        sol_acc = sol(sol.t, Val{1})
-        sol_pos = [u.x for u in sol.u]
-        sol_vel = [u.dx for u in sol.u]
-        sol_acc = [u.dx for u in sol_acc.u]
+        sol_t, prediction = _extract_trajectory_arrays(sol)
+        timesteps[(ti, "timesteps")] = sol_t
 
-        #convert array of matix into multidimensional array
-        sol_pos = cpu_device()(cat(sol_pos...; dims=3))
-        sol_vel = cat(sol_vel...; dims=3)
-        sol_acc = cat(sol_acc...; dims=3)
-
-        timesteps[(ti, "timesteps")] = sol.t
-
-        prediction = (pos=sol_pos, vel=sol_vel, acc=sol_acc)
-
-        #select timestep for prediction
-        gt_pos = device(data["position"])
-        gt_pos = cpu_device()(
-            gt_pos[:, :, stepstart:(stepstart + size(prediction.pos, 3) - 1)]
-        )
-        gt_vel = device(data["velocity"])
-        gt_vel = cpu_device()(
-            gt_vel[:, :, stepstart:(stepstart + size(prediction.vel, 3) - 1)]
-        )
-        gt_acc = device(data["acceleration"])
-        gt_acc = cpu_device()(
-            gt_acc[:, :, stepstart:(stepstart + size(prediction.acc, 3) - 1)]
-        )
-
-        gt = (pos=gt_pos, vel=gt_vel, acc=gt_acc)
+        gt = _slice_ground_truth(data, device, stepstart, size(prediction.pos, 3))
 
         print("\r\u1b[K")
         @info "Rollout trajectory $ti completed!"
@@ -1137,6 +1125,377 @@ function eval_network!(
     end
     return traj_ops, errors
     @info "Evaluation completed!"
+end
+
+"""
+    extrapolate_network(ds_path, cp_path::String, out_path::String, solver;
+                        start, stop, dt, saves,
+                        mse_steps=Float32[], has_ground_truth::Bool=true, kws...)
+
+Evaluate a trained network by rolling out trajectories that may extend past the ground
+truth horizon (or run with no ground truth at all).
+
+Unlike [`eval_network`](@ref), the user-supplied `start`, `stop`, `dt`, `saves`, and
+`mse_steps` are **never** overridden by values derived from the test trajectories. This
+lets callers integrate further than `(trajectory_length - 1) * dt`.
+
+## Arguments
+- `ds_path`: Path to the dataset (test split is used as the source of initial conditions).
+- `cp_path::String`: Checkpoint directory containing the trained model.
+- `out_path::String`: Output directory for the HDF5 result file.
+- `solver`: ODE solver (e.g. `Tsit5()`, `Euler()`) or `nothing` for collocation.
+- `start`: Evaluation start time; the initial condition is taken from the test
+  trajectory at frame `round(Int, (start/dt) + 1)`.
+- `stop`: Evaluation end time (may exceed `(trajectory_length - 1) * dt`).
+- `dt`: Fixed timestep. Must equal the dataset's native `dt`.
+- `saves`: Time points at which the ODE solution is saved.
+- `mse_steps=Float32[]`: Time points for MSE reporting. Steps beyond the ground-truth
+  horizon are skipped automatically.
+- `has_ground_truth::Bool=true`: When `false`, all ground-truth reads, MSE reporting,
+  and the `gt/` HDF5 group are skipped.
+
+## HDF5 Output
+
+Written to `{out_path}/{solver_name}/trajectories.h5`:
+```
+trajectory_N/
+  timesteps: Npred
+  prediction/
+    pos[1..Npred], vel[1..Npred], acc[1..Npred]
+    err[1..Npred]          # NaN32-filled for k > Noverlap (only when has_ground_truth)
+  gt/                      # omitted when has_ground_truth=false or no overlap
+    pos[1..Noverlap], vel[1..Noverlap], acc[1..Noverlap]
+```
+`Noverlap = min(Npred, trajectory_length - stepstart + 1)` is the number of saved
+steps covered by ground truth.
+
+## Notes
+- Online feature normalisers are frozen for the duration of the rollout so the
+  network's out-of-distribution predictions do not corrupt the stored statistics.
+- Integrator stability past the training horizon is not guaranteed — extrapolated
+  rollouts should be treated as qualitative unless independently validated.
+- Visualising the `gt/` subgroup of an extrapolated trajectory can throw past
+  `Noverlap` because the top-level `timesteps` field equals `Npred`. Use
+  [`eval_network`](@ref) when you need to visualise ground truth.
+"""
+function extrapolate_network(
+    ds_path,
+    cp_path::String,
+    out_path::String,
+    solver;
+    start,
+    stop,
+    dt,
+    saves,
+    mse_steps=Float32[],
+    has_ground_truth::Bool=true,
+    kws...,
+)
+    existing_cfg = load_model_config(cp_path)
+    if !isnothing(existing_cfg)
+        kws = merge(
+            (
+                mps=existing_cfg.mps,
+                layer_size=existing_cfg.layer_size,
+                hidden_layers=existing_cfg.hidden_layers,
+            ),
+            NamedTuple(kws),
+        )
+    end
+
+    args = Args(; kws...)
+
+    if CUDA.functional() && args.use_cuda
+        @info "Extrapolating on CUDA GPU..."
+        CUDA.device!(args.gpu_device)
+        CUDA.allowscalar(false)
+        device = gpu_device()
+    else
+        @info "Extrapolating on CPU..."
+        device = cpu_device()
+    end
+
+    @info "Using Lux as backend..."
+
+    println("Loading evaluation data...")
+    ds_test = Dataset(:test, ds_path, args)
+    ds_test.meta["device"] = device
+    ds_test.meta["training_strategy"] = nothing
+
+    @info "Evaluation data loaded!"
+    Threads.nthreads() < 2 &&
+        @warn "Julia is currently running on a single thread! Start Julia with more threads to speed up data loading."
+
+    println("Building model...")
+
+    quantities, e_norms, n_norms, o_norms = calc_norms(ds_test, device, args)
+
+    dims = ds_test.meta["dims"]
+    outputs = 0
+    for tf in ds_test.meta["output_features"]
+        outputs += ds_test.meta["features"][tf]["dim"]
+    end
+
+    gns, _, _, _ = load(
+        quantities,
+        typeof(dims) <: AbstractArray ? length(dims) : dims,
+        e_norms,
+        n_norms,
+        o_norms,
+        outputs,
+        args.mps,
+        args.layer_size,
+        args.hidden_layers,
+        nothing,
+        device,
+        args.use_valid ? joinpath(cp_path, "valid") : cp_path,
+    )
+
+    Lux.testmode(gns.st)
+
+    @info "Model built!"
+
+    extrapolate_network!(
+        solver,
+        gns,
+        ds_test,
+        device,
+        out_path,
+        start,
+        stop,
+        dt,
+        saves,
+        mse_steps,
+        args;
+        has_ground_truth=has_ground_truth,
+    )
+end
+
+"""
+    extrapolate_network!(solver, gns::GraphNetwork, ds_test::Dataset, device::Function,
+                         out_path, start, stop, dt, saves, mse_steps, args::Args;
+                         has_ground_truth::Bool=true)
+
+Inner evaluation loop for [`extrapolate_network`](@ref). Mirrors [`eval_network!`](@ref)
+but (a) never overrides the user-supplied time-grid arguments, (b) tolerates predictions
+longer than the ground truth (or missing ground truth entirely), and (c) freezes online
+feature normalisers during the rollout to prevent out-of-distribution drift.
+
+## Returns
+- `Tuple`: `(predictions::Dict{Int,NamedTuple}, errors::Dict{Int,Array{Float32,3}})`.
+  `errors` is empty when `has_ground_truth=false`.
+"""
+function extrapolate_network!(
+    solver,
+    gns::GraphNetwork,
+    ds_test::Dataset,
+    device::Function,
+    out_path,
+    start,
+    stop,
+    dt,
+    saves,
+    mse_steps,
+    args::Args;
+    has_ground_truth::Bool=true,
+)
+    @assert length(saves) > 0 "`saves` must not be empty"
+    @assert isapprox(Float32(saves[1]), Float32(start); atol=1.0f-6) "saves[1]=$(saves[1]) does not match start=$(start)"
+    @assert isapprox(Float32(saves[end]), Float32(stop); atol=1.0f-6) "saves[end]=$(saves[end]) does not match stop=$(stop)"
+
+    local traj_pred = Dict{
+        Int,
+        NamedTuple{
+            (:pos, :vel, :acc),Tuple{Array{Float32,3},Array{Float32,3},Array{Float32,3}}
+        },
+    }()
+    local traj_gt = Dict{
+        Int,
+        NamedTuple{
+            (:pos, :vel, :acc),Tuple{Array{Float32,3},Array{Float32,3},Array{Float32,3}}
+        },
+    }()
+    local traj_err = Dict{Int,Array{Float32,3}}()
+    local traj_timesteps = Dict{Int,Array{Float32,1}}()
+
+    frozen_state = _freeze_online_normalisers!(gns)
+
+    try
+        test_loader = DataLoader(ds_test; batchsize=-1, buffer=false, parallel=true)
+
+        for (ti, data) in enumerate(test_loader)
+            target_features = ds_test.meta["solver_target_features"]
+            output_features = ds_test.meta["output_features"]
+            println("Rollout trajectory $ti...")
+
+            data_dt = data["dt"] isa AbstractArray ? data["dt"][1] : data["dt"]
+            if !isapprox(Float32(dt), Float32(data_dt); atol=1.0f-6)
+                error(
+                    "Requested dt=$(dt) does not match dataset dt=$(data_dt). " *
+                    "Normalisation is trained at the dataset's dt.",
+                )
+            end
+
+            initial_state, node_type, stepstart = _prepare_rollout_inputs(
+                data, ds_test, start, dt, device
+            )
+
+            pr = ProgressUnknown(;
+                desc="Trajectory $ti/$(length(test_loader)): ",
+                showspeed=true,
+                enabled=args.show_progress_bars,
+            )
+
+            sol = rollout(
+                solver,
+                gns,
+                initial_state,
+                output_features,
+                ds_test.meta,
+                target_features,
+                node_type,
+                data["mask"],
+                data["val_mask"],
+                start,
+                stop,
+                dt,
+                saves,
+                device,
+                pr,
+            )
+
+            sol_t, prediction = _extract_trajectory_arrays(sol)
+            npred = size(prediction.pos, 3)
+            navail = data["trajectory_length"] - stepstart + 1
+            noverlap = has_ground_truth ? max(0, min(npred, navail)) : 0
+
+            print("\r\u1b[K")
+            @info "Rollout trajectory $ti completed!"
+
+            if has_ground_truth && noverlap > 0
+                gt = _slice_ground_truth(data, device, stepstart, noverlap)
+
+                squared_err = cpu_device()(
+                    (
+                        prediction.pos[:, Array(data["mask"]), 1:noverlap] .-
+                        gt.pos[:, Array(data["mask"]), :]
+                    ) .^ 2,
+                )
+
+                err_full = fill(NaN32, (size(squared_err, 1), size(squared_err, 2), npred))
+                err_full[:, :, 1:noverlap] .= squared_err
+
+                reduced = mean(squared_err; dims=2)
+                valid_mse_steps = filter(mse_steps) do h
+                    idx = findfirst(x -> x == h, saves)
+                    return !isnothing(idx) && idx <= noverlap
+                end
+                if !isempty(valid_mse_steps)
+                    println("MSE of state prediction ($noverlap of $npred steps covered):")
+                    for horizon in valid_mse_steps
+                        idx = findfirst(x -> x == horizon, saves)
+                        err = mean(reduced[:, 1, idx])
+                        cum_err = mean(reduced[:, 1, 1:idx])
+                        println(
+                            "  Trajectory $ti | mse t=$(horizon): $err | cum_mse t=$(horizon): $cum_err | cum_rmse t=$(horizon): $(sqrt(cum_err))",
+                        )
+                    end
+                end
+                if noverlap < npred
+                    @info "Trajectory $ti extrapolates past ground truth: $noverlap/$npred steps covered"
+                end
+
+                traj_gt[ti] = cpu_device()(gt)
+                traj_err[ti] = err_full
+            elseif has_ground_truth
+                @info "Trajectory $ti: no ground-truth overlap (stepstart=$stepstart, trajectory_length=$(data["trajectory_length"]))"
+            end
+
+            traj_pred[ti] = cpu_device()(prediction)
+            traj_timesteps[ti] = sol_t
+        end
+    finally
+        _restore_online_normalisers!(frozen_state)
+    end
+
+    eval_path = joinpath(
+        out_path, isnothing(solver) ? "collocation" : lowercase("$(nameof(typeof(solver)))")
+    )
+    mkpath(eval_path)
+
+    h5open(joinpath(eval_path, "trajectories.h5"), "w") do f
+        for i in sort(collect(keys(traj_pred)))
+            currentTrajectory = create_group(f, string("trajectory_$i"))
+            prediction = traj_pred[i]
+            npred = size(prediction.pos, 3)
+            currentTrajectory["timesteps"] = npred
+
+            sub_pred = create_group(currentTrajectory, "prediction")
+            err_arr = get(traj_err, i, nothing)
+            for k in axes(prediction.pos, 3)
+                sub_pred["pos[$k]"] = prediction.pos[:, :, k]
+                sub_pred["vel[$k]"] = prediction.vel[:, :, k]
+                sub_pred["acc[$k]"] = prediction.acc[:, :, k]
+                if !isnothing(err_arr)
+                    sub_pred["err[$k]"] = err_arr[:, :, k]
+                end
+            end
+
+            if haskey(traj_gt, i)
+                sub_gt = create_group(currentTrajectory, "gt")
+                gt = traj_gt[i]
+                for k in axes(gt.pos, 3)
+                    sub_gt["pos[$k]"] = gt.pos[:, :, k]
+                    sub_gt["vel[$k]"] = gt.vel[:, :, k]
+                    sub_gt["acc[$k]"] = gt.acc[:, :, k]
+                end
+            end
+        end
+    end
+
+    @info "Extrapolation completed!"
+    return traj_pred, traj_err
+end
+
+"""
+    _freeze_online_normalisers!(gns::GraphNetwork)
+
+Temporarily disable accumulation in every `NormaliserOnline` attached to `gns`. Returns
+a vector of `(normaliser, saved_num_accumulations)` pairs that `_restore_online_normalisers!`
+can use to undo the freeze.
+
+Implementation detail: the forward call `(n::NormaliserOnline)(F, acc)` only accumulates
+when `acc && n.num_accumulations < n.max_accumulations`. Setting
+`num_accumulations := max_accumulations` short-circuits the branch without changing the
+public call path in `build_graph`.
+"""
+function _freeze_online_normalisers!(gns::GraphNetwork)
+    saved = Vector{Tuple{GraphNetCore.NormaliserOnline,Float32}}()
+    if gns.e_norm isa GraphNetCore.NormaliserOnline
+        push!(saved, (gns.e_norm, gns.e_norm.num_accumulations))
+        gns.e_norm.num_accumulations = gns.e_norm.max_accumulations
+    end
+    for d in (gns.n_norm, gns.o_norm)
+        for (_, n) in d
+            if n isa GraphNetCore.NormaliserOnline
+                push!(saved, (n, n.num_accumulations))
+                n.num_accumulations = n.max_accumulations
+            end
+        end
+    end
+    return saved
+end
+
+"""
+    _restore_online_normalisers!(saved)
+
+Restore accumulation state saved by [`_freeze_online_normalisers!`](@ref).
+"""
+function _restore_online_normalisers!(saved)
+    for (n, num_acc) in saved
+        n.num_accumulations = num_acc
+    end
+    return nothing
 end
 
 end

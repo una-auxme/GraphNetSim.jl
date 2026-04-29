@@ -49,31 +49,35 @@ function visualize(
     #get all trajectory groups
     n_timesteps = Array{Int}(undef, 0)
     for topGroup in trajectory
-
-        # if NumberOfTimesteps === nothing    
-        timeStepsCheck = HDF5.h5open(inPath, "r")
-        currentGroup = timeStepsCheck[topGroup]
-        NumberOfTimesteps = HDF5.read(currentGroup, "timesteps")
-        push!(n_timesteps, NumberOfTimesteps)
-        NumberOfTimesteps = collect(1:1:NumberOfTimesteps)
-        # end
-
         inputFile = HDF5.h5open(inPath, "r")
 
         try
-            top = inputFile[topGroup]
-            top = top[subgroupTrajectory]
-            for t in NumberOfTimesteps
+            traj_group = inputFile[topGroup]
+            scalar_max = HDF5.read(traj_group, "timesteps")
+            top = traj_group[subgroupTrajectory]
+
+            # Determine actual step count in this subgroup by scanning its keys
+            # for datasets of the form "Position[N]" and taking the max N.
+            # The trajectory-level `timesteps` scalar serves only as an upper
+            # bound — extrapolation rollouts store a shorter `gt/` group.
+            prefix = Position * "["
+            actual_max = 0
+            for k in keys(top)
+                (startswith(k, prefix) && endswith(k, "]")) || continue
+                n = tryparse(Int, k[(length(prefix) + 1):(end - 1)])
+                n === nothing && continue
+                actual_max = max(actual_max, n)
+            end
+            step_count = min(scalar_max, actual_max)
+            push!(n_timesteps, step_count)
+
+            for t in 1:step_count
                 readDict[(currentTrajectory, Position, t)] = HDF5.read(
                     top, Position * "[$t]"
                 )
-                #read position 
-
                 for name in Parameters
                     readDict[(currentTrajectory, name, t)] = HDF5.read(top, name * "[$t]")
                 end
-                #read other parameters
-
             end
         finally
             HDF5.close(inputFile)
@@ -250,4 +254,37 @@ function dictToVTKHDF(
             end
         end
     end
+end
+
+"""
+    visualize_eval(inPath, outFolder; Position, gt_subgroup, gt_parameters,
+                   pred_subgroup, pred_parameters, Trajectorys)
+
+One-shot VTK export for evaluation outputs: writes both the rollout and the
+ground-truth subgroup. Safe for extrapolation — GT files are produced for
+every timestep present in the `gt/` group, even when the rollout is longer.
+
+## Arguments
+- `inPath::String`: Complete path ending with .h5 file.
+- `outFolder::String`: Complete path for output folder.
+- `Position::String`: HDF5 dataset name for position data (default `"pos"`).
+- `gt_subgroup::String`: Subgroup name for ground truth (default `"gt"`).
+- `gt_parameters::Vector{<:AbstractString}`: Additional GT datasets (default `["vel", "acc"]`).
+- `pred_subgroup::String`: Subgroup name for rollout (default `"prediction"`).
+- `pred_parameters::Vector{<:AbstractString}`: Additional rollout datasets (default `["vel", "acc", "err"]`).
+- `Trajectorys::Union{Vector{Int},Nothing}`: Trajectory indices to write (optional, auto-detected if nothing).
+"""
+function visualize_eval(
+    inPath::String,
+    outFolder::String;
+    Position::String="pos",
+    gt_subgroup::String="gt",
+    gt_parameters::Vector{<:AbstractString}=["vel", "acc"],
+    pred_subgroup::String="prediction",
+    pred_parameters::Vector{<:AbstractString}=["vel", "acc", "err"],
+    Trajectorys::Union{Vector{Int},Nothing}=nothing,
+)
+    visualize(inPath, outFolder, Position, pred_subgroup, pred_parameters, Trajectorys)
+    visualize(inPath, outFolder, Position, gt_subgroup, gt_parameters, Trajectorys)
+    return nothing
 end
