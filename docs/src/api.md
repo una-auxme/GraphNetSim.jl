@@ -71,6 +71,19 @@ GraphNetSim.DerivativeTraining
 GraphNetSim.BatchingStrategy
 ```
 
+### Schedulers
+
+Per-pass selection rules used by `DerivativeTraining` and `BatchingStrategy`
+to choose which training unit (timestep or batch) is processed at each
+inner iteration of a trajectory pass.
+
+```@docs
+GraphNetSim.Scheduler
+GraphNetSim.Sequential
+GraphNetSim.WorstLoss
+GraphNetSim.UniqueWorst
+```
+
 ## Normalization and Data Statistics
 
 ### Computing Normalization Statistics

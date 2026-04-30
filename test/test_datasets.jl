@@ -364,8 +364,7 @@ for cfg in CONFIGS
                 # epoch, so one full epoch = n_train * traj_length steps.
                 mktempdir() do cp_path
                     rerun = 5
-                    n_train =
-                        cfg.splits[findfirst(s -> s[1] == :train, cfg.splits)][2]
+                    n_train = cfg.splits[findfirst(s -> s[1] == :train, cfg.splits)][2]
                     base = cfg.traj_length
                     n_steps = base  # one epoch processes n_train trajectories
                     grad_calls = Ref(0)
@@ -374,9 +373,7 @@ for cfg in CONFIGS
                         cfg.path,
                         cp_path;
                         make_train_kwargs(cfg)...,
-                        training_strategy=DerivativeTraining(;
-                            scheduler=WorstLoss(rerun),
-                        ),
+                        training_strategy=DerivativeTraining(; scheduler=WorstLoss(rerun)),
                         steps=n_steps,
                         norm_steps=n_steps * 10,
                         checkpoint=n_steps * 10,
@@ -578,6 +575,44 @@ for cfg in CONFIGS
                         Tsit5(),
                         n_steps;
                         scheduler=UniqueWorst(2),
+                    ),
+                    steps=n_steps,
+                    checkpoint=n_steps,
+                    on_grad=(step, gs, ps, loss) -> (grad_calls[] += 1),
+                )
+
+                @test isfinite(min_val_loss)
+                @test grad_calls[] >= n_steps
+            end
+        end
+
+        # ─────────────────────────────────────────────────────────────────
+        # Group E3b: BatchingStrategy WorstLoss smoke
+        # Mirrors E3 but exercises the WorstLoss scheduler (which permits
+        # repeats) on the ODE-based path. BatchingStrategy.outer_iters
+        # ignores scheduler.rerun_steps and uses strategy.steps for the
+        # per-trajectory budget, so we assert grad_calls scales with steps,
+        # not with rerun_steps. This closes the coverage gap left by E3
+        # (UniqueWorst only).
+        # ─────────────────────────────────────────────────────────────────
+        @testset "E3b: BatchingStrategy WorstLoss smoke" begin
+            println("Running: E3b — BatchingStrategy WorstLoss smoke ($(cfg.name))")
+            mktempdir() do cp_path
+                batch_steps = 10
+                n_steps = 3
+
+                grad_calls = Ref(0)
+                min_val_loss = train_network(
+                    Adam(1.0f-4),
+                    cfg.path,
+                    cp_path;
+                    make_train_kwargs(cfg)...,
+                    training_strategy=BatchingStrategy(
+                        0.0f0,
+                        cfg.dt * batch_steps,
+                        Tsit5(),
+                        n_steps;
+                        scheduler=WorstLoss(2),
                     ),
                     steps=n_steps,
                     checkpoint=n_steps,

@@ -377,7 +377,7 @@ struct BatchingStrategy <: SolverStrategy
     solver::OrdinaryDiffEqAlgorithm
     sense::AbstractSensitivityAlgorithm
     steps::Int64
-    loss_function::Any
+    loss_function::Symbol
     solargs::Any
     scheduler::Scheduler
 end
@@ -426,6 +426,8 @@ function BatchingStrategy(
     scheduler::Scheduler=WorstLoss(0),
     solargs...,
 )
+    loss_function in (:mse, :mae) ||
+        throw(ArgumentError("loss_function must be :mse or :mae, got :$loss_function"))
     BatchingStrategy(
         tstart, intervall, solver, sense, steps, loss_function, solargs, scheduler
     )

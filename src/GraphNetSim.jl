@@ -319,6 +319,24 @@ function calc_norms(dataset, device, args)
     return quantities, e_norms, n_norms, o_norms
 end
 
+# Bridge between GraphNetCore.load()'s 2-col df_step (step, loss) and the
+# 3-col schema (step, interval_idx, loss). Idempotent: 3-col input is left
+# unchanged. Legacy 2-col rows preserve their original interval indices in
+# `interval_idx`; `step` is rebuilt as a monotonic 1:N counter so historical
+# rows stay plottable.
+function _migrate_df_step!(df_step::DataFrame)
+    if names(df_step) == ["step", "interval_idx", "loss"]
+        return df_step
+    end
+    legacy_idx = copy(df_step.step)
+    legacy_loss = copy(df_step.loss)
+    select!(df_step, Int[])
+    df_step.step = collect(Int.(1:length(legacy_idx)))
+    df_step.interval_idx = Int.(legacy_idx)
+    df_step.loss = legacy_loss
+    return df_step
+end
+
 """
     train_network(opt, ds_path::String, cp_path::String; kws...)
 
@@ -458,6 +476,8 @@ function train_network(opt, ds_path, cp_path; kws...)
         device,
         cp_path,
     ) # geht mit dims oder dimensions of array
+
+    _migrate_df_step!(df_step)
 
     if isnothing(opt_state)
         opt_state = Optimisers.setup(opt, gns.ps)
@@ -602,25 +622,24 @@ function train_gns!(
             effective_sched = norm_phase ? nothing : sched
 
             outer_iters_n = outer_iters(args.training_strategy, effective_sched, n_units)
-            losses_per_dp = if (!isnothing(effective_sched) && tracks_losses(effective_sched))
-                # Inf32 init is load-bearing: for BatchingStrategy + WorstLoss
-                # the base pass picks `argmax(fill(Inf32, n))` linearly. For
-                # DerivativeTraining the losses buffer is never read on the
-                # base pass (scheduler short-circuits to `i`), so the init
-                # value is a no-op there. Test D1f guards this invariant.
-                fill(Inf32, n_units)
-            else
-                nothing
-            end
+            losses_per_dp =
+                if (!isnothing(effective_sched) && tracks_losses(effective_sched))
+                    # Inf32 init is load-bearing: for BatchingStrategy + WorstLoss
+                    # the base pass picks `argmax(fill(Inf32, n))` linearly. For
+                    # DerivativeTraining the losses buffer is never read on the
+                    # base pass (scheduler short-circuits to `i`), so the init
+                    # value is a no-op there. Test D1f guards this invariant.
+                    fill(Inf32, n_units)
+                else
+                    nothing
+                end
 
             for datapoint in 1:outer_iters_n
                 norm_active = step + datapoint <= args.norm_steps
                 actual_dp = if isnothing(effective_sched)
                     datapoint
                 else
-                    next_index(
-                        effective_sched, datapoint, n_units, losses_per_dp, norm_active
-                    )
+                    next_index(effective_sched, datapoint, n_units, losses_per_dp, norm_active)
                 end
 
                 train_tuple = init_train_step(
@@ -656,7 +675,7 @@ function train_gns!(
                 end
                 tmp_loss += sum(losses)
                 if args.save_step
-                    push!(df_step, [actual_dp, sum(losses)])
+                    push!(df_step, [step + datapoint, actual_dp, sum(losses)])
                 end
                 if step + datapoint > args.norm_steps
                     for i in eachindex(gs)
