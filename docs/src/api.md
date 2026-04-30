@@ -48,6 +48,13 @@ GraphNetSim.eval_network
 GraphNetSim.eval_network!
 ```
 
+### Extrapolation Beyond Ground Truth
+
+```@docs
+GraphNetSim.extrapolate_network
+GraphNetSim.extrapolate_network!
+```
+
 ## Training Strategies
 
 ### Abstract Base Type
