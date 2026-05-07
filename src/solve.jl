@@ -356,10 +356,32 @@ using the bounds stored in `ds_test.meta["features"]["node_type"]`.
 """
 function _prepare_rollout_inputs(data, ds_test, start, dt, device)
     stepstart = round(Int, ((start / dt) + 1))
-    initial_state = Dict(
-        "position" => data["position"][:, :, stepstart],
-        "velocity" => data["velocity"][:, :, stepstart],
-    )
+    C = get(ds_test.meta, "history_size", 1)
+
+    if C > 1
+        # Paper-faithful warmup: `stepstart` is the first prediction frame, and
+        # the velocity buffer is seeded from the C ground-truth velocities ending
+        # at `stepstart` (so the buffer's newest slot and the integrator's current
+        # position align — the same pairing used at training time).
+        stepstart >= C || throw(
+            ArgumentError(
+                "history_size=$C requires start to map to a frame >= $C " *
+                "(got stepstart=$stepstart). Pass start=(C-1)*dt or later.",
+            ),
+        )
+        window = (stepstart - C + 1):stepstart
+        initial_state = Dict(
+            "position" => data["position"][:, :, stepstart],
+            "velocity" => data["velocity"][:, :, stepstart],
+            "velocity_window" => data["velocity"][:, :, window],
+        )
+    else
+        initial_state = Dict(
+            "position" => data["position"][:, :, stepstart],
+            "velocity" => data["velocity"][:, :, stepstart],
+        )
+    end
+
     node_type = device(
         Float32.(
             GraphNetCore.one_hot(

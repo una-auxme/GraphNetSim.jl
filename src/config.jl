@@ -29,7 +29,7 @@ as documentation and may legitimately differ between training phases.
 - `norm_type`: Normalization strategy for Float32 features (`:online`, `:minmax`, `:meanstd`).
 """
 @kwdef struct ModelConfig
-    format_version::Int = 1
+    format_version::Int = 2
     mps::Int
     layer_size::Int
     hidden_layers::Int
@@ -38,6 +38,7 @@ as documentation and may legitimately differ between training phases.
     types_noisy::Vector{Int}
     noise_stddevs::Vector{Float32}
     norm_type::Symbol = :online
+    history_size::Int = 1
 end
 
 """
@@ -59,14 +60,15 @@ function save_model_config(cfg::ModelConfig, cp_path::String)
         if !isnothing(existing)
             if existing.mps != cfg.mps ||
                 existing.layer_size != cfg.layer_size ||
-                existing.hidden_layers != cfg.hidden_layers
+                existing.hidden_layers != cfg.hidden_layers ||
+                existing.history_size != cfg.history_size
                 error(
                     "Architecture mismatch between supplied arguments and saved " *
                     "model config at \"$path\".\n" *
                     "  Saved:    mps=$(existing.mps), layer_size=$(existing.layer_size), " *
-                    "hidden_layers=$(existing.hidden_layers)\n" *
+                    "hidden_layers=$(existing.hidden_layers), history_size=$(existing.history_size)\n" *
                     "  Supplied: mps=$(cfg.mps), layer_size=$(cfg.layer_size), " *
-                    "hidden_layers=$(cfg.hidden_layers)\n" *
+                    "hidden_layers=$(cfg.hidden_layers), history_size=$(cfg.history_size)\n" *
                     "These parameters must match the existing checkpoint. " *
                     "Use a different cp_path to start a new training run.",
                 )
@@ -85,6 +87,7 @@ function save_model_config(cfg::ModelConfig, cp_path::String)
                     "mps" => cfg.mps,
                     "layer_size" => cfg.layer_size,
                     "hidden_layers" => cfg.hidden_layers,
+                    "history_size" => cfg.history_size,
                 ),
                 "training" => Dict(
                     "norm_steps" => cfg.norm_steps,
@@ -120,6 +123,7 @@ function load_model_config(cp_path::String)::Union{ModelConfig,Nothing}
             mps=arch["mps"],
             layer_size=arch["layer_size"],
             hidden_layers=arch["hidden_layers"],
+            history_size=Int(get(arch, "history_size", 1)),
             norm_steps=train["norm_steps"],
             types_updated=Int.(train["types_updated"]),
             types_noisy=Int.(train["types_noisy"]),

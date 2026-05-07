@@ -802,6 +802,7 @@ function prepare_trajectory!(
     if !isnothing(meta["training_strategy"]) &&
         (typeof(meta["training_strategy"]) <: DerivativeStrategy)
         add_targets!(data, meta["derivative_target_features"], device)
+        _stack_velocity_history!(data, meta, device)
         preprocess!(
             data,
             meta["input_features"],
@@ -825,4 +826,35 @@ function prepare_trajectory!(
         end
     end
     return data, meta
+end
+
+function _stack_velocity_history!(
+    data::Dict{String,Any}, meta::Dict{String,Any}, device::Function
+)
+    C = get(meta, "history_size", 1)
+    C == 1 && return
+    haskey(data, "velocity") || return
+    vel = data["velocity"]
+    T = size(vel, 3)
+    T >= C || throw(
+        ArgumentError("trajectory_length=$T is shorter than history_size=$C"),
+    )
+    M = T - C + 1
+
+    dim, np = size(vel, 1), size(vel, 2)
+    slices = [reshape(vel[:, :, c:(c + M - 1)], dim, np, 1, M) for c in 1:C]
+    data["velocity_history"] = device(cat(slices...; dims=3))
+
+    for key in collect(keys(data))
+        key == "velocity_history" && continue
+        v = data[key]
+        (v isa AbstractArray) || continue
+        ndims(v) >= 3 || continue
+        size(v, ndims(v)) == T || continue
+        idx = ntuple(i -> i == ndims(v) ? (C:T) : Colon(), ndims(v))
+        data[key] = v[idx...]
+    end
+
+    data["trajectory_length"] = M
+    return
 end

@@ -40,10 +40,16 @@ function build_graph(
     # fluid_position = data["position"][:, data["mask"], datapoint]
     current_position = data["position"][:, :, datapoint]
 
+    velocity = if get(meta, "history_size", 1) > 1 && haskey(data, "velocity_history")
+        data["velocity_history"][:, :, :, datapoint]
+    else
+        data["velocity"][:, :, datapoint]
+    end
+
     build_graph(
         gns,
         current_position,
-        data["velocity"][:, :, datapoint],
+        velocity,
         meta,
         node_type,
         data["mask"],
@@ -75,72 +81,70 @@ All features are normalized using the normalizers stored in the model.
 function build_graph(
     gns::GraphNetCore.GraphNetwork, position, velocity, meta, node_type, mask, device
 ) # TODO check ODE solve and if this is really repeatedly done
-    # if size(boundaries,2)== 0
-    #     current_position = position
-    # else
-    #     current_position = hcat(position, boundaries)
-    #     velocity = hcat(velocity, zeros(Float32, meta["dims"], size(boundaries,2)))
-    # end
-
     senders, receivers, rel_displacement, rel_dist_norm = point_neighbor_ns(
         position, Float32(meta["default_connectivity_radius"])
     )
-    # if size(boundaries,2) != 0
-    # #     # sender_old, receiver_old, senders, receivers, _, b_particle = check_and_delete_filtered(senders, receivers, size(position, 2), true)
-    # #     # rel_displacement = (position[:, receiver_old] - position[:, sender_old]) ./ Float32(meta["default_connectivity_radius"])
-    # #     # rel_dist_norm = sqrt.(sum(abs2, rel_displacement; dims = 1))
-    #     dist_bound = compute_clostest_dist_bound(Array(senders), Array(receivers), Array(rel_dist_norm), Array(rel_displacement), size(position,2), length(unique(Array(b_particle))))
-    #     particles = unique(Array(senders))
-    # else
-    #     dist_bound = cu(ones(Float32, size(position)...))
-    #     particles = Colon()
-    # end
 
-    if n_node_types(meta) > 1
-        if length(mask) == size(position, 2)
-            dist_bound = device(ones(Float32, size(position)...))
-        else
-            boundaries = device(Float32.(vcat(permutedims.(meta["bounds"])...)))
-            dist_low_bound = position .- boundaries[:, 1]
-            dist_up_bound = boundaries[:, 2] .- position
-            dist_bound = clamp.(
-                vcat(dist_low_bound, dist_up_bound) ./
-                Float32(meta["default_connectivity_radius"]),
-                -1.0f0,
-                1.0f0,
-            )
-        end
-    end
+    multi_type = n_node_types(meta) > 1
+    use_wall = multi_type || "wall_distance" in meta["input_features"]
+    use_position = "position" in meta["input_features"]
+
+    vel_norm = _normalize_velocity(gns, velocity)
 
     edge_features = device(vcat(rel_displacement, rel_dist_norm) .+ 1.0f-8)
 
-    if n_node_types(meta) == 1
-        if length(meta["input_features"]) == 2
-            node_features = device(
-                vcat(gns.n_norm["position"](position), gns.n_norm["velocity"](velocity))
-            )
-        else
-            node_features = device(gns.n_norm["velocity"](velocity))
-        end
-    else
-        if length(meta["input_features"]) == 2
-            node_features = device(
-                vcat(
-                    gns.n_norm["position"](position),
-                    gns.n_norm["velocity"](velocity),
-                    dist_bound,
-                    node_type,
-                ),
-            )
-        else
-            node_features = device(
-                vcat(gns.n_norm["velocity"](velocity), dist_bound, node_type)
-            )
-        end
+    nf = vel_norm
+    if use_position
+        nf = vcat(gns.n_norm["position"](position), nf)
     end
+    if use_wall
+        nf = vcat(nf, _wall_distance(position, mask, meta, device))
+    end
+    if multi_type
+        nf = vcat(nf, node_type)
+    end
+    node_features = device(nf)
 
     return GraphNetCore.FeatureGraph(
         node_features, gns.e_norm(edge_features), senders, receivers
+    )
+end
+
+function _normalize_velocity(gns::GraphNetCore.GraphNetwork, velocity)
+    nv = gns.n_norm["velocity"]
+    if ndims(velocity) == 2
+        return nv(velocity)
+    elseif ndims(velocity) == 3
+        C = size(velocity, 3)
+        slices = map(1:C) do c
+            slc = velocity[:, :, c]
+            return nv isa NormaliserOnline ? nv(slc, c == C) : nv(slc)
+        end
+        stacked = cat(slices...; dims=3)
+        permuted = permutedims(stacked, (1, 3, 2))
+        return reshape(permuted, :, size(velocity, 2))
+    else
+        throw(
+            ArgumentError(
+                "velocity must be 2D (dim, particles) or 3D (dim, particles, C); " *
+                "got ndims=$(ndims(velocity))",
+            ),
+        )
+    end
+end
+
+function _wall_distance(position, mask, meta, device)
+    if length(mask) == size(position, 2)
+        return device(ones(Float32, size(position)...))
+    end
+    boundaries = device(Float32.(vcat(permutedims.(meta["bounds"])...)))
+    dist_low_bound = position .- boundaries[:, 1]
+    dist_up_bound = boundaries[:, 2] .- position
+    return clamp.(
+        vcat(dist_low_bound, dist_up_bound) ./
+        Float32(meta["default_connectivity_radius"]),
+        -1.0f0,
+        1.0f0,
     )
 end
 

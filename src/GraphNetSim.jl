@@ -17,7 +17,7 @@ using HDF5
 using Plots
 
 import SciMLBase: ODEProblem, SecondOrderODEProblem
-import OrdinaryDiffEq: OrdinaryDiffEqAlgorithm, Tsit5
+import OrdinaryDiffEq: OrdinaryDiffEqAlgorithm, Tsit5, Euler
 import ProgressMeter: Progress
 
 import Base: @kwdef
@@ -30,6 +30,7 @@ import Printf: @sprintf
 include("utils.jl")
 include("graph.jl")
 include("solve.jl")
+include("rollout_history.jl")
 include("dataset.jl")
 include("visualize.jl")
 include("config.jl")
@@ -114,9 +115,51 @@ Configuration structure for training and evaluating Graph Neural Network simulat
     optimizer_learning_rate_start::Float32 = 1.0f-4
     optimizer_learning_rate_stop::Union{Nothing,Float32} = nothing
     norm_type::Symbol = :online
+    history_size::Int = 1
     save_step::Bool = false
     on_grad::Union{Nothing,Function} = nothing
     on_valid::Union{Nothing,Function} = nothing
+end
+
+function _validate_history_args(args::Args)
+    args.history_size ≥ 1 || throw(
+        ArgumentError("history_size must be ≥ 1, got $(args.history_size)")
+    )
+    args.history_size == 1 && return
+    args.training_strategy isa DerivativeTraining || throw(
+        ArgumentError(
+            "history_size > 1 is only supported with DerivativeTraining; got " *
+            "$(typeof(args.training_strategy)). ODE-based strategies will be " *
+            "extended in a follow-up plan.",
+        ),
+    )
+    args.solver_valid isa Euler || throw(
+        ArgumentError(
+            "history_size > 1 requires solver_valid = Euler() (sliding-buffer " *
+            "rollout is fixed-step only); got $(typeof(args.solver_valid)).",
+        ),
+    )
+    isnothing(args.solver_valid_dt) && throw(
+        ArgumentError(
+            "history_size > 1 requires solver_valid_dt to be set explicitly " *
+            "(Euler is fixed-step).",
+        ),
+    )
+    return
+end
+
+function _validate_history_meta(meta::Dict, args::Args)
+    args.history_size == 1 && return
+    allowed = ("velocity", "wall_distance")
+    bad = [f for f in meta["input_features"] if !(f in allowed)]
+    isempty(bad) || throw(
+        ArgumentError(
+            "history_size > 1 requires input_features ⊆ $(allowed); got " *
+            "extras $(bad). Drop position from input_features or set " *
+            "history_size = 1.",
+        ),
+    )
+    return
 end
 
 """
@@ -163,7 +206,11 @@ function calc_norms(dataset, device, args)
     for feature in dataset.meta["feature_names"]
         feature_dim = dataset.meta["features"][feature]["dim"]
         if feature in input_features
-            quantities += feature_dim
+            if feature == "velocity"
+                quantities += feature_dim * args.history_size
+            else
+                quantities += feature_dim
+            end
         end
 
         if getfield(
@@ -313,7 +360,7 @@ function calc_norms(dataset, device, args)
             end
         end
     end
-    if n_node_types(dataset.meta) > 1
+    if n_node_types(dataset.meta) > 1 || "wall_distance" in input_features
         quantities += length(dataset.meta["bounds"]) * 2
     end
 
@@ -386,12 +433,14 @@ function train_network(opt, ds_path, cp_path; kws...)
                 layer_size=existing_cfg.layer_size,
                 hidden_layers=existing_cfg.hidden_layers,
                 norm_type=existing_cfg.norm_type,
+                history_size=existing_cfg.history_size,
             ),
             NamedTuple(kws),
         )
     end
 
     args = Args(; kws...)
+    _validate_history_args(args)
 
     save_model_config(
         ModelConfig(;
@@ -403,6 +452,7 @@ function train_network(opt, ds_path, cp_path; kws...)
             types_noisy=args.types_noisy,
             noise_stddevs=args.noise_stddevs,
             norm_type=args.norm_type,
+            history_size=args.history_size,
         ),
         cp_path,
     )
@@ -425,12 +475,15 @@ function train_network(opt, ds_path, cp_path; kws...)
     ds_train.meta["types_noisy"] = args.types_noisy
     ds_train.meta["noise_stddevs"] = args.noise_stddevs
     ds_train.meta["device"] = device
+    ds_train.meta["history_size"] = args.history_size
     ds_valid = Dataset(:valid, ds_path, args)
     ds_valid.meta["types_updated"] = args.types_updated
     ds_valid.meta["types_noisy"] = args.types_noisy
     ds_valid.meta["noise_stddevs"] = args.noise_stddevs
     ds_valid.meta["device"] = device
+    ds_valid.meta["history_size"] = args.history_size
     ds_valid.meta["training_strategy"] = nothing
+    _validate_history_meta(ds_train.meta, args)
 
     @info "Training data loaded!"
     Threads.nthreads() < 2 &&
@@ -884,12 +937,14 @@ function eval_network(
                 mps=existing_cfg.mps,
                 layer_size=existing_cfg.layer_size,
                 hidden_layers=existing_cfg.hidden_layers,
+                history_size=existing_cfg.history_size,
             ),
             NamedTuple(kws),
         )
     end
 
     args = Args(; kws...)
+    _validate_history_args(args)
 
     if CUDA.functional() && args.use_cuda
         @info "Evaluating on CUDA GPU..."
@@ -906,7 +961,9 @@ function eval_network(
     println("Loading evaluation data...")
     ds_test = Dataset(:test, ds_path, args)
     ds_test.meta["device"] = device
+    ds_test.meta["history_size"] = args.history_size
     ds_test.meta["training_strategy"] = nothing
+    _validate_history_meta(ds_test.meta, args)
 
     # clear_log(1, false)
     @info "Evaluation data loaded!"
@@ -1022,8 +1079,11 @@ function eval_network!(
         println("Rollout trajectory $ti...")
 
         if length(test_loader) > 1
-            start = 0.0f0
             dt = data["dt"] # TODO dt can be an array?
+            C = get(ds_test.meta, "history_size", 1)
+            # With paper-faithful warmup, the first prediction frame is C; the C-1
+            # frames before it seed the velocity buffer.
+            start = Float32((C - 1) * dt)
             stop = round((data["trajectory_length"] - 1) * dt; digits=6)
             saves = start:dt:stop
             mse_steps = saves
@@ -1039,23 +1099,39 @@ function eval_network!(
             enabled=args.show_progress_bars,
         )
 
-        sol = rollout(
-            solver,
-            gns,
-            initial_state,
-            output_features,
-            ds_test.meta,
-            target_features,
-            node_type,
-            data["mask"],
-            data["val_mask"],
-            start,
-            stop,
-            dt,
-            saves,
-            device,
-            pr,
-        )
+        sol = if get(ds_test.meta, "history_size", 1) > 1
+            rollout_history(
+                gns,
+                initial_state,
+                output_features,
+                ds_test.meta,
+                target_features,
+                node_type,
+                data["mask"],
+                data["val_mask"],
+                saves,
+                device,
+                pr,
+            )
+        else
+            rollout(
+                solver,
+                gns,
+                initial_state,
+                output_features,
+                ds_test.meta,
+                target_features,
+                node_type,
+                data["mask"],
+                data["val_mask"],
+                start,
+                stop,
+                dt,
+                saves,
+                device,
+                pr,
+            )
+        end
 
         sol_t, prediction = _extract_trajectory_arrays(sol)
         timesteps[(ti, "timesteps")] = sol_t
@@ -1198,12 +1274,14 @@ function extrapolate_network(
                 mps=existing_cfg.mps,
                 layer_size=existing_cfg.layer_size,
                 hidden_layers=existing_cfg.hidden_layers,
+                history_size=existing_cfg.history_size,
             ),
             NamedTuple(kws),
         )
     end
 
     args = Args(; kws...)
+    _validate_history_args(args)
 
     if CUDA.functional() && args.use_cuda
         @info "Extrapolating on CUDA GPU..."
@@ -1220,7 +1298,9 @@ function extrapolate_network(
     println("Loading evaluation data...")
     ds_test = Dataset(:test, ds_path, args)
     ds_test.meta["device"] = device
+    ds_test.meta["history_size"] = args.history_size
     ds_test.meta["training_strategy"] = nothing
+    _validate_history_meta(ds_test.meta, args)
 
     @info "Evaluation data loaded!"
     Threads.nthreads() < 2 &&
@@ -1346,23 +1426,39 @@ function extrapolate_network!(
                 enabled=args.show_progress_bars,
             )
 
-            sol = rollout(
-                solver,
-                gns,
-                initial_state,
-                output_features,
-                ds_test.meta,
-                target_features,
-                node_type,
-                data["mask"],
-                data["val_mask"],
-                start,
-                stop,
-                dt,
-                saves,
-                device,
-                pr,
-            )
+            sol = if get(ds_test.meta, "history_size", 1) > 1
+                rollout_history(
+                    gns,
+                    initial_state,
+                    output_features,
+                    ds_test.meta,
+                    target_features,
+                    node_type,
+                    data["mask"],
+                    data["val_mask"],
+                    saves,
+                    device,
+                    pr,
+                )
+            else
+                rollout(
+                    solver,
+                    gns,
+                    initial_state,
+                    output_features,
+                    ds_test.meta,
+                    target_features,
+                    node_type,
+                    data["mask"],
+                    data["val_mask"],
+                    start,
+                    stop,
+                    dt,
+                    saves,
+                    device,
+                    pr,
+                )
+            end
 
             sol_t, prediction = _extract_trajectory_arrays(sol)
             npred = size(prediction.pos, 3)

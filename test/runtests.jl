@@ -17,4 +17,5 @@ include("generate_fixtures.jl")
 
     include("test_normalizer.jl")
     include("test_datasets.jl")
+    include("test_history_stack.jl")
 end

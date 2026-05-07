@@ -130,9 +130,29 @@ Inner function for validation of a single trajectory.
 function _validation_step(t::Tuple, sim_interval, data_interval)
     gns, data, meta, _, solver, solver_dt, node_type, pr = t
 
-    initial_state = Dict(
-        "position" => data["position"][:, :, 1], "velocity" => data["velocity"][:, :, 1]
-    )
+    C = get(meta, "history_size", 1)
+    initial_state = if C > 1
+        # First prediction frame is `data_interval[1] = C`; the C velocities ending
+        # there form the warmup buffer (paper-faithful: the model sees an
+        # in-distribution velocity history at step 1 of the rollout).
+        first_frame = first(data_interval)
+        first_frame >= C || throw(
+            ArgumentError(
+                "history_size=$C requires data_interval[1] >= $C; got $first_frame.",
+            ),
+        )
+        window = (first_frame - C + 1):first_frame
+        Dict(
+            "position" => data["position"][:, :, first_frame],
+            "velocity" => data["velocity"][:, :, first_frame],
+            "velocity_window" => data["velocity"][:, :, window],
+        )
+    else
+        Dict(
+            "position" => data["position"][:, :, 1],
+            "velocity" => data["velocity"][:, :, 1],
+        )
+    end
 
     target_dict = Dict{String,Int32}()
     for tf in meta["solver_target_features"]
@@ -142,29 +162,48 @@ function _validation_step(t::Tuple, sim_interval, data_interval)
     gt = vcat([data[tf] for tf in meta["solver_target_features"]]...)[
         :, data["mask"], data_interval
     ]
-    sol = rollout(
-        solver,
-        gns,
-        initial_state,
-        meta["output_features"],
-        meta,
-        meta["solver_target_features"],
-        node_type,
-        data["mask"],
-        data["val_mask"],
-        Float32(sim_interval[1]),
-        Float32(sim_interval[end]),
-        solver_dt,
-        sim_interval,
-        meta["device"],
-        pr,
-    )
+    sol = if C > 1
+        rollout_history(
+            gns,
+            initial_state,
+            meta["output_features"],
+            meta,
+            meta["solver_target_features"],
+            node_type,
+            data["mask"],
+            data["val_mask"],
+            sim_interval,
+            meta["device"],
+            pr,
+        )
+    else
+        rollout(
+            solver,
+            gns,
+            initial_state,
+            meta["output_features"],
+            meta,
+            meta["solver_target_features"],
+            node_type,
+            data["mask"],
+            data["val_mask"],
+            Float32(sim_interval[1]),
+            Float32(sim_interval[end]),
+            solver_dt,
+            sim_interval,
+            meta["device"],
+            pr,
+        )
+    end
     GC.gc()         # Run Julia's garbage collector first
     if CUDA.functional()
         CUDA.reclaim()  # Force garbage collection and free unused memory
     end
     sol_pos = [u.x for u in sol.u]
-    prediction = cat(sol_pos...; dims=3)[:, data["mask"], data_interval]
+    # `sol.u[k]` is the predicted state at frame `data_interval[k]` (paper-faithful)
+    # or frame `k` (legacy). In both cases, the comparison takes the first
+    # `length(data_interval)` saved entries.
+    prediction = cat(sol_pos...; dims=3)[:, data["mask"], 1:length(data_interval)]
 
     error = mean((prediction - gt) .^ 2; dims=3)
 
@@ -1080,6 +1119,11 @@ derivatives. Computes gradients via backpropagation.
 """
 function train_step(strategy::DerivativeStrategy, t::Tuple)
     gns, data, meta, target_quantities_change, node_type, mask, device, datapoint = t # TODO here own function
+    velocity_arg = if haskey(data, "velocity_history")
+        data["velocity_history"][:, :, :, datapoint]
+    else
+        data["velocity"][:, :, datapoint]
+    end
     loss, gs = Zygote.withgradient(
         ps -> train_loss(
             strategy,
@@ -1087,7 +1131,7 @@ function train_step(strategy::DerivativeStrategy, t::Tuple)
                 ps,
                 gns,
                 data["position"][:, :, datapoint],
-                data["velocity"][:, :, datapoint],
+                velocity_arg,
                 meta,
                 target_quantities_change,
                 node_type,
@@ -1176,16 +1220,33 @@ and comparing derivatives with ground truth.
 - `t::Tuple`: Validation data tuple.
 """
 function validation_step(::DerivativeStrategy, t::Tuple)
-    _, data, _, delta, _, _, _, _ = t
+    _, data, meta, delta, _, _, _, _ = t
     dt = data["dt"]
-    if typeof(dt) <: AbstractArray
-        sim_interval = dt[1]:(dt[2] - dt[1]):dt[delta]
+    C = get(meta, "history_size", 1)
+    if C > 1
+        # Paper-faithful: warmup uses frames 1..C of ground truth. The first
+        # prediction frame is C; the integration covers frames C..T (length
+        # T - C + 1). We size `sim_interval` with one trailing extra step (matching
+        # the C=1 convention of integrating one step past the last compared frame).
+        T = data["trajectory_length"]
+        L = T - C + 1
+        if typeof(dt) <: AbstractArray
+            base_dt = dt[2] - dt[1]
+            sim_interval = 0.0:base_dt:(base_dt * L)
+        else
+            sim_interval = 0.0:dt:(dt * L)
+        end
+        data_interval = C:T   # length L
     else
-        # sim_interval = 0.0: dt: dt * t[2]["trajectory_length"]
-        sim_interval = 0.0:dt:(dt * delta)
+        if typeof(dt) <: AbstractArray
+            sim_interval = dt[1]:(dt[2] - dt[1]):dt[delta]
+        else
+            # sim_interval = 0.0: dt: dt * t[2]["trajectory_length"]
+            sim_interval = 0.0:dt:(dt * delta)
+        end
+        # data_interval = 1:t[2]["trajectory_length"]
+        data_interval = 1:(length(sim_interval) - 1)
     end
-    # data_interval = 1:t[2]["trajectory_length"]
-    data_interval = 1:(length(sim_interval) - 1)
     return _validation_step(t, sim_interval, data_interval)
 end
 
