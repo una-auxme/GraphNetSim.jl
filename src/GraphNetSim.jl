@@ -24,8 +24,9 @@ import Base: @kwdef
 import SciMLBase: solve, remake
 import HDF5: h5open, create_group, open_group
 import ProgressMeter: next!, update!, finish!
-import Statistics: mean
+import Statistics: mean, quantile
 import Printf: @sprintf
+import Random: randperm
 
 include("utils.jl")
 include("graph.jl")
@@ -36,7 +37,20 @@ include("config.jl")
 include("../convert_csv/csvToh5.jl")
 
 export SingleShooting, MultipleShooting, DerivativeTraining, BatchingStrategy
-export Scheduler, Sequential, WorstLoss, UniqueWorst
+export Scheduler,
+    Sequential,
+    WorstLoss,
+    UniqueWorst,
+    Shuffled,
+    WeightedWorst,
+    TopKWorst,
+    EpsilonGreedy,
+    ProgressiveHorizon,
+    UCB,
+    LearningProgress,
+    PercentileWorst,
+    Staleness,
+    AnnealedWeighted
 
 export train_network,
     eval_network, extrapolate_network, data_minmax, data_meanstd, update_meta!

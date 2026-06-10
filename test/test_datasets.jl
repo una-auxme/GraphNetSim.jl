@@ -23,6 +23,7 @@ using DataFrames
 using LinearAlgebra
 using JSON
 using PointNeighbors
+using Random
 import OrdinaryDiffEq: Tsit5, Euler
 import Optimisers: Adam
 
@@ -333,6 +334,201 @@ for cfg in CONFIGS
                 @test losses[1] == -Inf32
             end
 
+            @testset "D1h: Shuffled permutation per cycle" begin
+                Random.seed!(123)
+                sched = Shuffled()
+                @test GraphNetSim.total_iters(sched, 6) == 6
+                @test GraphNetSim.tracks_losses(sched) == false
+                # losses argument is irrelevant; pass `nothing` like the loop does.
+                cycle1 = [GraphNetSim.next_index(sched, i, 6, nothing, false) for i in 1:6]
+                @test sort(cycle1) == collect(1:6)   # exact permutation
+                # A wrap-around (budget > n_units) re-shuffles into a new cycle.
+                cycle2 = [GraphNetSim.next_index(sched, i, 6, nothing, false) for i in 7:12]
+                @test sort(cycle2) == collect(1:6)
+                # update_state! is a no-op and accepts a nothing buffer.
+                @test GraphNetSim.update_state!(sched, 1, 1, 0.0f0, 6, nothing) === nothing
+            end
+
+            @testset "D1i: WeightedWorst loss-proportional reruns" begin
+                sched = WeightedWorst(5)
+                @test GraphNetSim.total_iters(sched, 10) == 15
+                @test GraphNetSim.tracks_losses(sched) == true
+                losses = Float32[1, 9, 3, 2, 7]
+                # Base pass is linear; norm window wraps; both bypass sampling.
+                @test GraphNetSim.next_index(sched, 1, 5, losses, false) == 1
+                @test GraphNetSim.next_index(sched, 5, 5, losses, false) == 5
+                @test GraphNetSim.next_index(sched, 7, 5, losses, true) == 2
+                # Uncomputed-first invariant: any Inf32 entry wins via argmax.
+                li = fill(Inf32, 5)
+                li[1] = 0.5f0
+                @test GraphNetSim.next_index(sched, 6, 5, li, false) == 2
+                # temperature → 0 concentrates on argmax(losses) == 2.
+                cold = WeightedWorst(5; temperature=1.0f-3)
+                Random.seed!(1)
+                @test all(
+                    GraphNetSim.next_index(cold, 6, 5, losses, false) == 2 for _ in 1:50
+                )
+                GraphNetSim.update_state!(sched, 6, 2, 0.5f0, 5, losses)
+                @test losses[2] == 0.5f0
+            end
+
+            @testset "D1j: TopKWorst round-robin over k worst" begin
+                sched = TopKWorst(6, 3)
+                @test GraphNetSim.total_iters(sched, 5) == 11
+                @test GraphNetSim.tracks_losses(sched) == true
+                losses = Float32[3, 1, 2, 5, 4]  # worst→best: 4, 5, 1, 3, 2
+                # Base pass linear.
+                @test GraphNetSim.next_index(sched, 1, 5, losses, false) == 1
+                # Reruns cycle the top-3 set [4, 5, 1] round-robin.
+                rr = [GraphNetSim.next_index(sched, i, 5, losses, false) for i in 6:11]
+                @test rr == [4, 5, 1, 4, 5, 1]
+                # k clamped to 1 collapses to WorstLoss (argmax only).
+                @test GraphNetSim.next_index(TopKWorst(3, 1), 6, 5, losses, false) == 4
+                # k clamped to n_units never exceeds the pool.
+                @test GraphNetSim.next_index(TopKWorst(3, 99), 6, 5, losses, false) == 4
+            end
+
+            @testset "D1k: EpsilonGreedy explore/exploit reruns" begin
+                sched = EpsilonGreedy(5)
+                @test GraphNetSim.total_iters(sched, 5) == 10
+                @test GraphNetSim.tracks_losses(sched) == true
+                losses = Float32[3, 1, 2, 5, 4]  # argmax == 4
+                # Base pass linear; norm window wraps.
+                @test GraphNetSim.next_index(sched, 2, 5, losses, false) == 2
+                @test GraphNetSim.next_index(sched, 7, 5, losses, true) == 2
+                # epsilon == 0 is pure greedy → always argmax.
+                greedy = EpsilonGreedy(5; epsilon=0.0f0)
+                @test all(
+                    GraphNetSim.next_index(greedy, 6, 5, losses, false) == 4 for _ in 1:50
+                )
+                # epsilon == 1 explores → not stuck on a single index.
+                explore = EpsilonGreedy(5; epsilon=1.0f0)
+                Random.seed!(7)
+                picks = [
+                    GraphNetSim.next_index(explore, 6, 5, losses, false) for _ in 1:200
+                ]
+                @test length(unique(picks)) > 1
+                # Uncomputed-first invariant.
+                li = fill(Inf32, 5)
+                li[3] = 0.5f0
+                @test GraphNetSim.next_index(greedy, 6, 5, li, false) == 1
+                GraphNetSim.update_state!(sched, 6, 4, 0.1f0, 5, losses)
+                @test losses[4] == 0.1f0
+            end
+
+            @testset "D1l: ProgressiveHorizon growing window" begin
+                sched = ProgressiveHorizon(0; warmup_frac=0.5f0, growth_steps=4)
+                @test GraphNetSim.total_iters(sched, 10) == 10
+                @test GraphNetSim.tracks_losses(sched) == false
+                # step 0 → frac=0.5 → horizon h=5; selections cycle within 1:5.
+                sched.step = 0
+                early = [GraphNetSim.next_index(sched, i, 10, nothing, false) for i in 1:6]
+                @test early == [1, 2, 3, 4, 5, 1]
+                # Once step ≥ growth_steps the horizon spans the whole pool.
+                sched.step = 4
+                @test GraphNetSim.next_index(sched, 7, 10, nothing, false) == 7
+                # update_state! advances the global counter, ignores losses.
+                @test GraphNetSim.update_state!(sched, 1, 1, 0.0f0, 10, nothing) === nothing
+                @test sched.step == 5
+            end
+
+            @testset "D1m: UCB bandit selection" begin
+                sched = UCB(2; c=0.0f0)  # c=0 → greedy on mean loss
+                @test GraphNetSim.total_iters(sched, 3) == 5
+                @test GraphNetSim.tracks_losses(sched) == true
+                losses = fill(Inf32, 3)
+                injected = Float32[1, 5, 2, 0.0, 0.0]
+                picks = Int[]
+                for i in 1:5
+                    idx = GraphNetSim.next_index(sched, i, 3, losses, false)
+                    push!(picks, idx)
+                    GraphNetSim.update_state!(sched, i, idx, injected[i], 3, losses)
+                end
+                # Base pass seeds means [1,5,2]; reruns greedily revisit idx 2.
+                @test picks == [1, 2, 3, 2, 2]
+                # Exploration bonus (c>0) keeps the bandit finite and valid.
+                ucbc = UCB(1; c=2.0f0)
+                losses2 = fill(Inf32, 3)
+                for i in 1:3
+                    idx = GraphNetSim.next_index(ucbc, i, 3, losses2, false)
+                    GraphNetSim.update_state!(ucbc, i, idx, Float32(i), 3, losses2)
+                end
+                @test GraphNetSim.next_index(ucbc, 4, 3, losses2, false) in 1:3
+            end
+
+            @testset "D1n: LearningProgress prioritises moving loss" begin
+                sched = LearningProgress(3)
+                @test GraphNetSim.total_iters(sched, 3) == 6
+                @test GraphNetSim.tracks_losses(sched) == true
+                losses = fill(Inf32, 3)
+                injected = Float32[1, 1, 1, 0, 0, 0]
+                picks = Int[]
+                for i in 1:6
+                    idx = GraphNetSim.next_index(sched, i, 3, losses, false)
+                    push!(picks, idx)
+                    GraphNetSim.update_state!(sched, i, idx, injected[i], 3, losses)
+                end
+                # Each unit carries Inf32 progress until a second sample exists,
+                # so reruns sweep 1,2,3 to establish deltas.
+                @test picks == [1, 2, 3, 1, 2, 3]
+            end
+
+            @testset "D1o: PercentileWorst top-quantile sampling" begin
+                sched = PercentileWorst(5; q=0.9f0)
+                @test GraphNetSim.total_iters(sched, 5) == 10
+                @test GraphNetSim.tracks_losses(sched) == true
+                # Base pass linear; norm window wraps.
+                losses = Float32[1, 1, 1, 1, 100]
+                @test GraphNetSim.next_index(sched, 1, 5, losses, false) == 1
+                @test GraphNetSim.next_index(sched, 7, 5, losses, true) == 2
+                # A single dominant outlier is the only candidate above the
+                # 0.9-quantile → always selected.
+                Random.seed!(3)
+                @test all(
+                    GraphNetSim.next_index(sched, 6, 5, losses, false) == 5 for _ in 1:50
+                )
+                # Uncomputed-first invariant.
+                li = fill(Inf32, 5)
+                li[2] = 0.5f0
+                @test GraphNetSim.next_index(sched, 6, 5, li, false) == 1
+            end
+
+            @testset "D1p: Staleness anti-starvation reruns" begin
+                sched = Staleness(2; weight=10.0f0)  # large weight → most stale wins
+                @test GraphNetSim.total_iters(sched, 3) == 5
+                @test GraphNetSim.tracks_losses(sched) == true
+                losses = fill(Inf32, 3)
+                injected = fill(1.0f0, 5)
+                picks = Int[]
+                for i in 1:5
+                    idx = GraphNetSim.next_index(sched, i, 3, losses, false)
+                    push!(picks, idx)
+                    GraphNetSim.update_state!(sched, i, idx, injected[i], 3, losses)
+                end
+                # After the base pass the least-recently-visited unit wins.
+                @test picks == [1, 2, 3, 1, 2]
+            end
+
+            @testset "D1q: AnnealedWeighted temperature schedule" begin
+                sched = AnnealedWeighted(5; t0=2.0f0, t1=1.0f-3, decay_steps=1)
+                @test GraphNetSim.total_iters(sched, 5) == 10
+                @test GraphNetSim.tracks_losses(sched) == true
+                losses = Float32[1, 9, 3, 2, 7]
+                # Base pass linear; norm window wraps regardless of temperature.
+                @test GraphNetSim.next_index(sched, 3, 5, losses, false) == 3
+                @test GraphNetSim.next_index(sched, 7, 5, losses, true) == 2
+                # Force the annealed (low-temperature) regime → concentrates on
+                # argmax(losses) == 2.
+                sched.step = 1  # frac=1 → T=t1=1e-3
+                Random.seed!(0)
+                @test all(
+                    GraphNetSim.next_index(sched, 6, 5, losses, false) == 2 for _ in 1:100
+                )
+                GraphNetSim.update_state!(sched, 6, 2, 0.5f0, 5, losses)
+                @test losses[2] == 0.5f0
+                @test sched.step == 2
+            end
+
             @testset "D1f: Inf32 init invariant (WorstLoss rerun pass)" begin
                 # The training loop initialises losses to fill(Inf32, n_units).
                 # For BatchingStrategy this is load-bearing: when base-pass
@@ -448,6 +644,49 @@ for cfg in CONFIGS
                 @test GraphNetSim.get_scheduler(
                     MultipleShooting(0.0f0, cfg.dt, cfg.dt * 5, Tsit5(), 2)
                 ) === nothing
+
+                # New schedulers plug into both strategies through the same
+                # uniform interface: get_scheduler returns them and outer_iters
+                # follows each strategy's budget rule.
+                for sched in (
+                    Shuffled(),
+                    WeightedWorst(2),
+                    TopKWorst(2, 2),
+                    EpsilonGreedy(2),
+                    ProgressiveHorizon(2),
+                    UCB(2),
+                    LearningProgress(2),
+                    PercentileWorst(2),
+                    Staleness(2),
+                    AnnealedWeighted(2),
+                )
+                    dt = DerivativeTraining(; scheduler=sched)
+                    @test GraphNetSim.get_scheduler(dt) === sched
+                    @test GraphNetSim.outer_iters(dt, sched, 4) ==
+                        GraphNetSim.total_iters(sched, 4)
+                    bs = BatchingStrategy(0.0f0, cfg.dt * 20, Euler(), 20; scheduler=sched)
+                    @test GraphNetSim.get_scheduler(bs) === sched
+                    @test GraphNetSim.outer_iters(bs, sched, 3) == 20
+                end
+            end
+
+            @testset "D7: solver-adaptive default sensealg (checkpointing)" begin
+                # The checkpointed InterpolatingAdjoint reverse pass re-solves the
+                # forward problem without forwarding dt/tstops, so fixed-timestep
+                # solvers (Euler) need checkpointing disabled. The constructors must
+                # auto-select this: checkpointing == isadaptive(solver). Guards the
+                # path that lets Euler() be used as solver_train.
+                @test GraphNetSim._default_solver_sense(Euler()).checkpointing == false
+                @test GraphNetSim._default_solver_sense(Tsit5()).checkpointing == true
+
+                for build in (
+                    s -> BatchingStrategy(0.0f0, cfg.dt * 20, s, 20),
+                    s -> SingleShooting(0.0f0, cfg.dt, cfg.dt * 5, s),
+                    s -> MultipleShooting(0.0f0, cfg.dt, cfg.dt * 5, s, 2),
+                )
+                    @test build(Euler()).sense.checkpointing == false
+                    @test build(Tsit5()).sense.checkpointing == true
+                end
             end
         end
 
@@ -625,10 +864,43 @@ for cfg in CONFIGS
         end
 
         # ─────────────────────────────────────────────────────────────────
+        # Group E3c: BatchingStrategy + Euler smoke
+        # Exercises the fixed-timestep solver path end-to-end. The constructor
+        # auto-selects checkpointing=false (see D7), which is what lets Euler()
+        # survive the InterpolatingAdjoint reverse pass. Guards the runtime path
+        # behind `solver_train = Euler()` in example/DamBreakSmall.
+        # ─────────────────────────────────────────────────────────────────
+        @testset "E3c: BatchingStrategy + Euler smoke" begin
+            println("Running: E3c — BatchingStrategy + Euler smoke ($(cfg.name))")
+            mktempdir() do cp_path
+                batch_steps = 10
+                n_steps = 3
+
+                grad_calls = Ref(0)
+                min_val_loss = train_network(
+                    Adam(1.0f-4),
+                    cfg.path,
+                    cp_path;
+                    make_train_kwargs(cfg)...,
+                    training_strategy=BatchingStrategy(
+                        0.0f0, cfg.dt * batch_steps, Euler(), n_steps
+                    ),
+                    steps=n_steps,
+                    checkpoint=n_steps,
+                    on_grad=(step, gs, ps, loss) -> (grad_calls[] += 1),
+                )
+
+                @test isfinite(min_val_loss)
+                @test grad_calls[] >= n_steps
+            end
+        end
+
+        # ─────────────────────────────────────────────────────────────────
         # Group F: SingleShooting smoke test
         # Just verifies that a few training steps complete without error.
-        # Uses Tsit5 (adaptive) — Euler can't be used because the
-        # InterpolatingAdjoint backward pass doesn't forward dt.
+        # Uses Tsit5 (adaptive), so the default sensealg keeps checkpointing=true.
+        # (A fixed-step solver like Euler would auto-select checkpointing=false;
+        # see D7 / E3c.)
         # ─────────────────────────────────────────────────────────────────
         @testset "F: SingleShooting smoke" begin
             println("Running: F — SingleShooting smoke ($(cfg.name))")

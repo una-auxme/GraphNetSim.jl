@@ -3,7 +3,7 @@
 # Licensed under the MIT license. See LICENSE file in the project root for details.
 #
 
-import SciMLBase: AbstractSensitivityAlgorithm, ODEFunction, ReturnCode
+import SciMLBase: AbstractSensitivityAlgorithm, ODEFunction, ReturnCode, isadaptive
 import SciMLSensitivity: InterpolatingAdjoint, ZygoteVJP, STACKTRACE_WITH_VJPWARN
 import Zygote: pullback
 using RecursiveArrayTools, CUDA
@@ -191,6 +191,24 @@ predicted and ground truth trajectories at specified timesteps, using sensitivit
 algorithms for gradient computation.
 """
 abstract type SolverStrategy <: TrainingStrategy end
+
+"""
+    _default_solver_sense(solver)
+
+Default sensitivity algorithm for solver-based strategies, chosen from the solver's
+adaptivity.
+
+`InterpolatingAdjoint(checkpointing=true)` re-solves the forward problem between
+checkpoints during the reverse pass, but that internal re-solve forwards neither `dt`
+nor `tstops` (see SciMLSensitivity `interpolating_adjoint.jl`), so a fixed-timestep
+solver such as `Euler()` throws `ArgumentError: Fixed timestep methods require a choice
+of dt or choosing the tstops`. Disabling checkpointing skips that re-solve and lets the
+forward solve's `dt` reach the backward adjoint solve, so fixed-step solvers work (at the
+cost of storing the full forward trajectory). Adaptive solvers keep `checkpointing=true`.
+"""
+function _default_solver_sense(solver)
+    return InterpolatingAdjoint(; autojacvec=ZygoteVJP(), checkpointing=isadaptive(solver))
+end
 
 """
     get_delta(::SolverStrategy, ::Integer)
@@ -422,12 +440,20 @@ Constructor for BatchingStrategy solver-based training.
 
 ## Keyword Arguments
 - `loss_function::Symbol=:mae`: Loss function type.
-- `sense::AbstractSensitivityAlgorithm`: Gradient algorithm.
+- `sense::AbstractSensitivityAlgorithm`: Gradient algorithm. Defaults to
+  [`_default_solver_sense`](@ref)`(solver)`: `InterpolatingAdjoint` with
+  `checkpointing` enabled for adaptive solvers and disabled for fixed-timestep
+  solvers (e.g. `Euler()`), which are otherwise incompatible with the
+  checkpointed reverse pass.
 - `scheduler::Scheduler=WorstLoss(0)`: Per-pass batch-selection rule. The
   default + `Inf32`-initialised losses buffer reproduces the historical
-  "uncomputed-first-else-highest-loss" curriculum. The scheduler's own
-  `rerun_steps` field (if any) is ignored — total outer iterations always
-  equal `strategy.steps`.
+  "uncomputed-first-else-highest-loss" curriculum. Any `Scheduler` works
+  (`Sequential`, `Shuffled`, `WorstLoss`, `UniqueWorst`, `WeightedWorst`,
+  `TopKWorst`, `EpsilonGreedy`, `PercentileWorst`, `UCB`, `LearningProgress`,
+  `Staleness`, `ProgressiveHorizon`, `AnnealedWeighted`); for loss-driven ones
+  the buffer fills during the implicit base pass. The scheduler's own
+  `rerun_steps` field (if any) is ignored — total outer iterations always equal
+  `strategy.steps`.
 - `solargs...`: Additional ODE solver keywords.
 """
 function BatchingStrategy(
@@ -436,9 +462,7 @@ function BatchingStrategy(
     solver::OrdinaryDiffEqAlgorithm,
     steps;
     loss_function=:mae,
-    sense::AbstractSensitivityAlgorithm=InterpolatingAdjoint(;
-        autojacvec=ZygoteVJP(), checkpointing=true
-    ),
+    sense::AbstractSensitivityAlgorithm=_default_solver_sense(solver),
     scheduler::Scheduler=WorstLoss(0),
     solargs...,
 )
@@ -642,7 +666,6 @@ function train_loss(strategy::BatchingStrategy, t::Tuple)
         dt=dt,
         sensealg=strategy.sense,
         callback=callback_solve,
-        # tstops = batch.batchStart:dt:batch.batchStop,
         saveat=(batch.batchStart:dt:batch.batchStop),
         strategy.solargs...,
     )
@@ -671,7 +694,9 @@ Simulates the system from `tstart` to `tstop` and calculates the loss based on t
 - `solver`: Solver that is used for simulating the system.
 
 ## Keyword Arguments
-- `sense = InterpolatingAdjoint(autojacvec = ZygoteVJP())`: The sensitivity algorithm that is used for caluclating the sensitivities.
+- `sense`: The sensitivity algorithm used for calculating the sensitivities. Defaults to
+  [`_default_solver_sense`](@ref)`(solver)` (`InterpolatingAdjoint` with `checkpointing`
+  on for adaptive solvers, off for fixed-timestep solvers such as `Euler()`).
 - `solargs`: Keyword arguments that are passed on to the solver.
 """
 struct SingleShooting <: SolverStrategy
@@ -704,9 +729,7 @@ function SingleShooting(
     dt::Float32,
     tstop::Float32,
     solver::OrdinaryDiffEqAlgorithm;
-    sense::AbstractSensitivityAlgorithm=InterpolatingAdjoint(;
-        autojacvec=ZygoteVJP(), checkpointing=true
-    ),
+    sense::AbstractSensitivityAlgorithm=_default_solver_sense(solver),
     loss_function=:mae,
     solargs...,
 )
@@ -800,7 +823,9 @@ Useful if the network tends to get stuck in a local minimum if SingleShooting is
 - `continuity_term = 100`: Factor by which the error between points of concurrent intervals is multiplied.
 
 ## Keyword Arguments
-- `sense = InterpolatingAdjoint(autojacvec = ZygoteVJP(), checkpointing = true)`:
+- `sense`: The sensitivity algorithm used for calculating the sensitivities. Defaults to
+  [`_default_solver_sense`](@ref)`(solver)` (`InterpolatingAdjoint` with `checkpointing`
+  on for adaptive solvers, off for fixed-timestep solvers such as `Euler()`).
 - `solargs`: Keyword arguments that are passed on to the solver.
 """
 struct MultipleShooting <: SolverStrategy
@@ -838,9 +863,7 @@ function MultipleShooting(
     solver::OrdinaryDiffEqAlgorithm,
     interval_size,
     continuity_term=100;
-    sense::AbstractSensitivityAlgorithm=InterpolatingAdjoint(
-        autojacvec=ZygoteVJP(), checkpointing=true
-    ),
+    sense::AbstractSensitivityAlgorithm=_default_solver_sense(solver),
     solargs...,
 )
     MultipleShooting(
@@ -944,6 +967,12 @@ function train_loss(strategy::MultipleShooting, t::Tuple)
                 ),
             ),
             strategy.solver;
+            # Pass dt only for fixed-timestep solvers (e.g. Euler): they require
+            # it, and it must flow through to the InterpolatingAdjoint reverse
+            # pass via kwargs. Adaptive solvers choose their own initial step, so
+            # we omit it to keep their trajectories byte-identical to the historical
+            # MultipleShooting behavior (which passed no dt at all).
+            (isadaptive(strategy.solver) ? (;) : (; dt=strategy.dt))...,
             saveat=tsteps[rg],
             sensealg=strategy.sense,
             strategy.solargs...,
@@ -1177,10 +1206,19 @@ Constructor for DerivativeTraining strategy.
 ## Keyword Arguments
 - `window_size::Integer=0`: Number of timesteps per trajectory (0 means use all).
 - `random::Bool=true`: Whether to shuffle timesteps within the window.
-- `scheduler::Scheduler=Sequential()`: Per-pass selection rule.
-  Use `WorstLoss(n)` to revisit `argmax`-worst steps `n` times (repeats
-  allowed), or `UniqueWorst(n)` to revisit each of the `n` worst steps at
-  most once per pass.
+- `scheduler::Scheduler=Sequential()`: Per-pass selection rule. Options:
+  `Sequential()` (linear), `Shuffled()` (random permutation per cycle),
+  `WorstLoss(n)` (revisit `argmax`-worst step `n` times, repeats allowed),
+  `UniqueWorst(n)` (revisit each of the `n` worst steps at most once),
+  `WeightedWorst(n; temperature)` (loss-proportional rerun sampling),
+  `TopKWorst(n, k)` (round-robin over the `k` worst),
+  `EpsilonGreedy(n; epsilon)` (greedy-worst with `epsilon` random exploration),
+  `PercentileWorst(n; q)` (uniform among the top-`q`-quantile worst),
+  `UCB(n; c)` (upper-confidence-bound bandit), `LearningProgress(n)` (prioritise
+  by `|Δloss|`), `Staleness(n; weight)` (loss + recency anti-starvation),
+  `ProgressiveHorizon(n; warmup_frac, growth_steps)` (growing time-horizon
+  curriculum), or `AnnealedWeighted(n; t0, t1, decay_steps)` (temperature-decayed
+  `WeightedWorst`).
 - `loss_function::Symbol=:mse`: Loss function type (`:mse` or `:mae`).
 """
 function DerivativeTraining(;

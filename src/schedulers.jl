@@ -80,19 +80,43 @@ function total_iters(sched::UniqueWorst, n_units::Integer)
     return n_units + min(sched.rerun_steps, n_units)
 end
 
-# Shared rerun-phase selection rule for loss-driven schedulers. During the
-# norm-steps window we cycle through `1:n_units` instead of calling `argmax`
-# because the losses buffer has not been fully populated with real values.
-function _rerun_next_index(
-    i::Integer, n_units::Integer, losses::Vector{Float32}, norm_active::Bool
+# Shared base-pass / norm-phase selection rule for loss-driven schedulers.
+#
+# All loss-driven schedulers share the same first two phases and differ only in
+# how they pick a unit once the base pass is complete and normalization is no
+# longer accumulating ("exploit" phase):
+#
+#   1. Base pass (`i <= n_units`): return the linear index `i`. This fills the
+#      losses buffer one entry per unit and — combined with the `Inf32` init —
+#      reproduces the historical "uncomputed-first" curriculum.
+#   2. Norm window (`norm_active`): cycle through `1:n_units` instead of
+#      consulting `losses`, which has not been fully populated with real values.
+#   3. Exploit phase: defer to `exploit(losses, i, n_units)`.
+#
+# `exploit` receives the current losses buffer, the (1-based) global iteration
+# index `i`, and `n_units`; the latter two let stateless schedulers derive a
+# rerun position (e.g. round-robin over a top-K set) without mutable state.
+function _explore_exploit_next_index(
+    exploit, i::Integer, n_units::Integer, losses::Vector{Float32}, norm_active::Bool
 )
     if i <= n_units
         return i
     elseif norm_active
         return ((i - 1) % n_units) + 1
     else
-        return argmax(losses)
+        return exploit(losses, i, n_units)
     end
+end
+
+# `WorstLoss`/`UniqueWorst` exploit rule: the single highest-loss unit. With an
+# `Inf32`-initialised buffer this also drives the base pass linearly, which is
+# why those schedulers can route their whole selection through this helper.
+function _rerun_next_index(
+    i::Integer, n_units::Integer, losses::Vector{Float32}, norm_active::Bool
+)
+    return _explore_exploit_next_index(
+        (l, _i, _n) -> argmax(l), i, n_units, losses, norm_active
+    )
 end
 
 function next_index(
@@ -128,6 +152,632 @@ function update_state!(
 end
 
 tracks_losses(::Union{WorstLoss,UniqueWorst}) = true
+
+"""
+    Shuffled()
+
+Random-permutation scheduler: each pass over the unit pool visits every unit
+exactly once, but in a fresh random order. A new permutation is drawn at the
+start of every cycle (whenever the cyclic position resets to `1`), so a
+strategy whose budget exceeds `n_units` re-shuffles on each wrap-around.
+
+Like `Sequential` it performs no reruns and tracks no losses; it differs only
+in ordering, which decorrelates consecutive gradient steps without biasing any
+unit's visit count. Safe for every training strategy and unaffected by the
+norm-accumulation window (the training loop bypasses the scheduler there).
+"""
+mutable struct Shuffled <: Scheduler
+    perm::Vector{Int}
+end
+Shuffled() = Shuffled(Int[])
+
+total_iters(::Shuffled, n_units::Integer) = n_units
+function next_index(
+    s::Shuffled, i::Integer, n_units::Integer, ::Union{Vector{Float32},Nothing}, ::Bool
+)
+    pos = ((i - 1) % n_units) + 1
+    if pos == 1
+        # Draw a fresh permutation at the start of each cycle. `randperm`
+        # allocates a new vector sized to the current pool, so this also
+        # adapts when `n_units` changes between trajectories.
+        s.perm = randperm(n_units)
+    end
+    return s.perm[pos]
+end
+function update_state!(
+    ::Shuffled, ::Integer, ::Integer, ::Real, ::Integer, ::Union{Vector{Float32},Nothing}
+)
+    return nothing
+end
+tracks_losses(::Shuffled) = false
+
+"""
+    WeightedWorst(rerun_steps; temperature=1.0f0)
+
+Stochastic loss-aware scheduler. After the base pass, take `rerun_steps` extra
+gradient steps, each on a unit sampled with probability proportional to its
+loss raised to `1/temperature`:
+
+- `temperature → 0` concentrates on the single worst unit (≈ `WorstLoss`).
+- `temperature == 1` samples in direct proportion to loss.
+- `temperature → ∞` approaches uniform sampling.
+
+Unlike `WorstLoss`, attention is spread across several high-loss units instead
+of fixating on the current `argmax`, which can avoid over-fitting a single hard
+unit. Non-finite (uncomputed) entries are always selected first via `argmax`,
+preserving the `Inf32`-init "uncomputed-first" invariant.
+"""
+struct WeightedWorst <: Scheduler
+    rerun_steps::Integer
+    temperature::Float32
+end
+function WeightedWorst(rerun_steps::Integer; temperature::Real=1.0f0)
+    WeightedWorst(rerun_steps, Float32(temperature))
+end
+
+total_iters(sched::WeightedWorst, n_units::Integer) = n_units + sched.rerun_steps
+
+# Sample an index with probability ∝ loss^(1/temperature). Falls back to the
+# first non-finite entry (uncomputed-first) and to uniform sampling when all
+# weights vanish, so it degrades gracefully regardless of loss scale.
+function _weighted_pick(losses::Vector{Float32}, temperature::Float32)
+    @inbounds for k in eachindex(losses)
+        if !isfinite(losses[k])
+            return argmax(losses)
+        end
+    end
+    inv_t = 1.0f0 / max(temperature, eps(Float32))
+    total = 0.0
+    @inbounds for k in eachindex(losses)
+        total += Float64(max(losses[k], 0.0f0))^inv_t
+    end
+    if !(total > 0.0)
+        return rand(1:length(losses))
+    end
+    r = rand() * total
+    acc = 0.0
+    @inbounds for k in eachindex(losses)
+        acc += Float64(max(losses[k], 0.0f0))^inv_t
+        if r <= acc
+            return k
+        end
+    end
+    return length(losses)
+end
+
+function next_index(
+    sched::WeightedWorst,
+    i::Integer,
+    n_units::Integer,
+    losses::Vector{Float32},
+    norm_active::Bool,
+)
+    return _explore_exploit_next_index(
+        (l, _i, _n) -> _weighted_pick(l, sched.temperature), i, n_units, losses, norm_active
+    )
+end
+function update_state!(
+    ::WeightedWorst,
+    ::Integer,
+    actual::Integer,
+    loss::Real,
+    ::Integer,
+    losses::Vector{Float32},
+)
+    losses[actual] = Float32(loss)
+    return nothing
+end
+tracks_losses(::WeightedWorst) = true
+
+"""
+    TopKWorst(rerun_steps, k)
+
+After the base pass, distribute `rerun_steps` extra gradient steps round-robin
+across the current `k` worst-loss units rather than repeatedly hammering the
+single `argmax` (`WorstLoss`) or visiting each worst unit only once
+(`UniqueWorst`). The top-`k` set is recomputed from the live losses buffer on
+every rerun pick, so it tracks the worst units as their losses change.
+
+`k` is clamped to `1:n_units`. With `k == 1` this reduces to `WorstLoss`; with
+`k == n_units` and `rerun_steps == n_units` it sweeps every unit once more in
+worst-first order. Non-finite (uncomputed) entries sort first, preserving the
+`Inf32`-init "uncomputed-first" invariant.
+"""
+struct TopKWorst <: Scheduler
+    rerun_steps::Integer
+    k::Integer
+end
+
+total_iters(sched::TopKWorst, n_units::Integer) = n_units + sched.rerun_steps
+
+function _topk_pick(losses::Vector{Float32}, i::Integer, n_units::Integer, k::Integer)
+    k_eff = clamp(k, 1, n_units)
+    ranked = partialsortperm(losses, 1:k_eff; rev=true)
+    pos = ((i - n_units - 1) % k_eff) + 1
+    return ranked[pos]
+end
+
+function next_index(
+    sched::TopKWorst,
+    i::Integer,
+    n_units::Integer,
+    losses::Vector{Float32},
+    norm_active::Bool,
+)
+    return _explore_exploit_next_index(
+        (l, ii, nn) -> _topk_pick(l, ii, nn, sched.k), i, n_units, losses, norm_active
+    )
+end
+function update_state!(
+    ::TopKWorst, ::Integer, actual::Integer, loss::Real, ::Integer, losses::Vector{Float32}
+)
+    losses[actual] = Float32(loss)
+    return nothing
+end
+tracks_losses(::TopKWorst) = true
+
+"""
+    EpsilonGreedy(rerun_steps; epsilon=0.1f0)
+
+ε-greedy loss-aware scheduler. After the base pass, take `rerun_steps` extra
+gradient steps; each picks the current worst unit (`argmax`) with probability
+`1 - epsilon` ("exploit") and a uniformly random unit with probability
+`epsilon` ("explore"). This keeps `WorstLoss`'s focus on the hardest unit while
+periodically sampling elsewhere to avoid starving units that the greedy rule
+never revisits.
+
+`epsilon` is clamped to `[0, 1]`; `epsilon == 0` recovers `WorstLoss`.
+Non-finite (uncomputed) entries are selected first via `argmax`, preserving the
+`Inf32`-init "uncomputed-first" invariant.
+"""
+struct EpsilonGreedy <: Scheduler
+    rerun_steps::Integer
+    epsilon::Float32
+end
+function EpsilonGreedy(rerun_steps::Integer; epsilon::Real=0.1f0)
+    EpsilonGreedy(rerun_steps, Float32(epsilon))
+end
+
+total_iters(sched::EpsilonGreedy, n_units::Integer) = n_units + sched.rerun_steps
+
+function _epsilon_pick(losses::Vector{Float32}, epsilon::Float32)
+    @inbounds for k in eachindex(losses)
+        if !isfinite(losses[k])
+            return argmax(losses)
+        end
+    end
+    if rand() < clamp(epsilon, 0.0f0, 1.0f0)
+        return rand(1:length(losses))
+    end
+    return argmax(losses)
+end
+
+function next_index(
+    sched::EpsilonGreedy,
+    i::Integer,
+    n_units::Integer,
+    losses::Vector{Float32},
+    norm_active::Bool,
+)
+    return _explore_exploit_next_index(
+        (l, _i, _n) -> _epsilon_pick(l, sched.epsilon), i, n_units, losses, norm_active
+    )
+end
+function update_state!(
+    ::EpsilonGreedy,
+    ::Integer,
+    actual::Integer,
+    loss::Real,
+    ::Integer,
+    losses::Vector{Float32},
+)
+    losses[actual] = Float32(loss)
+    return nothing
+end
+tracks_losses(::EpsilonGreedy) = true
+
+# ─────────────────────────────────────────────────────────────────────────────
+# Stateful schedulers
+#
+# The base interface passes only `(i, n_units, losses, norm_active)` — no global
+# step counter and no cross-pass history. Schedulers that need either keep it in
+# mutable struct fields (like `Shuffled.perm`). Two flavours of state appear
+# below:
+#
+#   * Per-pass state (`UCB`, `LearningProgress`, `Staleness`) — reset at the
+#     start of every trajectory pass (`i == 1`), mirroring the loop's per-pass
+#     `losses_per_dp` buffer. The base pass visits each unit once and seeds the
+#     state; the exploit phase then reads it.
+#   * Global state (`ProgressiveHorizon`, `AnnealedWeighted`) — a monotonic
+#     `step` counter incremented in `update_state!` that never resets, so these
+#     can anneal a quantity over the whole training run. The counter only
+#     advances once the scheduler is active (the norm-accumulation window
+#     bypasses the scheduler entirely, so warm-up steps are not counted).
+# ─────────────────────────────────────────────────────────────────────────────
+
+"""
+    ProgressiveHorizon(rerun_steps=0; warmup_frac=0.25f0, growth_steps=1000)
+
+Time-horizon curriculum. Restricts every selection to a growing prefix
+`1:h` of the unit pool, where `h = ceil(n_units · frac)` and `frac` ramps
+linearly from `warmup_frac` to `1` over the first `growth_steps` active
+gradient steps. Within the prefix it cycles linearly (`((i-1) % h) + 1`).
+
+For autoregressive simulators this learns near-term dynamics before long
+horizons — the same intuition behind multiple-shooting, applied as a sampling
+curriculum. Most natural for `BatchingStrategy`, where units are consecutive
+time intervals, but valid for any strategy. No loss tracking; stateful in the
+global `step` counter only.
+"""
+mutable struct ProgressiveHorizon <: Scheduler
+    rerun_steps::Integer
+    warmup_frac::Float32
+    growth_steps::Integer
+    step::Int
+end
+function ProgressiveHorizon(
+    rerun_steps::Integer=0; warmup_frac::Real=0.25f0, growth_steps::Integer=1000
+)
+    return ProgressiveHorizon(rerun_steps, Float32(warmup_frac), growth_steps, 0)
+end
+
+total_iters(sched::ProgressiveHorizon, n_units::Integer) = n_units + sched.rerun_steps
+
+function _horizon(sched::ProgressiveHorizon, n_units::Integer)
+    frac = clamp(
+        sched.warmup_frac +
+        (1.0f0 - sched.warmup_frac) *
+        (Float32(sched.step) / Float32(max(sched.growth_steps, 1))),
+        sched.warmup_frac,
+        1.0f0,
+    )
+    return clamp(ceil(Int, n_units * frac), 1, n_units)
+end
+
+function next_index(
+    sched::ProgressiveHorizon,
+    i::Integer,
+    n_units::Integer,
+    ::Union{Vector{Float32},Nothing},
+    ::Bool,
+)
+    h = _horizon(sched, n_units)
+    return ((i - 1) % h) + 1
+end
+function update_state!(
+    sched::ProgressiveHorizon,
+    ::Integer,
+    ::Integer,
+    ::Real,
+    ::Integer,
+    ::Union{Vector{Float32},Nothing},
+)
+    sched.step += 1
+    return nothing
+end
+tracks_losses(::ProgressiveHorizon) = false
+
+"""
+    UCB(rerun_steps=0; c=1.0f0)
+
+Upper-confidence-bound bandit scheduler. After the base pass (which visits
+each unit once and seeds its running mean loss), each rerun picks the unit
+maximising `mean_loss + c·sqrt(ln t / visits)`. The exploration bonus grows for
+rarely-visited units, so — unlike `WorstLoss` — no unit is starved
+indefinitely; `c` trades exploitation (`0` ≈ greedy mean loss) against
+exploration. Per-pass state: visit counts and loss sums, reset each trajectory.
+"""
+mutable struct UCB <: Scheduler
+    rerun_steps::Integer
+    c::Float32
+    counts::Vector{Int}
+    sums::Vector{Float64}
+    t::Int
+end
+function UCB(rerun_steps::Integer=0; c::Real=1.0f0)
+    UCB(rerun_steps, Float32(c), Int[], Float64[], 0)
+end
+
+total_iters(sched::UCB, n_units::Integer) = n_units + sched.rerun_steps
+
+function _ucb_reset!(sched::UCB, n_units::Integer)
+    sched.counts = zeros(Int, n_units)
+    sched.sums = zeros(Float64, n_units)
+    sched.t = 0
+    return nothing
+end
+
+function _ucb_pick(sched::UCB)
+    # Any never-visited unit wins first (uncomputed-first invariant).
+    @inbounds for k in eachindex(sched.counts)
+        if sched.counts[k] == 0
+            return k
+        end
+    end
+    best, best_val = 1, -Inf
+    logt = log(max(sched.t, 1))
+    @inbounds for k in eachindex(sched.counts)
+        mean_k = sched.sums[k] / sched.counts[k]
+        val = mean_k + sched.c * sqrt(logt / sched.counts[k])
+        if val > best_val
+            best_val, best = val, k
+        end
+    end
+    return best
+end
+
+function next_index(
+    sched::UCB, i::Integer, n_units::Integer, losses::Vector{Float32}, norm_active::Bool
+)
+    if i == 1 || length(sched.counts) != n_units
+        _ucb_reset!(sched, n_units)
+    end
+    return _explore_exploit_next_index(
+        (l, _i, _n) -> _ucb_pick(sched), i, n_units, losses, norm_active
+    )
+end
+function update_state!(
+    sched::UCB, ::Integer, actual::Integer, loss::Real, ::Integer, losses::Vector{Float32}
+)
+    losses[actual] = Float32(loss)
+    sched.counts[actual] += 1
+    sched.sums[actual] += Float64(loss)
+    sched.t += 1
+    return nothing
+end
+tracks_losses(::UCB) = true
+
+"""
+    LearningProgress(rerun_steps=0)
+
+Prioritise units by *learning progress* — the absolute change in loss between
+consecutive visits, `|loss - prev_loss|` — rather than by loss level. A unit
+whose loss is high but stuck is deprioritised relative to one that is actively
+moving, focusing reruns where gradient steps still pay off. Units with only one
+sample so far carry `Inf32` progress, so each is revisited at least once to
+establish a delta (preserving the uncomputed-first invariant). Per-pass state:
+previous-loss and progress buffers, reset each trajectory.
+"""
+mutable struct LearningProgress <: Scheduler
+    rerun_steps::Integer
+    prevloss::Vector{Float32}
+    progress::Vector{Float32}
+end
+function LearningProgress(rerun_steps::Integer=0)
+    return LearningProgress(rerun_steps, Float32[], Float32[])
+end
+
+total_iters(sched::LearningProgress, n_units::Integer) = n_units + sched.rerun_steps
+
+function _lp_reset!(sched::LearningProgress, n_units::Integer)
+    sched.prevloss = fill(Inf32, n_units)
+    sched.progress = fill(Inf32, n_units)
+    return nothing
+end
+
+function next_index(
+    sched::LearningProgress,
+    i::Integer,
+    n_units::Integer,
+    losses::Vector{Float32},
+    norm_active::Bool,
+)
+    if i == 1 || length(sched.progress) != n_units
+        _lp_reset!(sched, n_units)
+    end
+    return _explore_exploit_next_index(
+        (l, _i, _n) -> argmax(sched.progress), i, n_units, losses, norm_active
+    )
+end
+function update_state!(
+    sched::LearningProgress,
+    ::Integer,
+    actual::Integer,
+    loss::Real,
+    ::Integer,
+    losses::Vector{Float32},
+)
+    losses[actual] = Float32(loss)
+    if isfinite(sched.prevloss[actual])
+        sched.progress[actual] = abs(Float32(loss) - sched.prevloss[actual])
+    else
+        sched.progress[actual] = Inf32
+    end
+    sched.prevloss[actual] = Float32(loss)
+    return nothing
+end
+tracks_losses(::LearningProgress) = true
+
+"""
+    PercentileWorst(rerun_steps; q=0.9f0)
+
+Robust top-quantile scheduler. Each rerun samples uniformly among the units
+whose loss is at or above the `q`-quantile of the current losses buffer. Unlike
+`TopKWorst`'s fixed-`k` set, the candidate pool adapts to the loss distribution
+— widening when many units are equally bad and narrowing to the true tail when
+one dominates — which is less sensitive to a single outlier than `argmax`.
+Stateless; tracks losses. Non-finite (uncomputed) entries are selected first.
+"""
+struct PercentileWorst <: Scheduler
+    rerun_steps::Integer
+    q::Float32
+end
+function PercentileWorst(rerun_steps::Integer; q::Real=0.9f0)
+    PercentileWorst(rerun_steps, Float32(q))
+end
+
+total_iters(sched::PercentileWorst, n_units::Integer) = n_units + sched.rerun_steps
+
+function _percentile_pick(losses::Vector{Float32}, q::Float32)
+    @inbounds for k in eachindex(losses)
+        if !isfinite(losses[k])
+            return argmax(losses)
+        end
+    end
+    thr = Float32(quantile(losses, q))
+    n_cand = 0
+    @inbounds for k in eachindex(losses)
+        n_cand += losses[k] >= thr
+    end
+    n_cand == 0 && return argmax(losses)
+    pick = rand(1:n_cand)
+    c = 0
+    @inbounds for k in eachindex(losses)
+        if losses[k] >= thr
+            c += 1
+            c == pick && return k
+        end
+    end
+    return argmax(losses)
+end
+
+function next_index(
+    sched::PercentileWorst,
+    i::Integer,
+    n_units::Integer,
+    losses::Vector{Float32},
+    norm_active::Bool,
+)
+    return _explore_exploit_next_index(
+        (l, _i, _n) -> _percentile_pick(l, sched.q), i, n_units, losses, norm_active
+    )
+end
+function update_state!(
+    ::PercentileWorst,
+    ::Integer,
+    actual::Integer,
+    loss::Real,
+    ::Integer,
+    losses::Vector{Float32},
+)
+    losses[actual] = Float32(loss)
+    return nothing
+end
+tracks_losses(::PercentileWorst) = true
+
+"""
+    Staleness(rerun_steps=0; weight=1.0f0)
+
+Recency-aware anti-starvation scheduler. Each rerun picks
+`argmax(loss + weight · steps_since_last_visit)`, so high-loss units are still
+favoured but any unit left untouched long enough eventually wins regardless of
+its loss. `weight` tunes the trade-off: `0` recovers `WorstLoss`, large values
+approach round-robin coverage. A simpler, single-knob alternative to `UCB`.
+Per-pass state: per-unit last-visit timestamps, reset each trajectory.
+"""
+mutable struct Staleness <: Scheduler
+    rerun_steps::Integer
+    weight::Float32
+    lastvisit::Vector{Int}
+    t::Int
+end
+function Staleness(rerun_steps::Integer=0; weight::Real=1.0f0)
+    return Staleness(rerun_steps, Float32(weight), Int[], 0)
+end
+
+total_iters(sched::Staleness, n_units::Integer) = n_units + sched.rerun_steps
+
+function _stale_reset!(sched::Staleness, n_units::Integer)
+    sched.lastvisit = zeros(Int, n_units)
+    sched.t = 0
+    return nothing
+end
+
+function _stale_pick(sched::Staleness, losses::Vector{Float32})
+    best, best_val = 1, -Inf32
+    @inbounds for k in eachindex(losses)
+        val = losses[k] + sched.weight * Float32(sched.t - sched.lastvisit[k])
+        if val > best_val
+            best_val, best = val, k
+        end
+    end
+    return best
+end
+
+function next_index(
+    sched::Staleness,
+    i::Integer,
+    n_units::Integer,
+    losses::Vector{Float32},
+    norm_active::Bool,
+)
+    if i == 1 || length(sched.lastvisit) != n_units
+        _stale_reset!(sched, n_units)
+    end
+    return _explore_exploit_next_index(
+        (l, _i, _n) -> _stale_pick(sched, l), i, n_units, losses, norm_active
+    )
+end
+function update_state!(
+    sched::Staleness,
+    ::Integer,
+    actual::Integer,
+    loss::Real,
+    ::Integer,
+    losses::Vector{Float32},
+)
+    losses[actual] = Float32(loss)
+    sched.t += 1
+    sched.lastvisit[actual] = sched.t
+    return nothing
+end
+tracks_losses(::Staleness) = true
+
+"""
+    AnnealedWeighted(rerun_steps=0; t0=2.0f0, t1=0.1f0, decay_steps=1000)
+
+Temperature-annealed variant of `WeightedWorst`. Reruns sample a unit with
+probability ∝ `loss^(1/T)`, where the temperature `T` decays linearly from `t0`
+(exploratory, near-uniform) to `t1` (greedy, near-`argmax`) over the first
+`decay_steps` active gradient steps. Mirrors simulated annealing: spread
+attention early, sharpen onto the worst units late. Reuses `WeightedWorst`'s
+sampler; stateful in the global `step` counter only.
+"""
+mutable struct AnnealedWeighted <: Scheduler
+    rerun_steps::Integer
+    t0::Float32
+    t1::Float32
+    decay_steps::Integer
+    step::Int
+end
+function AnnealedWeighted(
+    rerun_steps::Integer=0; t0::Real=2.0f0, t1::Real=0.1f0, decay_steps::Integer=1000
+)
+    return AnnealedWeighted(rerun_steps, Float32(t0), Float32(t1), decay_steps, 0)
+end
+
+total_iters(sched::AnnealedWeighted, n_units::Integer) = n_units + sched.rerun_steps
+
+function _annealed_temp(sched::AnnealedWeighted)
+    frac = clamp(Float32(sched.step) / Float32(max(sched.decay_steps, 1)), 0.0f0, 1.0f0)
+    return sched.t0 + (sched.t1 - sched.t0) * frac
+end
+
+function next_index(
+    sched::AnnealedWeighted,
+    i::Integer,
+    n_units::Integer,
+    losses::Vector{Float32},
+    norm_active::Bool,
+)
+    temp = _annealed_temp(sched)
+    return _explore_exploit_next_index(
+        (l, _i, _n) -> _weighted_pick(l, temp), i, n_units, losses, norm_active
+    )
+end
+function update_state!(
+    sched::AnnealedWeighted,
+    ::Integer,
+    actual::Integer,
+    loss::Real,
+    ::Integer,
+    losses::Vector{Float32},
+)
+    losses[actual] = Float32(loss)
+    sched.step += 1
+    return nothing
+end
+tracks_losses(::AnnealedWeighted) = true
 
 """
     get_scheduler(strategy)

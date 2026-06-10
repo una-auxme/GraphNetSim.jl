@@ -97,6 +97,12 @@ data_meanstd(
 # Solvers #
 ###########
 
+# solver_train may now also be a fixed-step solver (e.g. Euler()) for the
+# ODE-based phases (BatchingStrategy, MultipleShooting): the strategy
+# constructors detect the fixed-timestep solver and default to an
+# InterpolatingAdjoint with checkpointing disabled (the checkpointed reverse
+# pass cannot re-solve a fixed-dt problem). The default remains the adaptive
+# Tsit5().
 solver_train = Tsit5()
 solver_eval = Euler()
 
