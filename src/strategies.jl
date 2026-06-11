@@ -1109,7 +1109,19 @@ output and target derivatives.
 """
 function train_loss(strategy::DerivativeStrategy, t::Tuple)
     ps, gns, position, velocity, meta, target, node_type, mask, device = t
-    graph = build_graph(gns, position, velocity, meta, node_type, mask, device)
+    # In `DerivativeTraining` the positions are fixed dataset values, so the
+    # graph is constant w.r.t. `ps`: its backward pass (neighbor search,
+    # normalizers, concat) is computed by Zygote only to be discarded. Wrap it
+    # in `@ignore_derivatives` to skip that wasted work. ODE-based
+    # `DerivativeStrategy` variants would evolve `position` from `ps` and so
+    # need the graph gradient — guard the optimization on the concrete type.
+    if strategy isa DerivativeTraining
+        graph = ChainRulesCore.@ignore_derivatives build_graph(
+            gns, position, velocity, meta, node_type, mask, device
+        )
+    else
+        graph = build_graph(gns, position, velocity, meta, node_type, mask, device)
+    end
     output, st = gns.model(graph, ps, gns.st)
     gns.st = st
 

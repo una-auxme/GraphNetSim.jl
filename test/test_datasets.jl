@@ -258,6 +258,52 @@ for cfg in CONFIGS
                 end
                 @test n_edges[] > 0
             end
+
+            @testset "C3: TreeNSearch matches old PointNeighbors impl" begin
+                # New TreeNSearch-backed point_neighbor_ns on the suite device.
+                s_new, r_new, d_new, n_new = GraphNetSim.point_neighbor_ns(DEVICE(pos), cr)
+                s_new = Array(s_new)
+                r_new = Array(r_new)
+                d_new = Array(d_new)
+                n_new = Array(n_new)
+
+                # Reference: replicate the pre-TreeNSearch PointNeighbors
+                # implementation exactly — query = receiver i, neighbor =
+                # sender j, rel_displacement = (pos_i - pos_j)/cr, and one
+                # self-loop per particle (PointNeighbors includes i == j).
+                nhs = GridNeighborhoodSearch{size(pos, 1)}(;
+                    search_radius=cr, n_points=size(pos, 2)
+                )
+                initialize!(nhs, pos, pos)
+                s_old = Int32[]
+                r_old = Int32[]
+                d_old = Vector{Vector{Float32}}()
+                n_old = Float32[]
+                # SerialBackend: the callback `push!`es into shared Vectors, so
+                # the default PolyesterBackend would race them under `-t N`.
+                foreach_point_neighbor(
+                    pos, pos, nhs; parallelization_backend=SerialBackend()
+                ) do i, j, pos_diff, dist
+                    push!(r_old, Int32(i))
+                    push!(s_old, Int32(j))
+                    push!(d_old, Float32.(pos_diff ./ cr))
+                    push!(n_old, Float32(dist / cr))
+                end
+
+                # Same edge count (self-loops present in both).
+                @test length(s_new) == length(s_old)
+
+                # Sort both edge lists by (receiver, sender); traversal order
+                # differs between implementations but the set must be identical.
+                p_new = sortperm(collect(zip(r_new, s_new)))
+                p_old = sortperm(collect(zip(r_old, s_old)))
+                @test s_new[p_new] == s_old[p_old]
+                @test r_new[p_new] == r_old[p_old]
+                for k in eachindex(p_new)
+                    @test d_new[:, p_new[k]] ≈ d_old[p_old[k]] atol = 1.0f-5
+                    @test n_new[1, p_new[k]] ≈ n_old[p_old[k]] atol = 1.0f-5
+                end
+            end
         end
 
         # ─────────────────────────────────────────────────────────────────
