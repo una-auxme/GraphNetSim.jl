@@ -33,13 +33,13 @@ RecursiveArrayTools = "731186ca-8d62-57ce-b412-fbd966d074cd"
 SciMLBase = "0bca4576-84f4-4d90-8ffe-ffa030f20462"
 SciMLSensitivity = "1ed8b502-d754-442c-8d5d-10ac956f44a1"
 Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
-TreeNSearch = "49bb3e92-56cb-4d34-aed6-8ee8ef58b458"
+Octopus = "49bb3e92-56cb-4d34-aed6-8ee8ef58b458"
 Zygote = "e88e6eb3-aa80-5325-afca-941959d7151f"
 cuDNN = "02a925ec-e4fe-4b08-9a7e-0d78e3d38ccd"
 
 [sources]
 GraphNetCore = {rev = "GNS-small-graph", url = "https://github.com/una-auxme/GraphNetCore.jl"}
-TreeNSearch = {path = "../fast_octree"}
+Octopus = {path = "../fast_octree"}
 
 [compat]
 Adapt = "4.3.0"
@@ -73,7 +73,7 @@ SciMLBase = "2.7.0 - 2"
 SciMLSensitivity = "7.76 - 7"
 Statistics = "1"
 Test = "1"
-TreeNSearch = "0.1"
+Octopus = "0.1"
 Zygote = "0.6"
 cuDNN = "1.4 - 1"
 julia = "1.10"

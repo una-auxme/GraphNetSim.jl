@@ -129,6 +129,11 @@ Configuration structure for training and evaluating Graph Neural Network simulat
     optimizer_learning_rate_start::Float32 = 1.0f-4
     optimizer_learning_rate_stop::Union{Nothing,Float32} = nothing
     norm_type::Symbol = :online
+    # Neighborhood-search backend for graph construction:
+    #   :pointneighbors — PointNeighbors.jl grid search (default; unchanged behavior)
+    #   :octopus        — Octopus.jl octree search (≈18x leaner GPU acceleration struct)
+    #   :auto           — PointNeighbors on CPU, Octopus on GPU (memory-optimal)
+    neighbor_backend::Symbol = :pointneighbors
     save_step::Bool = false
     on_grad::Union{Nothing,Function} = nothing
     on_valid::Union{Nothing,Function} = nothing
@@ -458,11 +463,13 @@ function train_network(opt, ds_path, cp_path; kws...)
     ds_train.meta["types_noisy"] = args.types_noisy
     ds_train.meta["noise_stddevs"] = args.noise_stddevs
     ds_train.meta["device"] = device
+    ds_train.meta["neighbor_backend"] = args.neighbor_backend
     ds_valid = Dataset(:valid, ds_path, args)
     ds_valid.meta["types_updated"] = args.types_updated
     ds_valid.meta["types_noisy"] = args.types_noisy
     ds_valid.meta["noise_stddevs"] = args.noise_stddevs
     ds_valid.meta["device"] = device
+    ds_valid.meta["neighbor_backend"] = args.neighbor_backend
     ds_valid.meta["training_strategy"] = nothing
 
     @info "Training data loaded!"
@@ -767,7 +774,12 @@ function train_gns!(
             end
             t_last_traj = time()
 
-            if step > args.norm_steps && cp_progress >= args.checkpoint
+            # `steps` is the total training-step budget. The outer `while` only
+            # re-checks between full epochs, so without this an epoch over a large
+            # dataset blows far past the budget (and host RAM). Force a final
+            # checkpoint+validation when the budget is hit, then break.
+            reached_budget = step >= args.steps
+            if step > args.norm_steps && (cp_progress >= args.checkpoint || reached_budget)
                 push!(df_train, [step, avg_loss / Float32(cp_progress)])
 
                 traj_idx = 1
@@ -882,6 +894,10 @@ function train_gns!(
                 avg_loss = 0.0f0
                 cp_progress = 0
             end
+
+            if reached_budget
+                break
+            end
         end
     end
     finish!(pr)
@@ -981,6 +997,7 @@ function eval_network(
     println("Loading evaluation data...")
     ds_test = Dataset(:test, ds_path, args)
     ds_test.meta["device"] = device
+    ds_test.meta["neighbor_backend"] = args.neighbor_backend
     ds_test.meta["training_strategy"] = nothing
 
     # clear_log(1, false)
@@ -1089,9 +1106,18 @@ function eval_network!(
     local errors = Dict{Tuple{Int,String},Array{Float32,3}}()
     local timesteps = Dict{Tuple{Int,String},Array{Float32,1}}()
 
-    test_loader = DataLoader(ds_test; batchsize=-1, buffer=false, parallel=true)
+    # parallel=false: the parallel loader yields trajectories in nondeterministic worker-completion
+    # order, so output `trajectory_<ti>` would not match dataset index `ti` (DIVERGENCES.md D6). Eval
+    # is only a handful of trajectories, so sequential, index-faithful iteration is the right tradeoff.
+    test_loader = DataLoader(ds_test; batchsize=-1, buffer=false, parallel=false)
+
+    # Optional cap on the number of evaluated trajectories (default: all). Lets bounded/provisional
+    # eval runs stay tractable — a full rollout over every test trajectory × solver is very slow.
+    # NB: bare `parse` resolves to `JSON.parse` in this module (see dataset.jl), so qualify Base.parse.
+    n_eval_traj = Base.parse(Int, get(ENV, "GNS_EVAL_NTRAJ", string(typemax(Int))))
 
     for (ti, data) in enumerate(test_loader)
+        ti > n_eval_traj && break
         target_features = ds_test.meta["solver_target_features"]
         output_features = ds_test.meta["output_features"]
         println("Rollout trajectory $ti...")
@@ -1295,6 +1321,7 @@ function extrapolate_network(
     println("Loading evaluation data...")
     ds_test = Dataset(:test, ds_path, args)
     ds_test.meta["device"] = device
+    ds_test.meta["neighbor_backend"] = args.neighbor_backend
     ds_test.meta["training_strategy"] = nothing
 
     @info "Evaluation data loaded!"
@@ -1396,7 +1423,10 @@ function extrapolate_network!(
     frozen_state = _freeze_online_normalisers!(gns)
 
     try
-        test_loader = DataLoader(ds_test; batchsize=-1, buffer=false, parallel=true)
+        # parallel=false: the parallel loader yields trajectories in nondeterministic worker-completion
+        # order, so output `trajectory_<ti>` would not match dataset index `ti` (DIVERGENCES.md D6). Eval
+        # is only a handful of trajectories, so sequential, index-faithful iteration is the right tradeoff.
+        test_loader = DataLoader(ds_test; batchsize=-1, buffer=false, parallel=false)
 
         for (ti, data) in enumerate(test_loader)
             target_features = ds_test.meta["solver_target_features"]

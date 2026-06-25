@@ -6,8 +6,8 @@
 using CUDA
 import Statistics: norm
 using JLD2
-using PointNeighbors  # CPU neighbor search (Array path); GPU path uses TreeNSearch
-using TreeNSearch      # GPU neighbor search (CuArray path) — fast octree, half the GPU memory
+using PointNeighbors
+using Octopus: Octopus
 using ChainRulesCore
 
 """
@@ -83,8 +83,10 @@ function build_graph(
     #     velocity = hcat(velocity, zeros(Float32, meta["dims"], size(boundaries,2)))
     # end
 
-    senders, receivers, rel_displacement, rel_dist_norm = point_neighbor_ns(
-        position, Float32(meta["default_connectivity_radius"])
+    senders, receivers, rel_displacement, rel_dist_norm = neighbor_search(
+        position,
+        Float32(meta["default_connectivity_radius"]),
+        get(meta, "neighbor_backend", :pointneighbors),
     )
     # if size(boundaries,2) != 0
     # #     # sender_old, receiver_old, senders, receivers, _, b_particle = check_and_delete_filtered(senders, receivers, size(position, 2), true)
@@ -98,19 +100,22 @@ function build_graph(
     # end
 
     if n_node_types(meta) > 1
-        if length(mask) == size(position, 2)
-            dist_bound = device(ones(Float32, size(position)...))
-        else
-            boundaries = device(Float32.(vcat(permutedims.(meta["bounds"])...)))
-            dist_low_bound = position .- boundaries[:, 1]
-            dist_up_bound = boundaries[:, 2] .- position
-            dist_bound = clamp.(
-                vcat(dist_low_bound, dist_up_bound) ./
-                Float32(meta["default_connectivity_radius"]),
-                -1.0f0,
-                1.0f0,
-            )
-        end
+        # DIVERGENCES.md D4 (2026-06-16): always compute the 4-wide clamped box distance.
+        # Previously, when `mask` covered all particles (a single-type trajectory, e.g. an all-water
+        # WaterRamps frame) this took a `dist_bound = ones(dim, n)` shortcut — only 2-wide — while
+        # mixed trajectories produced the 4-wide real distance. That made the node-feature width vary
+        # per trajectory, so a model trained on mixed trajectories crashed at eval on a single-type
+        # one (6 vs 8 inputs). The real clamped box distance is well-defined for every frame (it uses
+        # `meta["bounds"]`, not boundary particles) and matches DeepMind/`dm_boundary_features`.
+        boundaries = device(Float32.(vcat(permutedims.(meta["bounds"])...)))
+        dist_low_bound = position .- boundaries[:, 1]
+        dist_up_bound = boundaries[:, 2] .- position
+        dist_bound = clamp.(
+            vcat(dist_low_bound, dist_up_bound) ./
+            Float32(meta["default_connectivity_radius"]),
+            -1.0f0,
+            1.0f0,
+        )
     end
 
     edge_features = device(vcat(rel_displacement, rel_dist_norm) .+ 1.0f-8)
@@ -295,101 +300,99 @@ end
 """
     point_neighbor_ns(pos::CuArray, radius::Float32)
 
-GPU particle neighbor search backed by [TreeNSearch.jl](../fast_octree) — the
-fast octree neighborhood search of Fernández-Fernández et al. (SIGGRAPH Asia
-2022). The octree is O(N) and adapts to clustered/anisotropic point sets, so on
-the GPU it matches the old PointNeighbors `GridNeighborhoodSearch` on speed while
-using roughly **half** the GPU memory (the old dense `FullGridCellList` scales
-with domain/radius, not particle count — wasteful for the small connectivity
-radii used here). The CPU `Array` path keeps the old PointNeighbors search (see
-the method below), which is faster on the CPU than the octree build.
+Perform GPU-accelerated neighbor search using PointNeighbors grid-based acceleration.
 
-## Output convention (identical to the CPU path)
-- `receivers[k] = i` (the query point), `senders[k] = j` (its neighbor).
-- `rel_displacement[:, k] = (pos[:, i] - pos[:, j]) / radius`.
-- `rel_dist_norm[1, k]    = ‖pos[:, i] - pos[:, j]‖ / radius`.
-
-## Self-loops
-`build_edges` excludes the self-pair `j == i`; PointNeighbors includes one
-self-loop per particle (zero displacement / distance). We re-append those
-self-loops so the GPU and CPU paths return identical edge sets.
-
-## Gradients
-Differentiation w.r.t. `pos` flows through `TreeNSearch.build_edges_diff` (via
-its ChainRulesCore extension); the tree topology and radius are
-non-differentiable. The appended self-loops contribute zero gradient
-(`sender == receiver` cancels, and their zero distance is skipped by the
-`d_norm > 1e-8` guard). `build_edges_diff` computes the
-finite-difference-verified `∂L/∂pos`; the original hand-written GPU rrule had a
-flipped sign (see the corrected CPU rrule below for the right convention).
+Constructs a grid neighborhood search structure from particle positions and radius,
+then efficiently finds all particle pairs within the search radius using grid-based acceleration.
+Returns normalized relative displacements and distances.
 
 ## Arguments
-- `pos::CuArray`: particle positions, shape `(dims, n_particles)`.
-- `radius::Float32`: search (connectivity) radius.
+- `pos::CuArray`: Particle positions with shape (dims, n_particles).
+- `radius::Float32`: Search radius for neighbor detection.
 
 ## Returns
-- `Tuple`: `(senders, receivers, rel_displacement, rel_dist_norm)` as CuArrays.
+- `Tuple`: (senders, receivers, rel_displacement, rel_dist_norm)
+  - `senders::CuArray{Int32}`: Source particle indices for each edge.
+  - `receivers::CuArray{Int32}`: Neighbor particle indices for each edge.
+  - `rel_displacement::CuArray{Float32}`: Relative displacements normalized by radius (dims × n_edges).
+  - `rel_dist_norm::CuArray{Float32}`: Euclidean distances normalized by radius (1 × n_edges).
+
+## Notes
+- Uses PointNeighbors.jl GridNeighborhoodSearch for efficient GPU computation.
+- All distances and displacements are normalized by the search radius.
+- Supports arbitrary dimension (2D, 3D, etc.).
 """
-function point_neighbor_ns(pos::CuArray, radius::Float32)
-    D = size(pos, 1)
-    n = size(pos, 2)
+function point_neighbor_ns(pos::CuArray, radius::Float32; max_points_per_cell::Integer=100)
+    system = pos#[:,mask]
+    min_corner = minimum(pos; dims=2)
+    max_corner = maximum(pos; dims=2)
+    nhs = GridNeighborhoodSearch{size(pos, 1)}(;
+        search_radius=radius,
+        n_points=size(pos, 2),
+        cell_list=FullGridCellList(;
+            min_corner, max_corner, search_radius=radius, max_points_per_cell
+        ),
+    )
+    initialize!(nhs, Array(system), Array(pos))
+    backend = CUDABackend()
+    # Simple example: just count the neighbors of each particle
+    n_neighbors_gpu = CuArray(zeros(Int, size(pos, 2)))
+    nhs_gpu = adapt(backend, nhs)
 
-    # Build the octree and run the search. These setup ops mutate `tns` and are
-    # non-differentiable; only `build_edges_diff` carries the gradient to `pos`.
-    tns = ChainRulesCore.@ignore_derivatives begin
-        t = TNS(eltype(pos); ndims=D)
-        set_search_radius!(t, radius)
-        id = add_point_set!(t, pos)
-        set_active_search!(t, id, id)
-        run!(t)
-        t
+    foreach_point_neighbor(system, pos, nhs_gpu) do i, _, _, _
+        n_neighbors_gpu[i] += 1
     end
-    e = build_edges_diff(pos, tns, 1, radius)
+    # n_edges = CUDA.reduce(+,n_neighbors_gpu)
+    n_edges = sum(n_neighbors_gpu)
+    # println("Number of edges: $n_edges")
+    senders = CuArray{Int32}(undef, n_edges)
+    receivers = CuArray{Int32}(undef, n_edges)
+    rel_displacement = CuArray{Float32}(undef, size(pos, 1), n_edges)
+    rel_dist_norm = CuArray{Float32}(undef, 1, n_edges)
 
-    # Re-append the self-loops that `build_edges` drops (j == i), matching the
-    # historical PointNeighbors behavior. They are constant w.r.t. `pos`.
-    self_s, self_r, self_disp, self_dist = ChainRulesCore.@ignore_derivatives begin
-        s = similar(e.senders, n)
-        copyto!(s, Int32.(1:n))
-        (
-            s,
-            copy(s),
-            fill!(similar(e.rel_displacement, D, n), 0),
-            fill!(similar(e.rel_dist_norm, 1, n), 0),
-        )
+    offset = CUDA.cumsum(n_neighbors_gpu) .- n_neighbors_gpu .+ 1
+    foreach_point_neighbor(system, pos, nhs_gpu) do i, j, pos_diff, distance
+        receivers[offset[i]] = i # switched it for different subsets in boundary situation
+        senders[offset[i]] = j
+        # senders[offset[i]] = i
+        # receivers[offset[i]] = j
+        for d in 1:size(pos, 1)
+            rel_displacement[d, offset[i]] = pos_diff[d] / radius
+        end
+        rel_dist_norm[offset[i]] = distance/radius
+        offset[i] += 1
     end
-
-    senders = vcat(e.senders, self_s)
-    receivers = vcat(e.receivers, self_r)
-    rel_displacement = hcat(e.rel_displacement, self_disp)
-    rel_dist_norm = hcat(e.rel_dist_norm, self_dist)
-
-    return senders, receivers, rel_displacement, rel_dist_norm
+    # rel_displacement = rel_displacement ./ (Float32(radius))
+    # rel_dist_norm = rel_dist_norm ./ (Float32(radius))
+    senders, receivers, rel_displacement, rel_dist_norm
 end
 
 """
     point_neighbor_ns(pos::Array, radius::Float32)
 
-CPU particle neighbor search using PointNeighbors.jl `GridNeighborhoodSearch`
-(`FullGridCellList`). Mirrors the GPU `CuArray` method's interface and output
-convention exactly — query = receiver `i`, neighbor = sender `j`,
-`rel_displacement = (pos_i - pos_j)/radius`, one self-loop per particle — so
-`build_graph` can call `point_neighbor_ns` unconditionally and dispatch on the
-array type.
+CPU version of particle neighbor search using PointNeighbors.jl GridNeighborhoodSearch.
 
-The grid search is kept on the CPU because building the TreeNSearch octree is
-markedly slower there (~10× on a 46k-point droplet); TreeNSearch is used only on
-the GPU, where it matches the grid on speed and uses ~half the GPU memory.
-Gradients flow through the corrected rrule below.
+Mirrors the GPU version but operates on plain Julia Arrays instead of CuArrays.
+Together with the CuArray method, this allows `build_graph` to call
+`point_neighbor_ns` unconditionally and rely on multiple dispatch.
+
+## Arguments
+- `pos::Array`: Particle positions, shape (dims, n_particles).
+- `radius::Float32`: Search radius (connectivity radius).
+
+## Returns
+- `Tuple`: (senders, receivers, rel_displacement, rel_dist_norm) — all plain Arrays.
 """
-function point_neighbor_ns(pos::Array, radius::Float32)
+function point_neighbor_ns(pos::Array, radius::Float32; max_points_per_cell::Integer=100)
     system = pos
     min_corner = minimum(pos; dims=2)
     max_corner = maximum(pos; dims=2)
     nhs = GridNeighborhoodSearch{size(pos, 1)}(;
         search_radius=radius,
         n_points=size(pos, 2),
-        cell_list=FullGridCellList(; min_corner, max_corner, search_radius=radius),
+        cell_list=FullGridCellList(;
+            min_corner, max_corner, search_radius=radius, max_points_per_cell
+        ),
     )
     initialize!(nhs, system, pos)
 
@@ -421,20 +424,101 @@ function point_neighbor_ns(pos::Array, radius::Float32)
 end
 
 """
+    octopus_ns(pos, radius::Float32)
+
+Neighbor search backend using [Octopus.jl](https://github.com/una-auxme/Octopus.jl)'s
+fast octree (`TNS`). Dispatches on the array type internally (CPU `Array` or
+`CuArray`), so the same code serves both devices.
+
+Returns `(senders, receivers, rel_displacement, rel_dist_norm)` in exactly the
+format of [`point_neighbor_ns`](@ref) — same receiver/sender convention, same
+displacement sign and radius normalization, self-edges included — so the two
+backends are interchangeable inside [`build_graph`](@ref). Edge sets are
+byte-identical to `point_neighbor_ns` (verified in `benchmark_derivative_batching/`).
+
+Gradients flow through `pos` via Octopus's differentiable `build_edges_diff`
+rrule (CPU and GPU); the tree build itself is non-differentiable
+(`@ignore_derivatives`). Octopus excludes the self-pair, so self-edges (zero
+displacement/distance, matching PointNeighbors) are appended explicitly.
+"""
+function octopus_ns(pos, radius::Float32)
+    D = size(pos, 1)
+    n = size(pos, 2)
+    tns = ChainRulesCore.@ignore_derivatives begin
+        t = Octopus.TNS(eltype(pos); ndims=D)
+        Octopus.set_search_radius!(t, radius)
+        pid = Octopus.add_point_set!(t, pos)
+        Octopus.set_active_search!(t, pid, pid)
+        Octopus.run!(t)
+        t
+    end
+    e = Octopus.build_edges_diff(pos, tns, 1, radius)
+
+    self_s, self_r, self_disp, self_dist = ChainRulesCore.@ignore_derivatives begin
+        s = similar(e.senders, n)
+        copyto!(s, Int32.(1:n))
+        (
+            s,
+            copy(s),
+            fill!(similar(e.rel_displacement, D, n), zero(eltype(e.rel_displacement))),
+            fill!(similar(e.rel_dist_norm, 1, n), zero(eltype(e.rel_dist_norm))),
+        )
+    end
+
+    senders = vcat(e.senders, self_s)
+    receivers = vcat(e.receivers, self_r)
+    rel_displacement = hcat(e.rel_displacement, self_disp)
+    rel_dist_norm = hcat(e.rel_dist_norm, self_dist)
+    return senders, receivers, rel_displacement, rel_dist_norm
+end
+
+"""
+    neighbor_search(pos, radius::Float32, backend::Symbol)
+
+Select the neighborhood-search implementation for graph construction. `backend`
+comes from `Args.neighbor_backend` (threaded via `meta["neighbor_backend"]`):
+
+- `:pointneighbors` — [`point_neighbor_ns`](@ref), PointNeighbors.jl grid search (default).
+- `:octopus`        — [`octopus_ns`](@ref), Octopus.jl octree search.
+- `:auto`           — PointNeighbors on CPU (`Array`), Octopus on GPU (`CuArray`).
+                      PointNeighbors wins on CPU; Octopus's octree is ~18x leaner
+                      than the dense grid on the GPU acceleration struct.
+
+All branches return the identical `(senders, receivers, rel_displacement,
+rel_dist_norm)` format and are differentiable in `pos`.
+"""
+function neighbor_search(pos, radius::Float32, backend::Symbol)
+    if backend === :pointneighbors
+        return point_neighbor_ns(pos, radius)
+    elseif backend === :octopus
+        return octopus_ns(pos, radius)
+    elseif backend === :auto
+        return pos isa CuArray ? octopus_ns(pos, radius) : point_neighbor_ns(pos, radius)
+    else
+        throw(
+            ArgumentError(
+                "unknown neighbor_backend $(repr(backend)); " *
+                "use :pointneighbors, :octopus, or :auto",
+            ),
+        )
+    end
+end
+
+"""
     ChainRulesCore.rrule(::typeof(point_neighbor_ns), pos::Array, radius::Float32)
 
-Reverse-mode AD rule for the CPU (`Array`) neighbor search. Computes `∂L/∂pos`
-from the upstream tangents on `rel_displacement` / `rel_dist_norm`; the edge set
-and the radius are non-differentiable.
+Define the reverse-mode automatic differentiation rule for `point_neighbor_ns` on CPU.
 
-**Sign convention — corrected vs the original implementation** (verified against
-finite differences and matching `TreeNSearch.build_edges_diff`): since
-`rel_displacement[:, k] = (pos[:, i] - pos[:, j]) / radius` with `i = receiver`
-and `j = sender`, the gradient accumulates **+ on the receiver** and **− on the
-sender**. The original CPU/GPU rrules had these swapped, which negated `∂L/∂pos`
-and affected only the ODE/solver strategies (the sole paths that backprop through
-positions). Self-loops (`i == j`) cancel, and their zero distance is skipped by
-the `> 1e-8` guard.
+Mirrors the GPU rrule but operates on plain Arrays. Enables gradient computation
+through the neighbor search for CPU-based ODE training (SingleShooting, MultipleShooting).
+
+## Arguments
+- `::typeof(point_neighbor_ns)`: Function identifier.
+- `pos::Array`: Particle positions.
+- `radius::Float32`: Search radius.
+
+## Returns
+- `Tuple`: (primal_output, pullback_function)
 """
 function ChainRulesCore.rrule(::typeof(point_neighbor_ns), pos::Array, radius::Float32)
     senders, receivers, rel_displacement, rel_dist_norm = point_neighbor_ns(pos, radius)
@@ -466,13 +550,16 @@ function ChainRulesCore.rrule(::typeof(point_neighbor_ns), pos::Array, radius::F
             Δrel_dist_raw isa ChainRulesCore.NoTangent
         )
             for idx in eachindex(senders)
-                i = Int(receivers[idx])   # query point
-                j = Int(senders[idx])     # neighbor
+                i = Int(receivers[idx])
+                j = Int(senders[idx])
 
                 for d in 1:size(grad_pos, 1)
                     val_disp = Δdisp[d, idx] / radius
-                    grad_pos[d, i] += val_disp   # ∂rel_disp/∂pos_i = +1/r
-                    grad_pos[d, j] -= val_disp   # ∂rel_disp/∂pos_j = -1/r
+                    # rel_displacement[d,idx] = (pos[d,i] - pos[d,j]) / radius, with
+                    # i = receiver, j = sender, so ∂/∂pos_i = +1/r and ∂/∂pos_j = -1/r:
+                    # +receiver, -sender (FD-verified; see test_neighbor_backend.jl).
+                    grad_pos[d, i] += val_disp
+                    grad_pos[d, j] -= val_disp
                 end
 
                 d_norm = rel_dist_norm[1, idx]
@@ -492,4 +579,143 @@ function ChainRulesCore.rrule(::typeof(point_neighbor_ns), pos::Array, radius::F
 
     return (senders, receivers, rel_displacement, rel_dist_norm),
     point_neighbor_ns_cpu_pullback
+end
+
+"""
+    ChainRulesCore.rrule(::typeof(point_neighbor_ns), pos::CuArray, radius::Float32)
+
+Define the reverse-mode automatic differentiation rule for `point_neighbor_ns`.
+
+Enables gradient computation through the neighbor search operation for backpropagation.
+Gradients flow only through position; radius is treated as constant.
+
+## Arguments
+- `::typeof(point_neighbor_ns)`: Function identifier.
+- `pos::CuArray`: Particle positions.
+- `radius::Float32`: Search radius.
+
+## Returns
+- `Tuple`: (primal_output, pullback_function)
+  - `primal_output`: (senders, receivers, rel_displacement, rel_dist_norm).
+  - `pullback_function`: Function that computes gradients with respect to position.
+
+## Notes
+- Only position gradients are computed; radius gradient is NoTangent.
+- Uses GPU kernel for efficient gradient computation.
+- Handles various tangent types from Zygote (AbstractZero, AbstractArray, etc.).
+"""
+function ChainRulesCore.rrule(::typeof(point_neighbor_ns), pos::CuArray, radius::Float32)
+    # Forward Pass
+    senders, receivers, rel_displacement, rel_dist_norm = point_neighbor_ns(pos, radius)
+
+    function point_neighbor_ns_pullback(Δ)
+        # Δ = (f̄, pos̄, radius̄)
+        # Note: Δ is a Tuple, so Δ[3] is rel_displacement gradient, Δ[4] is rel_dist_norm
+        Δrel_disp_raw = Δ[3]
+        Δrel_dist_raw = Δ[4]
+
+        # Initialize gradient for pos
+        grad_pos = CUDA.zeros(eltype(pos), size(pos))
+
+        # Helper to convert Zygote Tangents/Nothing to CuArray
+        # This is critical to prevent "dynamic invocation"
+        function ensure_cuda(amt, dims)
+            if amt isa AbstractArray
+                return amt
+            elseif amt isa ChainRulesCore.AbstractZero
+                return CUDA.zeros(Float32, dims...)
+            else
+                # Handle cases where Zygote might wrap the array in a Fill or NamedTuple
+                return convert(CuArray{Float32}, amt)
+            end
+        end
+
+        Δdisp = ensure_cuda(Δrel_disp_raw, size(rel_displacement))
+        Δdist = ensure_cuda(Δrel_dist_raw, size(rel_dist_norm))
+
+        # Only compute if we have non-zero gradients
+        if !(
+            Δrel_disp_raw isa ChainRulesCore.NoTangent &&
+            Δrel_dist_raw isa ChainRulesCore.NoTangent
+        )
+            n_edges = length(senders)
+            threads = 256
+            blocks = cld(n_edges, threads)
+
+            @cuda threads=threads blocks=blocks pullback_kernel!(
+                grad_pos,
+                Δdisp,
+                Δdist,
+                senders,
+                receivers,
+                rel_displacement,
+                rel_dist_norm,
+                radius,
+            )
+        end
+        # Return gradients for: (::typeof(point_neighbor_ns), pos, radius, mask)    
+        return (NoTangent(), grad_pos, NoTangent(), NoTangent())
+    end
+
+    return (senders, receivers, rel_displacement, rel_dist_norm), point_neighbor_ns_pullback
+end
+
+"""
+    pullback_kernel!(grad_pos, Δrel_disp, Δrel_dist, senders, receivers, rel_disp, rel_dist, radius)
+
+GPU kernel for computing position gradients during backpropagation through neighbor search.
+
+Computes gradients with respect to particle positions from gradients of relative displacements
+and distances. Uses atomic operations to safely accumulate gradients for each particle.
+
+## Arguments
+- `grad_pos`: Output gradient array with shape (dims, n_particles).
+- `Δrel_disp`: Gradient w.r.t. relative displacements (dims × n_edges).
+- `Δrel_dist`: Gradient w.r.t. normalized distances (1 × n_edges).
+- `senders`: Source particle indices.
+- `receivers`: Receiver particle indices.
+- `rel_disp`: Relative displacement values (dims × n_edges).
+- `rel_dist`: Normalized distance values (1 × n_edges).
+- `radius`: Search radius used in normalization.
+
+## Implementation Details
+- Launched as CUDA kernel with threads=256.
+- Uses atomic addition to handle gradient contributions to shared particles.
+- Gradient contribution splits between displacement and distance terms with proper normalization.
+- Returns nothing (modifies grad_pos in-place).
+"""
+function pullback_kernel!(
+    grad_pos, Δrel_disp, Δrel_dist, senders, receivers, rel_disp, rel_dist, radius
+)
+    idx = (blockIdx().x - 1) * blockDim().x + threadIdx().x
+
+    if idx <= length(senders)
+        # Use Int64 for indexing to avoid overflows and ensure compatibility
+        i = Int32(receivers[idx])
+        j = Int32(senders[idx])
+
+        # 1. Gradient from rel_displacement (Matrix: dim x n_edges)
+        for d in 1:size(grad_pos, 1)
+            val_disp = Δrel_disp[d, idx] / radius
+            # rel_displacement = (pos_i - pos_j)/radius (i=receiver, j=sender), so the
+            # position gradient is +receiver, -sender (FD-verified).
+            CUDA.atomic_add!(pointer(grad_pos, (i-1)*size(grad_pos, 1) + d), val_disp)
+            CUDA.atomic_add!(pointer(grad_pos, (j-1)*size(grad_pos, 1) + d), -val_disp)
+        end
+
+        # 2. Gradient from rel_dist_norm (Matrix: 1 x n_edges)
+        # Match your allocation: rel_dist_norm[1, offset[i]]
+        d_norm = rel_dist[1, idx]
+
+        if d_norm > 1.0f-8
+            for d in 1:size(grad_pos, 1)
+                # rel_disp is also [d, idx]
+                grad_val = (Δrel_dist[1, idx] * rel_disp[d, idx]) / (d_norm * radius)
+
+                CUDA.atomic_add!(pointer(grad_pos, (i-1)*size(grad_pos, 1) + d), grad_val)
+                CUDA.atomic_add!(pointer(grad_pos, (j-1)*size(grad_pos, 1) + d), -grad_val)
+            end
+        end
+    end
+    return nothing
 end
