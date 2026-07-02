@@ -83,8 +83,16 @@ function build_graph(
     #     velocity = hcat(velocity, zeros(Float32, meta["dims"], size(boundaries,2)))
     # end
 
+    # Materialize `position` onto the active device's *concrete* array type
+    # before the neighbor search. In the ODE solver path `position` is `x.x`, a
+    # GPU-backed ComponentArray view (`<: AbstractArray` but not `<: CuArray`),
+    # which would otherwise miss `point_neighbor_ns(::CuArray)` and fall back to
+    # the host search. `device(...)` yields a `CuArray` on GPU / `Array` on CPU,
+    # selecting the matching method so the search AND its gradient
+    # (TreeNSearch `build_edges_diff`) stay on-device. `device` differentiates
+    # (MLDataDevices rrule), so ∂L/∂pos flows back to the view.
     senders, receivers, rel_displacement, rel_dist_norm = point_neighbor_ns(
-        position, Float32(meta["default_connectivity_radius"])
+        device(position), Float32(meta["default_connectivity_radius"])
     )
     # if size(boundaries,2) != 0
     # #     # sender_old, receiver_old, senders, receivers, _, b_particle = check_and_delete_filtered(senders, receivers, size(position, 2), true)
