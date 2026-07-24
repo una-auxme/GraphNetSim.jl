@@ -248,7 +248,11 @@ function data_meanstd(path; kws...)
     function add_to_result(data)
         for f in features
             if !haskey(ds_train.meta["features"][f], "onehot") && isnumber(ds_train.meta, f)
-                result["$f-acc_count"] += prod(size(data[f]))
+                # `-acc_sum`/`-acc_sum_squared` are per-dimension: each entry
+                # aggregates one value per particle per timestep. The divisor must
+                # therefore be the per-dimension sample count (N*T), not the total
+                # element count (dim*N*T).
+                result["$f-acc_count"] += prod(size(data[f])[2:end])
                 for i in axes(data[f], 3)
                     result["$f-acc_sum"] += reduce(+, data[f][:, :, i]; dims=2)[:, 1]
                     result["$f-acc_sum_squared"] += reduce(+, data[f][:, :, i] .^ 2; dims=2)[
@@ -262,7 +266,7 @@ function data_meanstd(path; kws...)
 
         for tf in target_features
             if isnumber(ds_train.meta, tf)
-                result["target|$tf-acc_count"] += prod(size(data[tf]))
+                result["target|$tf-acc_count"] += prod(size(data[tf])[2:end])
                 for i in axes(data[tf], 3)
                     result["target|$tf-acc_sum"] += reduce(+, data[tf][:, :, i]; dims=2)[
                         :, 1

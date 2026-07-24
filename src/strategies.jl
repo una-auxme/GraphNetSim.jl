@@ -560,6 +560,12 @@ function init_train_step(strategy::BatchingStrategy, t::Tuple)
 
     u0 = device(ComponentArray(; x=x0, dx=dx0))
     gt = vcat([data[tf][:, mask, tstart:tstop] for tf in target_fields]...)
+    # Extra targets for env-toggled Phase-2 loss experiments (see `train_loss`):
+    #   P2_LOSS=posvel  -> adds a velocity term (velocity depends on the network
+    #                      acceleration even for a 1-step Euler batch)
+    #   P2_LOSS=posnorm -> normalises the position residual by per-dim std
+    gt_vel = data["velocity"][:, mask, tstart:tstop]
+    pos_std = reshape(Float32.(meta["features"]["position"]["data_std"]), :, 1, 1)
     return (
         gns,
         data,
@@ -575,6 +581,8 @@ function init_train_step(strategy::BatchingStrategy, t::Tuple)
         batches,
         b,
         show_progress_bars,
+        gt_vel,
+        pos_std,
     )
 end
 
@@ -604,7 +612,9 @@ function train_step(strategy::BatchingStrategy, t::Tuple)
     device,
     batches,
     b,
-    show_progress_bars = t
+    show_progress_bars,
+    gt_vel,
+    pos_std = t
 
     pr = ProgressUnknown(;
         desc="Solver progress: ", showspeed=true, enabled=show_progress_bars
@@ -637,9 +647,14 @@ function train_step(strategy::BatchingStrategy, t::Tuple)
         (round(batches[b].batchStart; digits=4), round(batches[b].batchStop; digits=4)),
         gns.ps,
     )
+    # Read the loss-variant selector OUTSIDE the differentiated region: an ENV
+    # lookup is a `ccall` that Zygote cannot differentiate through.
+    p2mode = get(ENV, "P2_LOSS", "pos")
     shoot_loss, shoot_gs = Zygote.withgradient(
-        ps ->
-            train_loss(strategy, (prob, ps, u0, nothing, gt, mask, data["dt"], batches[b])),
+        ps -> train_loss(
+            strategy,
+            (prob, ps, u0, nothing, gt, mask, data["dt"], batches[b], gt_vel, pos_std, p2mode),
+        ),
         gns.ps,
     )
     return shoot_gs, shoot_loss
@@ -658,7 +673,7 @@ with ground truth using the configured loss function.
 - `t::Tuple`: Tuple containing problem, parameters, and ground truth data.
 """
 function train_loss(strategy::BatchingStrategy, t::Tuple)
-    prob, ps, u0, callback_solve, gt, mask, dt, batch = t
+    prob, ps, u0, callback_solve, gt, mask, dt, batch, gt_vel, pos_std, mode = t
     sol = solve(
         remake(prob; p=ps),
         strategy.solver;
@@ -672,12 +687,34 @@ function train_loss(strategy::BatchingStrategy, t::Tuple)
     sol_pos = [u.x for u in sol.u]
     pred = cat(sol_pos...; dims=3)
 
-    if strategy.loss_function == :mse
-        error = cpu_device()((gt[:, :, 1:size(pred, 3)] .- pred[:, mask, :]) .^ 2)
-    elseif strategy.loss_function == :mae
-        error = cpu_device()(abs.(gt[:, :, 1:size(pred, 3)] .- pred[:, mask, :]))
+    # Env-toggled Phase-2 loss variants (experiment). Default "pos" reproduces the
+    # original position-only loss exactly. See the gradient-suppression analysis:
+    # with a 1-step forward-Euler batch the position is independent of the network
+    # acceleration, so "pos" has ~zero gradient; "posvel" (velocity term) and a
+    # longer `intervall` restore it. `mode` is read outside the AD region in
+    # `train_step` (an ENV `ccall` is not differentiable by Zygote).
+    if mode == "posnorm"
+        res = cpu_device()(gt[:, :, 1:size(pred, 3)] .- pred[:, mask, :]) ./ pos_std
+        loss = strategy.loss_function == :mse ? mean(res .^ 2) : mean(abs.(res))
+    elseif mode == "posvel"
+        sol_vel = [u.dx for u in sol.u]
+        predv = cat(sol_vel...; dims=3)
+        if strategy.loss_function == :mse
+            ep = cpu_device()((gt[:, :, 1:size(pred, 3)] .- pred[:, mask, :]) .^ 2)
+            ev = cpu_device()((gt_vel[:, :, 1:size(predv, 3)] .- predv[:, mask, :]) .^ 2)
+        else
+            ep = cpu_device()(abs.(gt[:, :, 1:size(pred, 3)] .- pred[:, mask, :]))
+            ev = cpu_device()(abs.(gt_vel[:, :, 1:size(predv, 3)] .- predv[:, mask, :]))
+        end
+        loss = mean(ep) + mean(ev)
+    else  # "pos" — original behaviour
+        if strategy.loss_function == :mse
+            error = cpu_device()((gt[:, :, 1:size(pred, 3)] .- pred[:, mask, :]) .^ 2)
+        elseif strategy.loss_function == :mae
+            error = cpu_device()(abs.(gt[:, :, 1:size(pred, 3)] .- pred[:, mask, :]))
+        end
+        loss = mean(error)
     end
-    loss = mean(error)
     return loss
 end
 

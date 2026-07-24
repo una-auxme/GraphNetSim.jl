@@ -782,10 +782,16 @@ function train_gns!(
             if step > args.norm_steps && (cp_progress >= args.checkpoint || reached_budget)
                 push!(df_train, [step, avg_loss / Float32(cp_progress)])
 
+                # Optional validation subset (experiment knob): validate on only the
+                # first P2_VAL_SUBSET trajectories to make sweeps cheap. 0 = full set.
+                nt_full = ds_valid.meta["n_trajectories"]
+                val_subset = Base.parse(Int, get(ENV, "P2_VAL_SUBSET", "0"))
+                n_val_denom = val_subset > 0 ? min(val_subset, nt_full) : nt_full
+
                 traj_idx = 1
                 valid_error = 0.0f0
                 pr_valid = Progress(
-                    ds_valid.meta["n_trajectories"];
+                    n_val_denom;
                     desc="Validation progress: ",
                     barlen=50,
                     enabled=args.show_progress_bars,
@@ -798,6 +804,7 @@ function train_gns!(
                 frozen_state = _freeze_online_normalisers!(gns)
                 try
                     for data_valid in valid_loader
+                        val_subset > 0 && traj_idx > val_subset && break
                         if args.show_progress_bars
                             print("\n\n\n")
                         end
@@ -841,7 +848,7 @@ function train_gns!(
                             showvalues=[
                                 (
                                     :trajectory,
-                                    "$traj_idx/$(ds_valid.meta["n_trajectories"])",
+                                    "$traj_idx/$(n_val_denom)",
                                 ),
                                 (:valid_loss, "$(valid_error / traj_idx)"),
                             ],
@@ -852,8 +859,8 @@ function train_gns!(
                     _restore_online_normalisers!(frozen_state)
                 end
 
-                if valid_error / ds_valid.meta["n_trajectories"] < min_validation_loss
-                    # push!(df_valid, [step, valid_error / ds_valid.meta["n_trajectories"]])
+                if valid_error / n_val_denom < min_validation_loss
+                    # push!(df_valid, [step, valid_error / n_val_denom])
                     save!(
                         gns,
                         opt_state,
@@ -861,14 +868,14 @@ function train_gns!(
                         df_valid,
                         df_step,
                         step,
-                        valid_error / ds_valid.meta["n_trajectories"],
+                        valid_error / n_val_denom,
                         joinpath(cp_path, "valid");
                         is_training=false,
                     )
-                    min_validation_loss = valid_error / ds_valid.meta["n_trajectories"]
+                    min_validation_loss = valid_error / n_val_denom
                     cp_progress = args.checkpoint
                 end
-                last_validation_loss = valid_error / ds_valid.meta["n_trajectories"]
+                last_validation_loss = valid_error / n_val_denom
                 if !isnothing(args.on_valid)
                     args.on_valid(step, last_validation_loss)
                 end
@@ -887,7 +894,7 @@ function train_gns!(
                     df_valid,
                     df_step,
                     step,
-                    valid_error / ds_valid.meta["n_trajectories"],
+                    valid_error / n_val_denom,
                     cp_path;
                     is_training=false,
                 )
@@ -1290,6 +1297,7 @@ function extrapolate_network(
     saves,
     mse_steps=Float32[],
     has_ground_truth::Bool=true,
+    extrapolate_factor::Union{Nothing,Real}=nothing,
     kws...,
 )
     existing_cfg = load_model_config(cp_path)
@@ -1370,6 +1378,7 @@ function extrapolate_network(
         mse_steps,
         args;
         has_ground_truth=has_ground_truth,
+        extrapolate_factor=extrapolate_factor,
     )
 end
 
@@ -1379,9 +1388,18 @@ end
                          has_ground_truth::Bool=true)
 
 Inner evaluation loop for [`extrapolate_network`](@ref). Mirrors [`eval_network!`](@ref)
-but (a) never overrides the user-supplied time-grid arguments, (b) tolerates predictions
-longer than the ground truth (or missing ground truth entirely), and (c) freezes online
-feature normalisers during the rollout to prevent out-of-distribution drift.
+but (a) by default never overrides the user-supplied time-grid arguments, (b) tolerates
+predictions longer than the ground truth (or missing ground truth entirely), and (c)
+freezes online feature normalisers during the rollout to prevent out-of-distribution drift.
+
+## Per-trajectory horizons
+When `extrapolate_factor` is set (e.g. `2.0`), the global `stop`/`saves` are ignored and
+each trajectory instead rolls out to `extrapolate_factor` times its OWN ground-truth time
+window: a trajectory of `L` frames (GT window `dt*(L-1)`) is simulated over
+`[start, start + f*dt*(L-1)]`, i.e. `round(Int, f*(L-1)) + 1` frames. This is the correct
+setting for a dataset of varying-length trajectories, where a single global grid would
+extrapolate short trajectories far past `2×` while barely extrapolating the longest.
+`mse_steps` is still matched per trajectory against its own overlap region.
 
 ## Returns
 - `Tuple`: `(predictions::Dict{Int,NamedTuple}, errors::Dict{Int,Array{Float32,3}})`.
@@ -1400,10 +1418,15 @@ function extrapolate_network!(
     mse_steps,
     args::Args;
     has_ground_truth::Bool=true,
+    extrapolate_factor::Union{Nothing,Real}=nothing,
 )
-    @assert length(saves) > 0 "`saves` must not be empty"
-    @assert isapprox(Float32(saves[1]), Float32(start); atol=1.0f-6) "saves[1]=$(saves[1]) does not match start=$(start)"
-    @assert isapprox(Float32(saves[end]), Float32(stop); atol=1.0f-6) "saves[end]=$(saves[end]) does not match stop=$(stop)"
+    if isnothing(extrapolate_factor)
+        @assert length(saves) > 0 "`saves` must not be empty"
+        @assert isapprox(Float32(saves[1]), Float32(start); atol=1.0f-6) "saves[1]=$(saves[1]) does not match start=$(start)"
+        @assert isapprox(Float32(saves[end]), Float32(stop); atol=1.0f-6) "saves[end]=$(saves[end]) does not match stop=$(stop)"
+    else
+        @assert extrapolate_factor > 0 "`extrapolate_factor` must be positive, got $(extrapolate_factor)"
+    end
 
     local traj_pred = Dict{
         Int,
@@ -1441,6 +1464,17 @@ function extrapolate_network!(
                 )
             end
 
+            # Per-trajectory horizon: when extrapolate_factor is set, derive this
+            # trajectory's own time grid from its length (built by frame count to
+            # avoid Float32 range-endpoint drift); otherwise use the global grid.
+            traj_saves, traj_stop = if isnothing(extrapolate_factor)
+                saves, stop
+            else
+                nframes = round(Int, extrapolate_factor * (data["trajectory_length"] - 1)) + 1
+                s = Float32.(start .+ dt .* (0:(nframes - 1)))
+                s, s[end]
+            end
+
             initial_state, node_type, stepstart = _prepare_rollout_inputs(
                 data, ds_test, start, dt, device
             )
@@ -1462,9 +1496,9 @@ function extrapolate_network!(
                 data["mask"],
                 data["val_mask"],
                 start,
-                stop,
+                traj_stop,
                 dt,
-                saves,
+                traj_saves,
                 device,
                 pr,
             )
@@ -1492,13 +1526,13 @@ function extrapolate_network!(
 
                 reduced = mean(squared_err; dims=2)
                 valid_mse_steps = filter(mse_steps) do h
-                    idx = findfirst(x -> x == h, saves)
+                    idx = findfirst(x -> x == h, traj_saves)
                     return !isnothing(idx) && idx <= noverlap
                 end
                 if !isempty(valid_mse_steps)
                     println("MSE of state prediction ($noverlap of $npred steps covered):")
                     for horizon in valid_mse_steps
-                        idx = findfirst(x -> x == horizon, saves)
+                        idx = findfirst(x -> x == horizon, traj_saves)
                         err = mean(reduced[:, 1, idx])
                         cum_err = mean(reduced[:, 1, 1:idx])
                         println(
