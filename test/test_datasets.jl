@@ -227,6 +227,47 @@ for cfg in CONFIGS
                 result = data_meanstd(cfg.path)
                 @test !haskey(result, "node_type")
             end
+
+            # B1-B3 pass just as happily on wrong statistics: they only assert
+            # finiteness/non-triviality. Pin the actual values against stats
+            # recomputed from the raw HDF5 instead.
+            @testset "B4: meanstd matches ground truth" begin
+                meta = JSON.parsefile(joinpath(cfg.path, "meta.json"))
+                result = data_meanstd(cfg.path)
+
+                for field in ("velocity", "acceleration")
+                    tmpl = meta["features"][field]["key"]
+                    dim = meta["features"][field]["dim"]
+                    acc_sum = zeros(Float64, dim)
+                    acc_sq = zeros(Float64, dim)
+                    n_per_dim = 0
+
+                    for split in ("train.h5", "valid.h5", "test.h5")
+                        p = joinpath(cfg.path, split)
+                        isfile(p) || continue
+                        h5open(p, "r") do f
+                            for traj in keys(f)
+                                g = f[traj]
+                                for t in 1:meta["trajectory_length"]
+                                    k = replace(tmpl, "\$t" => string(t))
+                                    haskey(g, k) || continue
+                                    x = Float64.(read(g[k]))   # (dim, N)
+                                    acc_sum .+= vec(sum(x; dims=2))
+                                    acc_sq .+= vec(sum(x .^ 2; dims=2))
+                                    n_per_dim += size(x, 2)
+                                end
+                            end
+                        end
+                    end
+
+                    mean_true = acc_sum ./ n_per_dim
+                    std_true = sqrt.(max.(0.0, acc_sq ./ n_per_dim .- mean_true .^ 2))
+                    mean_got, std_got = result[field]
+
+                    @test mean_got ≈ Float32.(mean_true) rtol = 1.0f-3 atol = 1.0f-6
+                    @test std_got ≈ Float32.(std_true) rtol = 1.0f-3 atol = 1.0f-6
+                end
+            end
         end
 
         # ─────────────────────────────────────────────────────────────────
