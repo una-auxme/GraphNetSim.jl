@@ -300,15 +300,15 @@ for cfg in CONFIGS
                 @test n_edges[] > 0
             end
 
-            @testset "C3: TreeNSearch matches old PointNeighbors impl" begin
-                # New TreeNSearch-backed point_neighbor_ns on the suite device.
+            @testset "C3: Octopus matches old PointNeighbors impl" begin
+                # New Octopus-backed point_neighbor_ns on the suite device.
                 s_new, r_new, d_new, n_new = GraphNetSim.point_neighbor_ns(DEVICE(pos), cr)
                 s_new = Array(s_new)
                 r_new = Array(r_new)
                 d_new = Array(d_new)
                 n_new = Array(n_new)
 
-                # Reference: replicate the pre-TreeNSearch PointNeighbors
+                # Reference: replicate the pre-Octopus PointNeighbors
                 # implementation exactly — query = receiver i, neighbor =
                 # sender j, rel_displacement = (pos_i - pos_j)/cr, and one
                 # self-loop per particle (PointNeighbors includes i == j).

@@ -89,7 +89,7 @@ function build_graph(
     # which would otherwise miss `point_neighbor_ns(::CuArray)` and fall back to
     # the host search. `device(...)` yields a `CuArray` on GPU / `Array` on CPU,
     # selecting the matching method so the search AND its gradient
-    # (TreeNSearch `build_edges_diff`) stay on-device. `device` differentiates
+    # (Octopus `build_edges_diff`) stay on-device. `device` differentiates
     # (MLDataDevices rrule), so ∂L/∂pos flows back to the view.
     senders, receivers, rel_displacement, rel_dist_norm = neighbor_search(
         device(position),
@@ -308,11 +308,33 @@ end
 """
     point_neighbor_ns(pos::CuArray, radius::Float32)
 
-Perform GPU-accelerated neighbor search using PointNeighbors grid-based acceleration.
+GPU particle neighbor search backed by [Octopus.jl](../Octopus.jl) — the
+fast octree neighborhood search of Fernández-Fernández et al. (SIGGRAPH Asia
+2022). The octree is O(N) and adapts to clustered/anisotropic point sets, so on
+the GPU it matches the old PointNeighbors `GridNeighborhoodSearch` on speed while
+using roughly **half** the GPU memory (the old dense `FullGridCellList` scales
+with domain/radius, not particle count — wasteful for the small connectivity
+radii used here). The CPU `Array` path keeps the old PointNeighbors search (see
+the method below), which is faster on the CPU than the octree build.
 
-Constructs a grid neighborhood search structure from particle positions and radius,
-then efficiently finds all particle pairs within the search radius using grid-based acceleration.
-Returns normalized relative displacements and distances.
+## Output convention (identical to the CPU path)
+- `receivers[k] = i` (the query point), `senders[k] = j` (its neighbor).
+- `rel_displacement[:, k] = (pos[:, i] - pos[:, j]) / radius`.
+- `rel_dist_norm[1, k]    = ‖pos[:, i] - pos[:, j]‖ / radius`.
+
+## Self-loops
+`build_edges` excludes the self-pair `j == i`; PointNeighbors includes one
+self-loop per particle (zero displacement / distance). We re-append those
+self-loops so the GPU and CPU paths return identical edge sets.
+
+## Gradients
+Differentiation w.r.t. `pos` flows through `Octopus.build_edges_diff` (via
+its ChainRulesCore extension); the tree topology and radius are
+non-differentiable. The appended self-loops contribute zero gradient
+(`sender == receiver` cancels, and their zero distance is skipped by the
+`d_norm > 1e-8` guard). `build_edges_diff` computes the
+finite-difference-verified `∂L/∂pos`; the original hand-written GPU rrule had a
+flipped sign (see the corrected CPU rrule below for the right convention).
 
 ## Arguments
 - `pos::CuArray`: Particle positions with shape (dims, n_particles).
