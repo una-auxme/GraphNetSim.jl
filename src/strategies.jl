@@ -306,7 +306,7 @@ function train_step(strategy::SolverStrategy, t::Tuple)
             t,
         ),
     )
-    prob = ODEProblem(ff, u0, (strategy.tstart, strategy.tstop), gns.ps)
+    prob = ODEProblem(ff, u0, (strategy.tstart, strategy.tstop), gns.train_state.parameters)
     shoot_loss, shoot_gs = Zygote.withgradient(
         ps -> train_loss(
             strategy,
@@ -322,7 +322,7 @@ function train_step(strategy::SolverStrategy, t::Tuple)
                 [meta["features"][tf]["dim"] for tf in target_fields],
             ),
         ),
-        gns.ps,
+        gns.train_state.parameters,
     )
     return shoot_gs, shoot_loss
 end
@@ -645,12 +645,12 @@ function train_step(strategy::BatchingStrategy, t::Tuple)
         ff,
         u0,
         (round(batches[b].batchStart; digits=4), round(batches[b].batchStop; digits=4)),
-        gns.ps,
+        gns.train_state.parameters,
     )
     shoot_loss, shoot_gs = Zygote.withgradient(
         ps ->
             train_loss(strategy, (prob, ps, u0, nothing, gt, mask, data["dt"], batches[b])),
-        gns.ps,
+        gns.train_state.parameters,
     )
     batches[b].loss = shoot_loss
     return shoot_gs, shoot_loss
@@ -937,9 +937,10 @@ function train_step(strategy::MultipleShooting, t::Tuple)
             t,
         ),
     )
-    prob = ODEProblem(ff, u0, (strategy.tstart, strategy.tstop), gns.ps)
+    prob = ODEProblem(ff, u0, (strategy.tstart, strategy.tstop), gns.train_state.parameters)
     shoot_loss, shoot_gs = Zygote.withgradient(
-        ps -> train_loss(strategy, (prob, ps, data, gt, mask, device)), gns.ps
+        ps -> train_loss(strategy, (prob, ps, data, gt, mask, device)),
+        gns.train_state.parameters,
     )
     return shoot_gs, shoot_loss
 end
@@ -1095,7 +1096,7 @@ function train_step(strategy::DerivativeStrategy, t::Tuple)
                 device,
             ),
         ),
-        gns.ps,
+        gns.train_state.parameters,
     )
 
     return gs, loss
@@ -1116,8 +1117,9 @@ output and target derivatives.
 function train_loss(strategy::DerivativeStrategy, t::Tuple)
     ps, gns, position, velocity, meta, target, node_type, mask, device = t
     graph = build_graph(gns, position, velocity, meta, node_type, mask, device)
-    output, st = gns.model(graph, ps, gns.st)
-    gns.st = st
+    # GraphNetCore >= 0.4: model/state live inside the TrainState; layers are
+    # stateless under a forward pass so no state write-back is needed.
+    output, _ = gns.train_state.model(graph, ps, gns.train_state.states)
 
     # error = loss_function(target, output)
     # error = loss_function(target, output[:, mask])
