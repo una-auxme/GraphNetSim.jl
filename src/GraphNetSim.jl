@@ -501,11 +501,11 @@ function train_network(opt, ds_path, cp_path; kws...)
         cp_path,
     ) # geht mit dims oder dimensions of array
 
-    # Populated on a fresh start by the TrainState constructor, restored on resume.
-    # On resume GraphNetCore loads the optimiser state from the (CPU) checkpoint without
-    # moving it to the device, so re-apply `device` here to keep it co-located with the
-    # (GPU) parameters — otherwise Optimisers.update mixes CPU/GPU arrays.
-    opt_state = device(gns.train_state.optimizer_state)
+    # The optimiser state lives inside `gns.train_state` (populated on a fresh start by the
+    # TrainState constructor, restored on resume). On resume GraphNetCore loads it from the
+    # (CPU) checkpoint without moving it to the device, so re-`device` it in place here to keep
+    # it co-located with the (GPU) parameters.
+    @set! gns.train_state.optimizer_state = device(gns.train_state.optimizer_state)
 
     Lux.trainmode(gns.train_state.states)
 
@@ -514,14 +514,14 @@ function train_network(opt, ds_path, cp_path; kws...)
     print("\u1b[1G")
 
     min_validation_loss = train_gns!(
-        gns, opt_state, ds_train, ds_valid, df_train, df_valid, device, cp_path, args
+        gns, ds_train, ds_valid, df_train, df_valid, device, cp_path, args
     )
 
     return min_validation_loss
 end
 
 """
-    train_gns!(gns::GraphNetwork, opt_state, ds_train::Dataset, ds_valid::Dataset, df_train, df_valid, device::Function, cp_path::String, args::Args)
+    train_gns!(gns::GraphNetwork, ds_train::Dataset, ds_valid::Dataset, df_train, df_valid, device::Function, cp_path::String, args::Args)
 
 Execute the main training loop for a Graph Neural Network simulator.
 
@@ -530,8 +530,7 @@ Supports various training strategies (derivative, batching) and handles
 feature noise injection, gradient accumulation over multiple time steps, and online normalizer updates.
 
 ## Arguments
-- `gns::GraphNetwork`: Graph network model containing parameters and normalizers.
-- `opt_state`: Optimizer state from Optimisers.jl.
+- `gns::GraphNetwork`: Graph network model containing parameters, optimiser state, and normalizers.
 - `ds_train::Dataset`: Training dataset with trajectories and metadata.
 - `ds_valid::Dataset`: Validation dataset for monitoring training progress.
 - `df_train`: DataFrame storing training loss at checkpoints.
@@ -564,7 +563,6 @@ For each training step:
 """
 function train_gns!(
     gns::GraphNetwork,
-    opt_state,
     ds_train::Dataset,
     ds_valid::Dataset,
     df_train,
@@ -652,17 +650,20 @@ function train_gns!(
                 tmp_loss += sum(losses)
                 if step + datapoint > args.norm_steps
                     for i in eachindex(gs)
-                        opt_state, ps = Optimisers.update(
-                            opt_state, gns.train_state.parameters, gs[i]
+                        # The optimiser state is intrinsic to the TrainState; apply_gradients
+                        # runs `Optimisers.update` on it and writes the updated parameters +
+                        # optimiser state back into `gns.train_state` (no separate opt_state).
+                        gns.train_state = Lux.Training.apply_gradients(
+                            gns.train_state, gs[i]
                         )
-                        # TrainState is immutable; @set! rebuilds it with the
-                        # updated parameters (was `gns.ps = ps`).
-                        @set! gns.train_state.parameters = ps
 
                         if !isnothing(args.optimizer_learning_rate_stop) &&
                             (step + datapoint) % 100 == 0
-                            Optimisers.adjust!(
-                                opt_state,
+                            # Lux extends Optimisers.adjust! to a TrainState: it adjusts the
+                            # optimiser state and keeps the optimiser rule in sync, returning
+                            # the updated TrainState. Learn rate decay from the GNS paper.
+                            gns.train_state = Optimisers.adjust!(
+                                gns.train_state,
                                 Float32(
                                     args.optimizer_learning_rate_stop +
                                     (
@@ -670,7 +671,7 @@ function train_gns!(
                                         args.optimizer_learning_rate_stop
                                     ) * 0.1^((step + datapoint) / 5.0f6),
                                 ),
-                            ) # Learn rate decay from GNS paper
+                            )
                         end
                     end
                     update!(
@@ -806,7 +807,12 @@ function train_gns!(
 
                 if valid_error / ds_valid.meta["n_trajectories"] < min_validation_loss
                     save!(
-                        gns, opt_state, df_train, df_valid, step, joinpath(cp_path, "valid")
+                        gns,
+                        gns.train_state.optimizer_state,
+                        df_train,
+                        df_valid,
+                        step,
+                        joinpath(cp_path, "valid"),
                     )
                     min_validation_loss = valid_error / ds_valid.meta["n_trajectories"]
                     cp_progress = args.checkpoint
@@ -823,7 +829,9 @@ function train_gns!(
                     println("  min_validation_loss: $min_validation_loss")
                     println("  last_validation_loss: $last_validation_loss")
                 end
-                save!(gns, opt_state, df_train, df_valid, step, cp_path)
+                save!(
+                    gns, gns.train_state.optimizer_state, df_train, df_valid, step, cp_path
+                )
                 avg_loss = 0.0f0
                 cp_progress = 0
             end
