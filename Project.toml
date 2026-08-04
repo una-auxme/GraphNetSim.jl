@@ -1,7 +1,7 @@
 name = "GraphNetSim"
 uuid = "5ff66f56-808c-48e7-ac84-dd29877231f8"
 version = "0.1.0"
-authors = ["JK <Josef.Kircher@uni-a.de", "JT <julian.trommer@informatik.uni-augsburg.de>"]
+authors = ["Josef Jouaux <Josef.Kircher@uni-a.de>", "JT <julian.trommer@informatik.uni-augsburg.de>"]
 
 [deps]
 Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
@@ -12,6 +12,7 @@ ComponentArrays = "b0b7db55-cfe3-40fc-9ded-d10e2dbeff66"
 DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
 DataInterpolations = "82cc6244-b520-54b8-b5a6-8a565e85f1d0"
 Distributions = "31c24e10-a181-5473-b8eb-7969acd0382f"
+GPUCompiler = "61eb1bfa-7361-4325-ad38-22787b887f55"
 GraphNetCore = "7809f980-de1b-4f9a-8451-85f041491431"
 HDF5 = "f67ccb44-e63f-5c2f-98bd-6dc0ccc4ba2f"
 JLD2 = "033835bb-8acc-5ee8-8aae-3f567f8a3819"
@@ -37,27 +38,22 @@ Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 Zygote = "e88e6eb3-aa80-5325-afca-941959d7151f"
 cuDNN = "02a925ec-e4fe-4b08-9a7e-0d78e3d38ccd"
 
-# TODO: once GraphNetCore's `dataload` branch is merged into main and a v0.4 is
-# registered, drop this [sources] entry (or repoint rev = "main") and rely on the
-# registered version pinned by the GraphNetCore compat below.
-[sources]
-GraphNetCore = {rev = "dataload", url = "https://github.com/una-auxme/GraphNetCore.jl"}
-
 [compat]
 Adapt = "4.3.0"
 Aqua = "0.8"
 CSV = "0.10.15"
 CUDA = "5.9.6"
+GPUCompiler = "~1.9"
 ChainRulesCore = "1.16.0 - 1"
 ComponentArrays = "0.15"
 DataFrames = "1.6"
 DataInterpolations = "8.6.0"
 Distributions = "0.25"
-GraphNetCore = "0.4"
+GraphNetCore = "0.4.1"
 HDF5 = "0.17"
 JLD2 = "0.6"
 JSON = "0.21"
-JuliaFormatter = "2.2.1"
+JuliaFormatter = "~2.2"
 KernelAbstractions = "0.9.39"
 Lux = "1.13 - 1"
 LuxCUDA = "0.3"
@@ -82,8 +78,7 @@ julia = "1.11"
 
 [extras]
 Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
-Statistics = "10745b16-79ce-11e8-11f9-7d13ad32a3b2"
 Test = "8dfed614-e22c-5e08-85e1-65c5234f0b40"
 
 [targets]
-test = ["Aqua", "Statistics", "Test"]
+test = ["Aqua", "Test"]

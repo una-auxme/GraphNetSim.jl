@@ -12,7 +12,16 @@ include("generate_fixtures.jl")
         @testset "Method ambiguity" begin
             Aqua.test_ambiguities([GraphNetSim])
         end
-        Aqua.test_all(GraphNetSim; ambiguities=false)
+        # Deps that are intentionally not `import`ed from src/, so exclude them from the
+        # stale-deps check:
+        #  - GPUCompiler: deps-only version pin (see Project.toml [compat]), loaded
+        #    transitively via CUDA/Reactant.
+        #  - JuliaFormatter: dev/CI tool invoked as `using JuliaFormatter; format(".")`.
+        Aqua.test_all(
+            GraphNetSim;
+            ambiguities=false,
+            stale_deps=(ignore=[:GPUCompiler, :JuliaFormatter],),
+        )
     end
 
     include("test_normalizer.jl")

@@ -1,6 +1,25 @@
 #
-# Copyright (c) 2026 Josef Kircher, Julian Trommer
+# Copyright (c) 2026 Josef Jouaux, Julian Trommer
 # Licensed under the MIT license. See LICENSE file in the project root for details.
+#
+# This file contains work derived from DeepMind's "learning_to_simulate"
+# (https://github.com/google-deepmind/deepmind-research), modified from the original:
+#
+#   Copyright 2020 DeepMind Technologies Limited. All Rights Reserved.
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+#
+# See THIRD_PARTY_NOTICES.md for details.
 #
 
 module GraphNetSim
@@ -17,7 +36,10 @@ using HDF5
 using Plots
 
 import SciMLBase: ODEProblem, SecondOrderODEProblem
-import OrdinaryDiffEq: OrdinaryDiffEqAlgorithm, Tsit5
+# Newer OrdinaryDiffEq relocated `OrdinaryDiffEqAlgorithm` into its OrdinaryDiffEqCore
+# subpackage; alias it back to the original name so solver-type signatures stay unchanged.
+import OrdinaryDiffEq: OrdinaryDiffEqCore, Tsit5
+const OrdinaryDiffEqAlgorithm = OrdinaryDiffEqCore.OrdinaryDiffEqAlgorithm
 import ProgressMeter: Progress
 
 import Base: @kwdef
@@ -480,7 +502,10 @@ function train_network(opt, ds_path, cp_path; kws...)
     ) # geht mit dims oder dimensions of array
 
     # Populated on a fresh start by the TrainState constructor, restored on resume.
-    opt_state = gns.train_state.optimizer_state
+    # On resume GraphNetCore loads the optimiser state from the (CPU) checkpoint without
+    # moving it to the device, so re-apply `device` here to keep it co-located with the
+    # (GPU) parameters — otherwise Optimisers.update mixes CPU/GPU arrays.
+    opt_state = device(gns.train_state.optimizer_state)
 
     Lux.trainmode(gns.train_state.states)
 
@@ -928,7 +953,9 @@ function eval_network(
         args.mps,
         args.layer_size,
         args.hidden_layers,
-        nothing,
+        # v0.4 load() builds a Lux TrainState that requires a real optimiser even for
+        # eval/extrapolate (its optimiser state is unused here); pass a throwaway Adam.
+        Optimisers.Adam(),
         device,
         args.use_valid ? joinpath(cp_path, "valid") : cp_path,
     )
@@ -1241,7 +1268,9 @@ function extrapolate_network(
         args.mps,
         args.layer_size,
         args.hidden_layers,
-        nothing,
+        # v0.4 load() builds a Lux TrainState that requires a real optimiser even for
+        # eval/extrapolate (its optimiser state is unused here); pass a throwaway Adam.
+        Optimisers.Adam(),
         device,
         args.use_valid ? joinpath(cp_path, "valid") : cp_path,
     )
