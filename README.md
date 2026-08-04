@@ -1,5 +1,9 @@
 # GraphNetSim.jl
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/una-auxme/GraphNetSim.jl/main/docs/src/assets/logo.svg" alt="GraphNetSim.jl logo" width="200"/>
+</p>
+
 [![Docs](https://img.shields.io/badge/docs-dev-blue.svg)](https://una-auxme.github.io/GraphNetSim.jl/dev)
 [![ColPrac: Contributor's Guide on Collaborative Practices for Community Packages](https://img.shields.io/badge/ColPrac-Contributor's%20Guide-blueviolet)](https://github.com/SciML/ColPrac)
 [![Code Style: Blue](https://img.shields.io/badge/code%20style-blue-4495d1.svg)](https://github.com/JuliaDiff/BlueStyle)
