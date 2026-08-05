@@ -1,6 +1,25 @@
 #
-# Copyright (c) 2026 Josef Kircher, Julian Trommer
+# Copyright (c) 2026 Josef Jouaux, Julian Trommer
 # Licensed under the MIT license. See LICENSE file in the project root for details.
+#
+# This file contains work derived from DeepMind's "learning_to_simulate"
+# (https://github.com/google-deepmind/deepmind-research), modified from the original:
+#
+#   Copyright 2020 DeepMind Technologies Limited. All Rights Reserved.
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+#
+# See THIRD_PARTY_NOTICES.md for details.
 #
 
 module GraphNetSim
@@ -17,7 +36,10 @@ using HDF5
 using Plots
 
 import SciMLBase: ODEProblem, SecondOrderODEProblem
-import OrdinaryDiffEq: OrdinaryDiffEqAlgorithm, Tsit5, Euler
+# Newer OrdinaryDiffEq relocated `OrdinaryDiffEqAlgorithm` into its OrdinaryDiffEqCore
+# subpackage; alias it back to the original name so solver-type signatures stay unchanged.
+import OrdinaryDiffEq: OrdinaryDiffEqCore, Tsit5, Euler
+const OrdinaryDiffEqAlgorithm = OrdinaryDiffEqCore.OrdinaryDiffEqAlgorithm
 import ProgressMeter: Progress
 
 import Base: @kwdef
@@ -26,6 +48,10 @@ import HDF5: h5open, create_group, open_group
 import ProgressMeter: next!, update!, finish!
 import Statistics: mean
 import Printf: @sprintf
+# GraphNetCore >= 0.4 stores the model/params/state in a Lux.Training.TrainState
+# (immutable), so parameter updates go through Setfield's @set! rather than
+# reassigning a `gns.ps` field.
+import Setfield: @set!
 
 include("utils.jl")
 include("graph.jl")
@@ -35,6 +61,7 @@ include("dataset.jl")
 include("visualize.jl")
 include("config.jl")
 include("../convert_csv/csvToh5.jl")
+include("../convert_csv/vtkToh5.jl")
 
 export SingleShooting, MultipleShooting, DerivativeTraining, BatchingStrategy
 
@@ -43,7 +70,7 @@ export train_network,
 export init_train_step, train_step, validation_step, batchTrajectory
 # export prepare_training, get_delta
 export visualize, visualize_eval
-export csv_to_hdf5
+export csv_to_hdf5, vtk_to_hdf5
 export ModelConfig, save_model_config, load_model_config
 
 """
@@ -90,7 +117,8 @@ Configuration structure for training and evaluating Graph Neural Network simulat
 - `solver_valid::OrdinaryDiffEqAlgorithm=Tsit5()`: ODE solver for validation rollouts
 - `solver_valid_dt::Union{Nothing,Float32}=nothing`: Fixed timestep for validation solver
 - `reset_valid::Bool=false`: Reset validation after loading checkpoint
-- `save_step::Bool=false`: Save loss at every step (can create large log files)
+- `save_step::Bool=false`: No-op since GraphNetCore >= 0.4 (the per-step `df_step`
+  DataFrame was removed upstream). Kept for backwards-compatible `Args` construction.
 """
 @kwdef mutable struct Args
     mps::Integer = 15
@@ -198,7 +226,7 @@ function calc_norms(dataset, device, args)
     n_norms = Dict{String,Union{NormaliserOffline,NormaliserOnline}}()
     o_norms = Dict{String,Union{NormaliserOffline,NormaliserOnline}}()
 
-    e_norms = NormaliserOnline(dataset.meta["dims"] + 1, device)
+    e_norms = NormaliserOnline(Float32, dataset.meta["dims"] + 1, device)
 
     input_features = dataset.meta["input_features"]
     output_features = dataset.meta["output_features"]
@@ -217,9 +245,9 @@ function calc_norms(dataset, device, args)
             Base, Symbol(uppercasefirst(dataset.meta["features"][feature]["dtype"]))
         ) == Bool
             quantities += 1
-            n_norms[feature] = NormaliserOfflineMinMax(0.0f0, 1.0f0)
+            n_norms[feature] = NormaliserOfflineMinMax(0.0f0, 1.0f0, device)
             if feature in output_features
-                o_norms[feature] = NormaliserOfflineMinMax(0.0f0, 1.0f0)
+                o_norms[feature] = NormaliserOfflineMinMax(0.0f0, 1.0f0, device)
             end
         elseif getfield(
             Base, Symbol(uppercasefirst(dataset.meta["features"][feature]["dtype"]))
@@ -243,6 +271,7 @@ function calc_norms(dataset, device, args)
                         1.0f0,
                         Float32(dataset.meta["features"][feature]["target_min"]),
                         Float32(dataset.meta["features"][feature]["target_max"]),
+                        device,
                     )
                     if feature in output_features
                         o_norms[feature] = NormaliserOfflineMinMax(
@@ -250,6 +279,7 @@ function calc_norms(dataset, device, args)
                             1.0f0,
                             Float32(dataset.meta["features"][feature]["target_min"]),
                             Float32(dataset.meta["features"][feature]["target_max"]),
+                            device,
                         )
                     end
                 end
@@ -264,11 +294,11 @@ function calc_norms(dataset, device, args)
             if args.norm_type == :online
                 if feature in input_features
                     n_norms[feature] = NormaliserOnline(
-                        feature_dim, device; max_acc=Float32(args.norm_steps)
+                        Float32, feature_dim, device; max_acc=Float32(args.norm_steps)
                     )
                 elseif feature in output_features
                     o_norms[feature] = NormaliserOnline(
-                        feature_dim, device; max_acc=Float32(args.norm_steps)
+                        Float32, feature_dim, device; max_acc=Float32(args.norm_steps)
                     )
                 end
             elseif args.norm_type == :minmax
@@ -290,6 +320,7 @@ function calc_norms(dataset, device, args)
                             Float32(dataset.meta["features"][feature]["data_max"]),
                             Float32(dataset.meta["features"][feature]["target_min"]),
                             Float32(dataset.meta["features"][feature]["target_max"]),
+                            device,
                         )
                     elseif feature in output_features
                         if haskey(dataset.meta["features"][feature], "output_min") &&
@@ -299,10 +330,14 @@ function calc_norms(dataset, device, args)
                                 Float32(dataset.meta["features"][feature]["output_max"]),
                                 Float32(dataset.meta["features"][feature]["target_min"]),
                                 Float32(dataset.meta["features"][feature]["target_max"]),
+                                device,
                             )
                         else
                             o_norms[feature] = NormaliserOnline(
-                                feature_dim, device; max_acc=Float32(args.norm_steps)
+                                Float32,
+                                feature_dim,
+                                device;
+                                max_acc=Float32(args.norm_steps),
                             )
                         end
                     end
@@ -311,6 +346,7 @@ function calc_norms(dataset, device, args)
                         n_norms[feature] = NormaliserOfflineMinMax(
                             Float32(dataset.meta["features"][feature]["data_min"]),
                             Float32(dataset.meta["features"][feature]["data_max"]),
+                            device,
                         )
                     elseif feature in output_features
                         if haskey(dataset.meta["features"][feature], "output_min") &&
@@ -318,10 +354,14 @@ function calc_norms(dataset, device, args)
                             o_norms[feature] = NormaliserOfflineMinMax(
                                 Float32(dataset.meta["features"][feature]["output_min"]),
                                 Float32(dataset.meta["features"][feature]["output_max"]),
+                                device,
                             )
                         else
                             o_norms[feature] = NormaliserOnline(
-                                feature_dim, device; max_acc=Float32(args.norm_steps)
+                                Float32,
+                                feature_dim,
+                                device;
+                                max_acc=Float32(args.norm_steps),
                             )
                         end
                     end
@@ -498,7 +538,9 @@ function train_network(opt, ds_path, cp_path; kws...)
         outputs += ds_train.meta["features"][tf]["dim"]
     end
 
-    gns, opt_state, df_train, df_valid, df_step = load(
+    # GraphNetCore >= 0.4: load() returns (gns, df_train, df_valid). The optimiser
+    # state now lives inside gns.train_state (df_step was dropped upstream).
+    gns, df_train, df_valid = load(
         quantities,
         typeof(dims) <: AbstractArray ? length(dims) : dims,
         e_norms,
@@ -513,34 +555,27 @@ function train_network(opt, ds_path, cp_path; kws...)
         cp_path,
     ) # geht mit dims oder dimensions of array
 
-    if isnothing(opt_state)
-        opt_state = Optimisers.setup(opt, gns.ps)
-    end
+    # The optimiser state lives inside `gns.train_state` (populated on a fresh start by the
+    # TrainState constructor, restored on resume). On resume GraphNetCore loads it from the
+    # (CPU) checkpoint without moving it to the device, so re-`device` it in place here to keep
+    # it co-located with the (GPU) parameters.
+    @set! gns.train_state.optimizer_state = device(gns.train_state.optimizer_state)
 
-    Lux.trainmode(gns.st)
+    Lux.trainmode(gns.train_state.states)
 
     @info "Model built!"
     print("Compiling code...")
     print("\u1b[1G")
 
     min_validation_loss = train_gns!(
-        gns,
-        opt_state,
-        ds_train,
-        ds_valid,
-        df_train,
-        df_valid,
-        df_step,
-        device,
-        cp_path,
-        args,
+        gns, ds_train, ds_valid, df_train, df_valid, device, cp_path, args
     )
 
     return min_validation_loss
 end
 
 """
-    train_gns!(gns::GraphNetwork, opt_state, ds_train::Dataset, ds_valid::Dataset, df_train, df_valid, df_step, device::Function, cp_path::String, args::Args)
+    train_gns!(gns::GraphNetwork, ds_train::Dataset, ds_valid::Dataset, df_train, df_valid, device::Function, cp_path::String, args::Args)
 
 Execute the main training loop for a Graph Neural Network simulator.
 
@@ -549,13 +584,11 @@ Supports various training strategies (derivative, batching) and handles
 feature noise injection, gradient accumulation over multiple time steps, and online normalizer updates.
 
 ## Arguments
-- `gns::GraphNetwork`: Graph network model containing parameters and normalizers.
-- `opt_state`: Optimizer state from Optimisers.jl.
+- `gns::GraphNetwork`: Graph network model containing parameters, optimiser state, and normalizers.
 - `ds_train::Dataset`: Training dataset with trajectories and metadata.
 - `ds_valid::Dataset`: Validation dataset for monitoring training progress.
 - `df_train`: DataFrame storing training loss at checkpoints.
 - `df_valid`: DataFrame storing best validation losses.
-- `df_step`: DataFrame storing loss at each step (if save_step enabled).
 - `device::Function`: Device placement function (cpu_device or gpu_device).
 - `cp_path::String`: Path for saving checkpoints and logs.
 - `args::Args`: Configuration including optimizer, strategy, and training parameters.
@@ -584,12 +617,10 @@ For each training step:
 """
 function train_gns!(
     gns::GraphNetwork,
-    opt_state,
     ds_train::Dataset,
     ds_valid::Dataset,
     df_train,
     df_valid,
-    df_step,
     device::Function,
     cp_path,
     args::Args,
@@ -666,21 +697,27 @@ function train_gns!(
                 )
                 gs, losses = train_step(args.training_strategy, train_tuple)
                 if !isnothing(args.on_grad)
-                    args.on_grad(step + datapoint, gs, gns.ps, sum(losses))
+                    args.on_grad(
+                        step + datapoint, gs, gns.train_state.parameters, sum(losses)
+                    )
                 end
                 tmp_loss += sum(losses)
-                if args.save_step
-                    push!(df_step, [datapoint, sum(losses)])
-                end
                 if step + datapoint > args.norm_steps
                     for i in eachindex(gs)
-                        opt_state, ps = Optimisers.update(opt_state, gns.ps, gs[i])
-                        gns.ps = ps
+                        # The optimiser state is intrinsic to the TrainState; apply_gradients
+                        # runs `Optimisers.update` on it and writes the updated parameters +
+                        # optimiser state back into `gns.train_state` (no separate opt_state).
+                        gns.train_state = Lux.Training.apply_gradients(
+                            gns.train_state, gs[i]
+                        )
 
                         if !isnothing(args.optimizer_learning_rate_stop) &&
                             (step + datapoint) % 100 == 0
-                            Optimisers.adjust!(
-                                opt_state,
+                            # Lux extends Optimisers.adjust! to a TrainState: it adjusts the
+                            # optimiser state and keeps the optimiser rule in sync, returning
+                            # the updated TrainState. Learn rate decay from the GNS paper.
+                            gns.train_state = Optimisers.adjust!(
+                                gns.train_state,
                                 Float32(
                                     args.optimizer_learning_rate_stop +
                                     (
@@ -688,7 +725,7 @@ function train_gns!(
                                         args.optimizer_learning_rate_stop
                                     ) * 0.1^((step + datapoint) / 5.0f6),
                                 ),
-                            ) # Learn rate decay from GNS paper
+                            )
                         end
                     end
                     update!(
@@ -818,18 +855,18 @@ function train_gns!(
                     _restore_online_normalisers!(frozen_state)
                 end
 
+                # GraphNetCore >= 0.4: save! no longer appends to df_valid, so record
+                # the validation loss here (once per checkpoint).
+                push!(df_valid, [step, valid_error / ds_valid.meta["n_trajectories"]])
+
                 if valid_error / ds_valid.meta["n_trajectories"] < min_validation_loss
-                    # push!(df_valid, [step, valid_error / ds_valid.meta["n_trajectories"]])
                     save!(
                         gns,
-                        opt_state,
+                        gns.train_state.optimizer_state,
                         df_train,
                         df_valid,
-                        df_step,
                         step,
-                        valid_error / ds_valid.meta["n_trajectories"],
-                        joinpath(cp_path, "valid");
-                        is_training=false,
+                        joinpath(cp_path, "valid"),
                     )
                     min_validation_loss = valid_error / ds_valid.meta["n_trajectories"]
                     cp_progress = args.checkpoint
@@ -847,15 +884,7 @@ function train_gns!(
                     println("  last_validation_loss: $last_validation_loss")
                 end
                 save!(
-                    gns,
-                    opt_state,
-                    df_train,
-                    df_valid,
-                    df_step,
-                    step,
-                    valid_error / ds_valid.meta["n_trajectories"],
-                    cp_path;
-                    is_training=false,
+                    gns, gns.train_state.optimizer_state, df_train, df_valid, step, cp_path
                 )
                 avg_loss = 0.0f0
                 cp_progress = 0
@@ -980,7 +1009,7 @@ function eval_network(
         outputs += ds_test.meta["features"][tf]["dim"]
     end
 
-    gns, _, _, _ = load(
+    gns, _, _ = load(
         quantities,
         typeof(dims) <: AbstractArray ? length(dims) : dims,
         e_norms,
@@ -990,12 +1019,14 @@ function eval_network(
         args.mps,
         args.layer_size,
         args.hidden_layers,
-        nothing,
+        # v0.4 load() builds a Lux TrainState that requires a real optimiser even for
+        # eval/extrapolate (its optimiser state is unused here); pass a throwaway Adam.
+        Optimisers.Adam(),
         device,
         args.use_valid ? joinpath(cp_path, "valid") : cp_path,
     )
 
-    Lux.testmode(gns.st)
+    Lux.testmode(gns.train_state.states)
 
     # clear_log(1, false)
     @info "Model built!"
@@ -1316,7 +1347,7 @@ function extrapolate_network(
         outputs += ds_test.meta["features"][tf]["dim"]
     end
 
-    gns, _, _, _ = load(
+    gns, _, _ = load(
         quantities,
         typeof(dims) <: AbstractArray ? length(dims) : dims,
         e_norms,
@@ -1326,12 +1357,14 @@ function extrapolate_network(
         args.mps,
         args.layer_size,
         args.hidden_layers,
-        nothing,
+        # v0.4 load() builds a Lux TrainState that requires a real optimiser even for
+        # eval/extrapolate (its optimiser state is unused here); pass a throwaway Adam.
+        Optimisers.Adam(),
         device,
         args.use_valid ? joinpath(cp_path, "valid") : cp_path,
     )
 
-    Lux.testmode(gns.st)
+    Lux.testmode(gns.train_state.states)
 
     @info "Model built!"
 
@@ -1560,10 +1593,11 @@ Temporarily disable accumulation in every `NormaliserOnline` attached to `gns`. 
 a vector of `(normaliser, saved_num_accumulations)` pairs that `_restore_online_normalisers!`
 can use to undo the freeze.
 
-Implementation detail: the forward call `(n::NormaliserOnline)(F, acc)` only accumulates
-when `acc && n.num_accumulations < n.max_accumulations`. Setting
+Implementation detail: in GraphNetCore >= 0.4 the forward call `(n::NormaliserOnline)(F)`
+only accumulates when `n.num_accumulations < n.max_accumulations`. Setting
 `num_accumulations := max_accumulations` short-circuits the branch without changing the
-public call path in `build_graph`.
+public call path in `build_graph`. (GraphNetCore also ships `set_training!` for the same
+purpose; we keep this local save/restore helper to snapshot and revert exact counts.)
 """
 function _freeze_online_normalisers!(gns::GraphNetwork)
     saved = Vector{Tuple{GraphNetCore.NormaliserOnline,Float32}}()

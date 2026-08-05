@@ -1,6 +1,25 @@
 #
-# Copyright (c) 2026 Josef Kircher, Julian Trommer
+# Copyright (c) 2026 Josef Jouaux, Julian Trommer
 # Licensed under the MIT license. See LICENSE file in the project root for details.
+#
+# This file contains work derived from DeepMind's "learning_to_simulate"
+# (https://github.com/google-deepmind/deepmind-research), modified from the original:
+#
+#   Copyright 2020 DeepMind Technologies Limited. All Rights Reserved.
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+#
+# See THIRD_PARTY_NOTICES.md for details.
 #
 
 import ProgressMeter: ProgressUnknown
@@ -71,7 +90,7 @@ function rollout(
         interval,
         (
             gns,
-            gns.ps,
+            gns.train_state.parameters,
             output_fields,
             meta,
             target_fields,
@@ -239,7 +258,7 @@ returns time derivatives (velocities and accelerations). Includes optional progr
 
 ## Notes
 - Used during training phase with gradient computation enabled.
-- Network state `gns.st` is updated in-place.
+- Network state (`gns.train_state.states`) is read-only here; the model layers are stateless under a forward pass.
 - Denormalization uses normalizers from `gns.o_norm` dictionary.
 """
 function ode_step(
@@ -252,8 +271,10 @@ function ode_step(
     graph = build_graph(gns, x.x, x.dx, meta, node_type, mask, device)
     # end
 
-    output, st = gns.model(graph, ps, gns.st)
-    gns.st = st
+    # GraphNetCore >= 0.4: model/state live inside the TrainState. Our layers
+    # (Dense + LayerNorm) are stateless under a forward pass, so the returned
+    # state equals the input state — no write-back needed (previously `gns.st = st`).
+    output, _ = gns.train_state.model(graph, ps, gns.train_state.states)
 
     indices = [meta["features"][tf]["dim"] for tf in target_fields]
     buf = Zygote.Buffer(output)
@@ -311,7 +332,7 @@ potential future inference optimizations.
 
 ## Notes
 - Used during evaluation/inference phase without gradient computation.
-- Network state `gns.st` is updated in-place.
+- Network state (`gns.train_state.states`) is read-only here; the model layers are stateless under a forward pass.
 - Denormalization uses normalizers from `gns.o_norm` dictionary.
 - Future optimization target: could implement checkpointing or reduced-precision compute here.
 """
@@ -322,8 +343,10 @@ function ode_step_eval(
 ) # TODO if rework is finished only one ode_step function is needed
     graph = build_graph(gns, x.x, x.dx, meta, node_type, mask, device)
 
-    output, st = gns.model(graph, ps, gns.st)
-    gns.st = st
+    # GraphNetCore >= 0.4: model/state live inside the TrainState. Our layers
+    # (Dense + LayerNorm) are stateless under a forward pass, so the returned
+    # state equals the input state — no write-back needed (previously `gns.st = st`).
+    output, _ = gns.train_state.model(graph, ps, gns.train_state.states)
     indices = [meta["features"][tf]["dim"] for tf in target_fields]
     buf = Zygote.Buffer(output)
     for i in 1:length(output_fields)
