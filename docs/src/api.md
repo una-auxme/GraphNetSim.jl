@@ -13,6 +13,14 @@ GraphNetSim.Args
 GraphNetSim.Dataset
 ```
 
+### Model Configuration
+
+```@docs
+GraphNetSim.ModelConfig
+GraphNetSim.save_model_config
+GraphNetSim.load_model_config
+```
+
 #### Dataset Constructors
 
 ```@docs
@@ -86,6 +94,7 @@ GraphNetSim.BatchingStrategy
 GraphNetSim.data_minmax
 GraphNetSim.data_meanstd
 GraphNetSim.der_minmax
+GraphNetSim.update_meta!
 ```
 
 ## Graph Construction and ODE Solving
@@ -115,6 +124,7 @@ GraphNetSim.MLUtils.getobs!
 
 ```@docs
 GraphNetSim.csv_to_hdf5
+GraphNetSim.vtk_to_hdf5
 ```
 
 ## Visualization
@@ -123,4 +133,5 @@ GraphNetSim.csv_to_hdf5
 
 ```@docs
 visualize
+visualize_eval
 ```

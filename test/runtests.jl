@@ -24,6 +24,7 @@ include("generate_fixtures.jl")
         )
     end
 
+    include("test_converters.jl")
     include("test_normalizer.jl")
     include("test_datasets.jl")
 end

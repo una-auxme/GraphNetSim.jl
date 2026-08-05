@@ -176,13 +176,13 @@ This package is inspired by the Graph Network-based Simulator (GNS) framework:
 
 ## License and Attribution
 
-GraphNetSim.jl is distributed under the [MIT License](LICENSE).
+GraphNetSim.jl is distributed under the [MIT License](https://github.com/una-auxme/GraphNetSim.jl/blob/main/LICENSE).
 
 It includes / is derived from portions of DeepMind's
 [`learning_to_simulate`](https://github.com/google-deepmind/deepmind-research/tree/master/learning_to_simulate)
 (Copyright 2020 DeepMind Technologies Limited), which is licensed under the Apache License,
 Version 2.0. The attribution and the full Apache 2.0 license text are provided in
-[`THIRD_PARTY_NOTICES.md`](THIRD_PARTY_NOTICES.md).
+[`THIRD_PARTY_NOTICES.md`](https://github.com/una-auxme/GraphNetSim.jl/blob/main/THIRD_PARTY_NOTICES.md).
 
 ## Contributing
 

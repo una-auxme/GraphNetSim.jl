@@ -60,6 +60,7 @@ include("dataset.jl")
 include("visualize.jl")
 include("config.jl")
 include("../convert_csv/csvToh5.jl")
+include("../convert_csv/vtkToh5.jl")
 
 export SingleShooting, MultipleShooting, DerivativeTraining, BatchingStrategy
 
@@ -68,7 +69,7 @@ export train_network,
 export init_train_step, train_step, validation_step, batchTrajectory
 # export prepare_training, get_delta
 export visualize, visualize_eval
-export csv_to_hdf5
+export csv_to_hdf5, vtk_to_hdf5
 export ModelConfig, save_model_config, load_model_config
 
 """
