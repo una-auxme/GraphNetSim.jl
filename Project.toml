@@ -1,7 +1,7 @@
 name = "GraphNetSim"
 uuid = "5ff66f56-808c-48e7-ac84-dd29877231f8"
 version = "0.1.0"
-authors = ["Josef Jouaux <Josef.Kircher@uni-a.de>", "JT <julian.trommer@informatik.uni-augsburg.de>"]
+authors = ["Josef Jouaux <Josef.Kircher@uni-a.de>", "JT <julian.trommer@uni-a.de>"]
 
 [deps]
 Adapt = "79e6a3ab-5dfb-504d-930d-738a2a938a0e"
@@ -51,7 +51,7 @@ ComponentArrays = "0.15"
 DataFrames = "1.6"
 DataInterpolations = "8.6.0"
 Distributions = "0.25"
-GraphNetCore = "0.4.1"
+GraphNetCore = "0.4.2"
 HDF5 = "0.17"
 JLD2 = "0.6"
 JSON = "0.21"
