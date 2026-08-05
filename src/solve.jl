@@ -348,13 +348,22 @@ function ode_step_eval(
     # state equals the input state — no write-back needed (previously `gns.st = st`).
     output, _ = gns.train_state.model(graph, ps, gns.train_state.states)
     indices = [meta["features"][tf]["dim"] for tf in target_fields]
-    buf = Zygote.Buffer(output)
-    for i in 1:length(output_fields)
-        buf[(sum(indices[1:(i - 1)]) + 1):sum(indices[1:i]), :] = inverse_data(
-            gns.o_norm[output_fields[i]],
-            output[(sum(indices[1:(i - 1)]) + 1):sum(indices[1:i]), :],
-        )
-    end
+
+    # Inference-only path: `rollout` solves an `ODEProblem{false}` with no sensealg, so this RHS is
+    # never differentiated. Denormalize the output slices directly instead of routing them through a
+    # `Zygote.Buffer` + `copy` (as the differentiated training `ode_step` must) — that AD bookkeeping
+    # is dead weight in a hot loop run ~`trajectory_length` times per trajectory. Values are identical
+    # to the buffer version; for a single output field (the common case) `reduce(vcat, [slice])`
+    # returns the slice untouched, so no concat/copy happens at all.
+    dx = reduce(
+        vcat,
+        [
+            inverse_data(
+                gns.o_norm[output_fields[i]],
+                output[(sum(indices[1:(i - 1)]) + 1):sum(indices[1:i]), :],
+            ) for i in 1:length(output_fields)
+        ],
+    )
 
     @ignore_derivatives begin
         if !isnothing(pr)
@@ -362,7 +371,7 @@ function ode_step_eval(
         end
     end
 
-    return device(ComponentArray(; x=x.dx, dx=copy(buf) .* val_mask)) # TODO check why output is used here directly
+    return device(ComponentArray(; x=x.dx, dx=dx .* val_mask))
 end
 
 """

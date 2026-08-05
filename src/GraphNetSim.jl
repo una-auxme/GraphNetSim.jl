@@ -144,6 +144,7 @@ Configuration structure for training and evaluating Graph Neural Network simulat
     optimizer_learning_rate_stop::Union{Nothing,Float32} = nothing
     norm_type::Symbol = :online
     history_size::Int = 1
+    neighbor_backend::Symbol = :pointneighbors
     save_step::Bool = false
     on_grad::Union{Nothing,Function} = nothing
     on_valid::Union{Nothing,Function} = nothing
@@ -516,12 +517,14 @@ function train_network(opt, ds_path, cp_path; kws...)
     ds_train.meta["noise_stddevs"] = args.noise_stddevs
     ds_train.meta["device"] = device
     ds_train.meta["history_size"] = args.history_size
+    ds_train.meta["neighbor_backend"] = args.neighbor_backend
     ds_valid = Dataset(:valid, ds_path, args)
     ds_valid.meta["types_updated"] = args.types_updated
     ds_valid.meta["types_noisy"] = args.types_noisy
     ds_valid.meta["noise_stddevs"] = args.noise_stddevs
     ds_valid.meta["device"] = device
     ds_valid.meta["history_size"] = args.history_size
+    ds_valid.meta["neighbor_backend"] = args.neighbor_backend
     ds_valid.meta["training_strategy"] = nothing
     _validate_history_meta(ds_train.meta, args)
 
@@ -991,6 +994,7 @@ function eval_network(
     ds_test = Dataset(:test, ds_path, args)
     ds_test.meta["device"] = device
     ds_test.meta["history_size"] = args.history_size
+    ds_test.meta["neighbor_backend"] = args.neighbor_backend
     ds_test.meta["training_strategy"] = nothing
     _validate_history_meta(ds_test.meta, args)
 
@@ -1330,6 +1334,7 @@ function extrapolate_network(
     ds_test = Dataset(:test, ds_path, args)
     ds_test.meta["device"] = device
     ds_test.meta["history_size"] = args.history_size
+    ds_test.meta["neighbor_backend"] = args.neighbor_backend
     ds_test.meta["training_strategy"] = nothing
     _validate_history_meta(ds_test.meta, args)
 
