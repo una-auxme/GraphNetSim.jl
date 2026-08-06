@@ -340,20 +340,26 @@ Returns normalized relative displacements and distances.
 - Supports arbitrary dimension (2D, 3D, etc.).
 """
 function point_neighbor_ns(pos::CuArray, radius::Float32)
-    system = pos#[:,mask]
+    system = pos
     min_corner = minimum(pos; dims=2)
     max_corner = maximum(pos; dims=2)
     nhs = GridNeighborhoodSearch{size(pos, 1)}(;
         search_radius=radius,
         n_points=size(pos, 2),
         cell_list=FullGridCellList(; min_corner, max_corner, search_radius=radius),
+        update_strategy=ParallelUpdate(),
     )
-    initialize!(nhs, Array(system), Array(pos))
-    backend = CUDABackend()
-    # Simple example: just count the neighbors of each particle
-    n_neighbors_gpu = CuArray(zeros(Int, size(pos, 2)))
-    nhs_gpu = adapt(backend, nhs)
+    # Build the cell list on-device: adapt the (empty) nhs to the GPU, then `initialize!` with the
+    # CuArray positions so PointNeighbors dispatches to the parallel atomic init
+    # (`default_backend(::CuArray)` => GPU; `ParallelUpdate`'s `initialize_grid!` is the parallel one).
+    # Avoids the GPU->CPU->GPU round trip of the old `initialize!(nhs, Array(...), Array(...))` +
+    # adapt-back, whose serial CPU cell-list build was ~16 ms at 33k particles vs ~2 ms here (~8x).
+    # Edge set is identical; edge order may differ (atomic push), perturbing the downstream scatter
+    # by ~eps only. Benchmarked in example/RuntimeBenchmark/.
+    nhs_gpu = adapt(CUDABackend(), nhs)
+    initialize!(nhs_gpu, pos, pos)
 
+    n_neighbors_gpu = CuArray(zeros(Int, size(pos, 2)))
     foreach_point_neighbor(system, pos, nhs_gpu) do i, _, _, _
         n_neighbors_gpu[i] += 1
     end

@@ -1108,7 +1108,13 @@ function eval_network!(
 
     test_loader = DataLoader(ds_test; batchsize=-1, buffer=false, parallel=true)
 
+    # Optional cap on the number of evaluated trajectories (default: all). Lets bounded eval and
+    # A/B timing runs stay tractable — a full rollout over every test trajectory is very slow.
+    # NB: bare `parse` resolves to `JSON.parse` in this module (see dataset.jl), so qualify Base.parse.
+    n_eval_traj = Base.parse(Int, get(ENV, "GNS_EVAL_NTRAJ", string(typemax(Int))))
+
     for (ti, data) in enumerate(test_loader)
+        ti > n_eval_traj && break
         target_features = ds_test.meta["solver_target_features"]
         output_features = ds_test.meta["output_features"]
         println("Rollout trajectory $ti...")
