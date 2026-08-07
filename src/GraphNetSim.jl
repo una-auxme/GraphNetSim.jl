@@ -60,8 +60,8 @@ include("rollout_history.jl")
 include("dataset.jl")
 include("visualize.jl")
 include("config.jl")
-include("../convert_csv/csvToh5.jl")
-include("../convert_csv/vtkToh5.jl")
+include("import_data/csvToh5.jl")
+include("import_data/vtkToh5.jl")
 
 export SingleShooting, MultipleShooting, DerivativeTraining, BatchingStrategy
 
