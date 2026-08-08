@@ -1,6 +1,25 @@
 #
-# Copyright (c) 2026 Josef Kircher, Julian Trommer
+# Copyright (c) 2026 Josef Jouaux, Julian Trommer
 # Licensed under the MIT license. See LICENSE file in the project root for details.
+#
+# This file contains work derived from DeepMind's "learning_to_simulate"
+# (https://github.com/google-deepmind/deepmind-research), modified from the original:
+#
+#   Copyright 2020 DeepMind Technologies Limited. All Rights Reserved.
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+#
+# See THIRD_PARTY_NOTICES.md for details.
 #
 
 ## new
@@ -54,7 +73,7 @@ then loads trajectories and merges metadata with provided arguments.
 function Dataset(datafile::String, metafile::String, args)
     if !isfile(datafile)
         throw(ArgumentError("Invalid datafile: $datafile"))
-    elseif !endswith(datafile, ".jld2") || !endswith(datafile, ".h5")
+    elseif !endswith(datafile, ".jld2") && !endswith(datafile, ".h5")
         throw(
             ArgumentError(
                 "Invalid file format for datafile: $datafile. Possible formats are [.jld2, .h5]",
@@ -77,6 +96,7 @@ function Dataset(datafile::String, metafile::String, args)
     meta["keys_trajectories"] = keys_traj
     merge!(meta, Dict(String(key) => getfield(args, key) for key in propertynames(args)))
 
+    validate_type_args(meta)
     Dataset(meta, datafile, ReentrantLock())
 end
 
@@ -122,6 +142,7 @@ function Dataset(split::Symbol, path::String, args)
     meta["keys_trajectories"] = keys_traj
     merge!(meta, Dict(String(key) => getfield(args, key) for key in propertynames(args)))
 
+    validate_type_args(meta)
     Dataset(meta, datafile, ReentrantLock())
 end
 
@@ -176,6 +197,42 @@ function keystraj(datafile::String)
     close(file)
 
     return keys_traj
+end
+
+"""
+    validate_type_args(meta::Dict{String,Any})
+
+Check that `types_updated` and `types_noisy` are consistent with the node types
+present in the dataset.
+
+- `types_updated` containing a type not in the dataset throws an `ArgumentError`
+  because the resulting mask would be empty, silently producing zero gradient signal.
+- `types_noisy` containing a type not in the dataset issues a `@warn` because
+  using `[0]` as a "no noise" sentinel is a common intentional pattern.
+"""
+function validate_type_args(meta::Dict{String,Any})
+    type_min = Int(meta["features"]["node_type"]["data_min"])
+    type_max = Int(meta["features"]["node_type"]["data_max"])
+    valid_types = type_min:type_max
+
+    unknown_updated = filter(t -> t ∉ valid_types, meta["types_updated"])
+    if !isempty(unknown_updated)
+        throw(
+            ArgumentError(
+                "types_updated contains type(s) $unknown_updated that are not present " *
+                "in the dataset (valid types: $(collect(valid_types))). " *
+                "This would produce an empty particle mask and no gradient signal.",
+            ),
+        )
+    end
+
+    unknown_noisy = filter(t -> t ∉ valid_types, meta["types_noisy"])
+    if !isempty(unknown_noisy)
+        @warn "types_noisy contains type(s) $unknown_noisy not present in the dataset " *
+            "(valid types: $(collect(valid_types))). " *
+            "No noise will be applied. If this is intentional (e.g. types_noisy=[0] " *
+            "as a 'no noise' sentinel), you can ignore this warning."
+    end
 end
 
 MLUtils.numobs(ds::Dataset) = ds.meta["n_trajectories"]
@@ -612,27 +669,9 @@ function create_edges(traj_dict::Dict{String,Any}, meta::Dict{String,Any})
     for i in axes(position)[3]
         fluid_position = position[:, traj_dict["mask"], i]
         current_position = position[:, :, i]
-        if device == cpu_device()
-            cur_pos_cpu = cpu_device()(current_position)
-            tree = KDTree(cur_pos_cpu; reorder=false)
-            receivers_list = inrange(
-                tree, cur_pos_cpu, Float32(meta["default_connectivity_radius"]), false
-            )
-            sender = vcat(
-                [repeat([i], length(j)) for (i, j) in enumerate(receivers_list)]...
-            )
-            receiver = vcat(receivers_list...)
-            rel_displacement =
-                (current_position[:, receiver] - current_position[:, sender]) ./
-                Float32(meta["default_connectivity_radius"])
-            rel_dist_norm = sqrt.(sum(abs2, rel_displacement; dims=1))
-        else
-            sender, receiver, rel_displacement, rel_dist_norm = point_neighbor_ns(
-                current_position,
-                Float32(meta["default_connectivity_radius"]),
-                traj_dict["mask"],
-            )
-        end
+        sender, receiver, rel_displacement, rel_dist_norm = point_neighbor_ns(
+            current_position, Float32(meta["default_connectivity_radius"])
+        )
         # if meta["features"]["node_type"]["data_max"] - meta["features"]["node_type"]["data_min"] != 0
         #     sender_old, receiver_old, sender, receiver, _, b_particle = check_and_delete_filtered(sender, receiver, size(fluid_position, 2), true)
         #     rel_displacement = (current_position[:, receiver_old] - current_position[:, sender_old]) ./ Float32(meta["default_connectivity_radius"])
@@ -782,6 +821,7 @@ function prepare_trajectory!(
     if !isnothing(meta["training_strategy"]) &&
         (typeof(meta["training_strategy"]) <: DerivativeStrategy)
         add_targets!(data, meta["derivative_target_features"], device)
+        _stack_velocity_history!(data, meta, device)
         preprocess!(
             data,
             meta["input_features"],
@@ -805,4 +845,35 @@ function prepare_trajectory!(
         end
     end
     return data, meta
+end
+
+function _stack_velocity_history!(
+    data::Dict{String,Any}, meta::Dict{String,Any}, device::Function
+)
+    C = get(meta, "history_size", 1)
+    C == 1 && return
+    haskey(data, "velocity") || return
+    vel = data["velocity"]
+    T = size(vel, 3)
+    T >= C || throw(
+        ArgumentError("trajectory_length=$T is shorter than history_size=$C"),
+    )
+    M = T - C + 1
+
+    dim, np = size(vel, 1), size(vel, 2)
+    slices = [reshape(vel[:, :, c:(c + M - 1)], dim, np, 1, M) for c in 1:C]
+    data["velocity_history"] = device(cat(slices...; dims=3))
+
+    for key in collect(keys(data))
+        key == "velocity_history" && continue
+        v = data[key]
+        (v isa AbstractArray) || continue
+        ndims(v) >= 3 || continue
+        size(v, ndims(v)) == T || continue
+        idx = ntuple(i -> i == ndims(v) ? (C:T) : Colon(), ndims(v))
+        data[key] = v[idx...]
+    end
+
+    data["trajectory_length"] = M
+    return
 end

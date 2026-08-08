@@ -1,9 +1,28 @@
 #
-# Copyright (c) 2026 Josef Kircher, Julian Trommer
+# Copyright (c) 2026 Josef Jouaux, Julian Trommer
 # Licensed under the MIT license. See LICENSE file in the project root for details.
 #
+# This file contains work derived from DeepMind's "learning_to_simulate"
+# (https://github.com/google-deepmind/deepmind-research), modified from the original:
+#
+#   Copyright 2020 DeepMind Technologies Limited. All Rights Reserved.
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+#
+# See THIRD_PARTY_NOTICES.md for details.
+#
 
-import SciMLBase: AbstractSensitivityAlgorithm, ODEFunction
+import SciMLBase: AbstractSensitivityAlgorithm, ODEFunction, ReturnCode
 import SciMLSensitivity: InterpolatingAdjoint, ZygoteVJP, STACKTRACE_WITH_VJPWARN
 import Zygote: pullback
 using RecursiveArrayTools, CUDA
@@ -130,9 +149,29 @@ Inner function for validation of a single trajectory.
 function _validation_step(t::Tuple, sim_interval, data_interval)
     gns, data, meta, _, solver, solver_dt, node_type, pr = t
 
-    initial_state = Dict(
-        "position" => data["position"][:, :, 1], "velocity" => data["velocity"][:, :, 1]
-    )
+    C = get(meta, "history_size", 1)
+    initial_state = if C > 1
+        # First prediction frame is `data_interval[1] = C`; the C velocities ending
+        # there form the warmup buffer (paper-faithful: the model sees an
+        # in-distribution velocity history at step 1 of the rollout).
+        first_frame = first(data_interval)
+        first_frame >= C || throw(
+            ArgumentError(
+                "history_size=$C requires data_interval[1] >= $C; got $first_frame.",
+            ),
+        )
+        window = (first_frame - C + 1):first_frame
+        Dict(
+            "position" => data["position"][:, :, first_frame],
+            "velocity" => data["velocity"][:, :, first_frame],
+            "velocity_window" => data["velocity"][:, :, window],
+        )
+    else
+        Dict(
+            "position" => data["position"][:, :, 1],
+            "velocity" => data["velocity"][:, :, 1],
+        )
+    end
 
     target_dict = Dict{String,Int32}()
     for tf in meta["solver_target_features"]
@@ -142,27 +181,48 @@ function _validation_step(t::Tuple, sim_interval, data_interval)
     gt = vcat([data[tf] for tf in meta["solver_target_features"]]...)[
         :, data["mask"], data_interval
     ]
-    sol = rollout(
-        solver,
-        gns,
-        initial_state,
-        meta["output_features"],
-        meta,
-        meta["solver_target_features"],
-        node_type,
-        data["mask"],
-        data["val_mask"],
-        Float32(sim_interval[1]),
-        Float32(sim_interval[end]),
-        solver_dt,
-        sim_interval,
-        meta["device"],
-        pr,
-    )
+    sol = if C > 1
+        rollout_history(
+            gns,
+            initial_state,
+            meta["output_features"],
+            meta,
+            meta["solver_target_features"],
+            node_type,
+            data["mask"],
+            data["val_mask"],
+            sim_interval,
+            meta["device"],
+            pr,
+        )
+    else
+        rollout(
+            solver,
+            gns,
+            initial_state,
+            meta["output_features"],
+            meta,
+            meta["solver_target_features"],
+            node_type,
+            data["mask"],
+            data["val_mask"],
+            Float32(sim_interval[1]),
+            Float32(sim_interval[end]),
+            solver_dt,
+            sim_interval,
+            meta["device"],
+            pr,
+        )
+    end
     GC.gc()         # Run Julia's garbage collector first
-    CUDA.reclaim()  # Force garbage collection and free unused memory
+    if CUDA.functional()
+        CUDA.reclaim()  # Force garbage collection and free unused memory
+    end
     sol_pos = [u.x for u in sol.u]
-    prediction = cat(sol_pos...; dims=3)[:, data["mask"], data_interval]
+    # `sol.u[k]` is the predicted state at frame `data_interval[k]` (paper-faithful)
+    # or frame `k` (legacy). In both cases, the comparison takes the first
+    # `length(data_interval)` saved entries.
+    prediction = cat(sol_pos...; dims=3)[:, data["mask"], 1:length(data_interval)]
 
     error = mean((prediction - gt) .^ 2; dims=3)
 
@@ -224,48 +284,31 @@ prepares ground truth data for ODE problem setup.
 """
 function init_train_step(strategy::SolverStrategy, t::Tuple)
     gns,
-    data,
-    position,
-    velocity,
-    meta,
-    output_fields,
-    target_fields,
-    node_type,
-    mask,
-    device,
-    _ = t
+    data, meta, output_fields, target_fields, node_type, mask, val_mask, device, _, _,
+    show_progress_bars = t
 
-    target_dict = Dict{String,Int32}()
-    for tf in target_fields
-        target_dict[tf] = meta["features"][tf]["dim"]
-    end
-
-    initial_state = Dict("position" => position, "velocity" => velocity)
-
-    inputs = deepcopy(initial_state)
-    for i in keys(target_dict)
-        delete!(inputs, "target|" * i)
-    end
+    initial_state = Dict(
+        "position" => data["position"][:, :, 1], "velocity" => data["velocity"][:, :, 1]
+    )
 
     x0 = initial_state["position"]
     dx0 = initial_state["velocity"]
 
     u0 = device(ComponentArray(; x=initial_state["position"], dx=initial_state["velocity"]))
-    gt = vcat([data[tf] for tf in target_fields]...)
+    gt = vcat([data[tf][:, mask, :] for tf in target_fields]...)
 
     return (
         gns,
         meta,
-        inputs,
         output_fields,
         target_fields,
         node_type,
         mask,
-        x0,
-        dx0,
+        val_mask,
         u0,
         gt,
         device,
+        show_progress_bars,
     )
 end
 
@@ -292,10 +335,16 @@ and computes gradients via sensitivity analysis (adjoint method).
 5. Return gradients and loss.
 """
 function train_step(strategy::SolverStrategy, t::Tuple)
-    gns, meta, inputs, output_fields, target_fields, node_type, mask, u0, gt, device = t
+    gns,
+    meta, output_fields, target_fields, node_type, mask, val_mask, u0, gt, device,
+    show_progress_bars = t
 
-    pr = ProgressUnknown(; desc="Solver progress: ", showspeed=true)
-    print("\n\n\n\n\n\n\n\n") # display solver progress after main progress
+    pr = ProgressUnknown(;
+        desc="Solver progress: ", showspeed=true, enabled=show_progress_bars
+    )
+    if show_progress_bars
+        print("\n\n\n\n\n\n\n\n") # display solver progress after main progress
+    end
 
     ff = ODEFunction{false}(
         (x, ps, t) -> ode_func_train(
@@ -303,19 +352,19 @@ function train_step(strategy::SolverStrategy, t::Tuple)
             (
                 gns,
                 ps,
-                inputs,
                 output_fields,
                 meta,
                 target_fields,
                 node_type,
                 pr,
                 mask,
+                val_mask,
                 device,
             ),
             t,
         ),
     )
-    prob = ODEProblem(ff, u0, (strategy.tstart, strategy.tstop), gns.ps)
+    prob = ODEProblem(ff, u0, (strategy.tstart, strategy.tstop), gns.train_state.parameters)
     shoot_loss, shoot_gs = Zygote.withgradient(
         ps -> train_loss(
             strategy,
@@ -331,7 +380,7 @@ function train_step(strategy::SolverStrategy, t::Tuple)
                 [meta["features"][tf]["dim"] for tf in target_fields],
             ),
         ),
-        gns.ps,
+        gns.train_state.parameters,
     )
     return shoot_gs, shoot_loss
 end
@@ -453,7 +502,7 @@ function BatchingStrategy(
     solver::OrdinaryDiffEqAlgorithm,
     steps;
     loss_function=:mae,
-    sense::AbstractSensitivityAlgorithm=InterpolatingAdjoint(;
+    sense::AbstractSensitivityAlgorithm=InterpolatingAdjoint(
         autojacvec=ZygoteVJP(), checkpointing=true
     ),
     solargs...,
@@ -561,7 +610,7 @@ function init_train_step(strategy::BatchingStrategy, t::Tuple)
     device,
     _,
     batches,
-    show_progess_bars = t
+    show_progress_bars = t
 
     b = nextBatch(batches)
 
@@ -593,7 +642,7 @@ function init_train_step(strategy::BatchingStrategy, t::Tuple)
         device,
         batches,
         b,
-        show_progess_bars,
+        show_progress_bars,
     )
 end
 
@@ -623,12 +672,14 @@ function train_step(strategy::BatchingStrategy, t::Tuple)
     device,
     batches,
     b,
-    show_progess_bars = t
+    show_progress_bars = t
 
     pr = ProgressUnknown(;
-        desc="Solver progress: ", showspeed=true, enabled=show_progess_bars
+        desc="Solver progress: ", showspeed=true, enabled=show_progress_bars
     )
-    print("\n\n\n\n\n\n\n\n") # display solver progress after main progress
+    if show_progress_bars
+        print("\n\n\n\n\n\n\n\n") # display solver progress after main progress
+    end
 
     ff = ODEFunction{false}(
         (x, ps, t) -> ode_func_train(
@@ -652,12 +703,12 @@ function train_step(strategy::BatchingStrategy, t::Tuple)
         ff,
         u0,
         (round(batches[b].batchStart; digits=4), round(batches[b].batchStop; digits=4)),
-        gns.ps,
+        gns.train_state.parameters,
     )
     shoot_loss, shoot_gs = Zygote.withgradient(
         ps ->
             train_loss(strategy, (prob, ps, u0, nothing, gt, mask, data["dt"], batches[b])),
-        gns.ps,
+        gns.train_state.parameters,
     )
     batches[b].loss = shoot_loss
     return shoot_gs, shoot_loss
@@ -746,7 +797,7 @@ function SingleShooting(
     dt::Float32,
     tstop::Float32,
     solver::OrdinaryDiffEqAlgorithm;
-    sense::AbstractSensitivityAlgorithm=InterpolatingAdjoint(;
+    sense::AbstractSensitivityAlgorithm=InterpolatingAdjoint(
         autojacvec=ZygoteVJP(), checkpointing=true
     ),
     loss_function=:mae,
@@ -769,6 +820,7 @@ trajectory with ground truth data.
 """
 function train_loss(strategy::SingleShooting, t::Tuple)
     prob, ps, u0, callback_solve, gt, mask, n_norm, target_fields, target_dims = t # TODO add du0 TODO vary ps
+    tstop_data = strategy.tstart + (size(gt, 3) - 1) * strategy.dt
     sol = solve(
         remake(prob; p=ps),
         strategy.solver;
@@ -776,6 +828,7 @@ function train_loss(strategy::SingleShooting, t::Tuple)
         dt=strategy.dt,
         sensealg=strategy.sense,
         callback=callback_solve,
+        saveat=(strategy.tstart:strategy.dt:tstop_data),
         strategy.solargs...,
     ) # TODO remake du0=du0 currently not implemented Chris what are u doing?
     # sol = solve(remake(prob; p = ps), strategy.solver; u0 = u0, dt = strategy.dt)
@@ -878,14 +931,80 @@ function MultipleShooting(
     solver::OrdinaryDiffEqAlgorithm,
     interval_size,
     continuity_term=100;
+    # checkpointing=false for MultipleShooting: its short sub-interval solves can produce
+    # single-point checkpoint segments, and the checkpointed reverse pass then evaluates
+    # `abs(cpsol_t[end] - cpsol_t[end-1])` -> BoundsError at index 0 (SciMLSensitivity's
+    # interpolating_adjoint.jl). Storing the full forward trajectory avoids that re-solve.
     sense::AbstractSensitivityAlgorithm=InterpolatingAdjoint(
-        autojacvec=ZygoteVJP(), checkpointing=true
+        autojacvec=ZygoteVJP(), checkpointing=false
     ),
     solargs...,
 )
     MultipleShooting(
         tstart, dt, tstop, solver, sense, interval_size, continuity_term, solargs
     )
+end
+
+function init_train_step(::MultipleShooting, t::Tuple)
+    gns,
+    data, meta, output_fields, target_fields, node_type, mask, val_mask, device, _, _,
+    show_progress_bars = t
+
+    u0 = device(ComponentArray(; x=data["position"][:, :, 1], dx=data["velocity"][:, :, 1]))
+    gt = vcat([data[tf][:, mask, :] for tf in target_fields]...)
+
+    return (
+        gns,
+        data,
+        meta,
+        output_fields,
+        target_fields,
+        node_type,
+        mask,
+        val_mask,
+        u0,
+        gt,
+        device,
+        show_progress_bars,
+    )
+end
+
+function train_step(strategy::MultipleShooting, t::Tuple)
+    gns,
+    data, meta, output_fields, target_fields, node_type, mask, val_mask, u0, gt, device,
+    show_progress_bars = t
+
+    pr = ProgressUnknown(;
+        desc="Solver progress: ", showspeed=true, enabled=show_progress_bars
+    )
+    if show_progress_bars
+        print("\n\n\n\n\n\n\n\n")
+    end
+
+    ff = ODEFunction{false}(
+        (x, ps, t) -> ode_func_train(
+            x,
+            (
+                gns,
+                ps,
+                output_fields,
+                meta,
+                target_fields,
+                node_type,
+                pr,
+                mask,
+                val_mask,
+                device,
+            ),
+            t,
+        ),
+    )
+    prob = ODEProblem(ff, u0, (strategy.tstart, strategy.tstop), gns.train_state.parameters)
+    shoot_loss, shoot_gs = Zygote.withgradient(
+        ps -> train_loss(strategy, (prob, ps, data, gt, mask, device)),
+        gns.train_state.parameters,
+    )
+    return shoot_gs, shoot_loss
 end
 
 """
@@ -898,56 +1017,53 @@ for mismatches between interval endpoints.
 
 ## Arguments
 - `strategy::MultipleShooting`: MultipleShooting instance.
-- `t::Tuple`: Tuple containing problem, parameters, and ground truth data.
+- `t::Tuple`: Tuple containing problem, parameters, data, ground truth, mask, and device.
 """
 function train_loss(strategy::MultipleShooting, t::Tuple)
-    prob, ps, _, callback_solve, gt, _, _, _ = t
+    prob, ps, data, gt, mask, device = t
 
-    tsteps = strategy.tstart:strategy.dt:strategy.tstop
+    tstop_data = strategy.tstart + (size(gt, 3) - 1) * strategy.dt
+    tsteps = strategy.tstart:strategy.dt:tstop_data
     ranges = [
         i:min(length(tsteps), i + strategy.interval_size - 1) for
         i in 1:(strategy.interval_size - 1):(length(tsteps) - 1)
     ]
-    println(ranges)
     sols = [
         solve(
             remake(
                 prob;
                 p=ps,
                 tspan=(tsteps[first(rg)], tsteps[last(rg)]),
-                u0=gt[:, :, first(rg)],
+                u0=device(
+                    ComponentArray(;
+                        x=data["position"][:, :, first(rg)],
+                        dx=data["velocity"][:, :, first(rg)],
+                    ),
+                ),
             ),
             strategy.solver;
             saveat=tsteps[rg],
             sensealg=strategy.sense,
-            callback=callback_solve,
             strategy.solargs...,
         ) for rg in ranges
     ]
-    group_predictions = typeof(gt) <: CuArray ? CuArray.(sols) : Array.(sols)
 
     retcodes = [sol.retcode for sol in sols]
-    if any(retcodes .!= :Success)
+    if any(retcodes .!= ReturnCode.Success)
         return Inf
     end
 
-    vm = cpu_device()(val_mask)
+    group_predictions = [cat([u.x for u in sol.u]...; dims=3)[:, mask, :] for sol in sols]
 
     loss = 0
     for (i, rg) in enumerate(ranges)
-        error = cpu_device()((gt[:, :, rg] - group_predictions[i]) .^ 2)
-
-        err_buf = Zygote.Buffer(error)
-        err_buf[:, :, :] = error
-        for i in axes(err_buf, 3)
-            err_buf[:, :, i] = err_buf[:, :, i] .* vm
-        end
-        loss += mean(copy(err_buf))
+        error = cpu_device()((gt[:, :, rg] .- group_predictions[i]) .^ 2)
+        loss += mean(error)
 
         if i > 1
             loss +=
                 strategy.continuity_term *
-                sum(abs, group_predictions[i - 1][:, :, end] - gt[:, :, first(rg)])
+                sum(abs, group_predictions[i - 1][:, :, end] .- gt[:, :, first(rg)])
         end
     end
 
@@ -1027,6 +1143,11 @@ derivatives. Computes gradients via backpropagation.
 """
 function train_step(strategy::DerivativeStrategy, t::Tuple)
     gns, data, meta, target_quantities_change, node_type, mask, device, datapoint = t # TODO here own function
+    velocity_arg = if haskey(data, "velocity_history")
+        data["velocity_history"][:, :, :, datapoint]
+    else
+        data["velocity"][:, :, datapoint]
+    end
     loss, gs = Zygote.withgradient(
         ps -> train_loss(
             strategy,
@@ -1034,7 +1155,7 @@ function train_step(strategy::DerivativeStrategy, t::Tuple)
                 ps,
                 gns,
                 data["position"][:, :, datapoint],
-                data["velocity"][:, :, datapoint],
+                velocity_arg,
                 meta,
                 target_quantities_change,
                 node_type,
@@ -1042,7 +1163,7 @@ function train_step(strategy::DerivativeStrategy, t::Tuple)
                 device,
             ),
         ),
-        gns.ps,
+        gns.train_state.parameters,
     )
 
     return gs, loss
@@ -1063,8 +1184,9 @@ output and target derivatives.
 function train_loss(strategy::DerivativeStrategy, t::Tuple)
     ps, gns, position, velocity, meta, target, node_type, mask, device = t
     graph = build_graph(gns, position, velocity, meta, node_type, mask, device)
-    output, st = gns.model(graph, ps, gns.st)
-    gns.st = st
+    # GraphNetCore >= 0.4: model/state live inside the TrainState; layers are
+    # stateless under a forward pass so no state write-back is needed.
+    output, _ = gns.train_state.model(graph, ps, gns.train_state.states)
 
     # error = loss_function(target, output)
     # error = loss_function(target, output[:, mask])
@@ -1123,16 +1245,33 @@ and comparing derivatives with ground truth.
 - `t::Tuple`: Validation data tuple.
 """
 function validation_step(::DerivativeStrategy, t::Tuple)
-    _, data, _, delta, _, _, _, _ = t
+    _, data, meta, delta, _, _, _, _ = t
     dt = data["dt"]
-    if typeof(dt) <: AbstractArray
-        sim_interval = dt[1]:(dt[2] - dt[1]):dt[delta]
+    C = get(meta, "history_size", 1)
+    if C > 1
+        # Paper-faithful: warmup uses frames 1..C of ground truth. The first
+        # prediction frame is C; the integration covers frames C..T (length
+        # T - C + 1). We size `sim_interval` with one trailing extra step (matching
+        # the C=1 convention of integrating one step past the last compared frame).
+        T = data["trajectory_length"]
+        L = T - C + 1
+        if typeof(dt) <: AbstractArray
+            base_dt = dt[2] - dt[1]
+            sim_interval = 0.0:base_dt:(base_dt * L)
+        else
+            sim_interval = 0.0:dt:(dt * L)
+        end
+        data_interval = C:T   # length L
     else
-        # sim_interval = 0.0: dt: dt * t[2]["trajectory_length"]
-        sim_interval = 0.0:dt:(dt * delta)
+        if typeof(dt) <: AbstractArray
+            sim_interval = dt[1]:(dt[2] - dt[1]):dt[delta]
+        else
+            # sim_interval = 0.0: dt: dt * t[2]["trajectory_length"]
+            sim_interval = 0.0:dt:(dt * delta)
+        end
+        # data_interval = 1:t[2]["trajectory_length"]
+        data_interval = 1:(length(sim_interval) - 1)
     end
-    # data_interval = 1:t[2]["trajectory_length"]
-    data_interval = 1:(length(sim_interval) - 1)
     return _validation_step(t, sim_interval, data_interval)
 end
 

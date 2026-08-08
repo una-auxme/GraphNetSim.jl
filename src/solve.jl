@@ -1,6 +1,25 @@
 #
-# Copyright (c) 2026 Josef Kircher, Julian Trommer
+# Copyright (c) 2026 Josef Jouaux, Julian Trommer
 # Licensed under the MIT license. See LICENSE file in the project root for details.
+#
+# This file contains work derived from DeepMind's "learning_to_simulate"
+# (https://github.com/google-deepmind/deepmind-research), modified from the original:
+#
+#   Copyright 2020 DeepMind Technologies Limited. All Rights Reserved.
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+#
+# See THIRD_PARTY_NOTICES.md for details.
 #
 
 import ProgressMeter: ProgressUnknown
@@ -71,7 +90,7 @@ function rollout(
         interval,
         (
             gns,
-            gns.ps,
+            gns.train_state.parameters,
             output_fields,
             meta,
             target_fields,
@@ -239,7 +258,7 @@ returns time derivatives (velocities and accelerations). Includes optional progr
 
 ## Notes
 - Used during training phase with gradient computation enabled.
-- Network state `gns.st` is updated in-place.
+- Network state (`gns.train_state.states`) is read-only here; the model layers are stateless under a forward pass.
 - Denormalization uses normalizers from `gns.o_norm` dictionary.
 """
 function ode_step(
@@ -252,8 +271,10 @@ function ode_step(
     graph = build_graph(gns, x.x, x.dx, meta, node_type, mask, device)
     # end
 
-    output, st = gns.model(graph, ps, gns.st)
-    gns.st = st
+    # GraphNetCore >= 0.4: model/state live inside the TrainState. Our layers
+    # (Dense + LayerNorm) are stateless under a forward pass, so the returned
+    # state equals the input state — no write-back needed (previously `gns.st = st`).
+    output, _ = gns.train_state.model(graph, ps, gns.train_state.states)
 
     indices = [meta["features"][tf]["dim"] for tf in target_fields]
     buf = Zygote.Buffer(output)
@@ -311,7 +332,7 @@ potential future inference optimizations.
 
 ## Notes
 - Used during evaluation/inference phase without gradient computation.
-- Network state `gns.st` is updated in-place.
+- Network state (`gns.train_state.states`) is read-only here; the model layers are stateless under a forward pass.
 - Denormalization uses normalizers from `gns.o_norm` dictionary.
 - Future optimization target: could implement checkpointing or reduced-precision compute here.
 """
@@ -322,8 +343,10 @@ function ode_step_eval(
 ) # TODO if rework is finished only one ode_step function is needed
     graph = build_graph(gns, x.x, x.dx, meta, node_type, mask, device)
 
-    output, st = gns.model(graph, ps, gns.st)
-    gns.st = st
+    # GraphNetCore >= 0.4: model/state live inside the TrainState. Our layers
+    # (Dense + LayerNorm) are stateless under a forward pass, so the returned
+    # state equals the input state — no write-back needed (previously `gns.st = st`).
+    output, _ = gns.train_state.model(graph, ps, gns.train_state.states)
     indices = [meta["features"][tf]["dim"] for tf in target_fields]
     buf = Zygote.Buffer(output)
     for i in 1:length(output_fields)
@@ -340,4 +363,103 @@ function ode_step_eval(
     end
 
     return device(ComponentArray(; x=x.dx, dx=copy(buf) .* val_mask)) # TODO check why output is used here directly
+end
+
+"""
+    _prepare_rollout_inputs(data, ds_test, start, dt, device)
+
+Build the initial ODE state and one-hot node type tensor for a single test trajectory.
+
+Extracts position and velocity at time `start` (converted to the nearest frame index
+`stepstart = round(Int, (start/dt) + 1)`) and one-hot-encodes the trajectory's node types
+using the bounds stored in `ds_test.meta["features"]["node_type"]`.
+
+## Returns
+- `Tuple`: `(initial_state::Dict, node_type, stepstart::Int)`.
+"""
+function _prepare_rollout_inputs(data, ds_test, start, dt, device)
+    stepstart = round(Int, ((start / dt) + 1))
+    C = get(ds_test.meta, "history_size", 1)
+
+    if C > 1
+        # Paper-faithful warmup: `stepstart` is the first prediction frame, and
+        # the velocity buffer is seeded from the C ground-truth velocities ending
+        # at `stepstart` (so the buffer's newest slot and the integrator's current
+        # position align — the same pairing used at training time).
+        stepstart >= C || throw(
+            ArgumentError(
+                "history_size=$C requires start to map to a frame >= $C " *
+                "(got stepstart=$stepstart). Pass start=(C-1)*dt or later.",
+            ),
+        )
+        window = (stepstart - C + 1):stepstart
+        initial_state = Dict(
+            "position" => data["position"][:, :, stepstart],
+            "velocity" => data["velocity"][:, :, stepstart],
+            "velocity_window" => data["velocity"][:, :, window],
+        )
+    else
+        initial_state = Dict(
+            "position" => data["position"][:, :, stepstart],
+            "velocity" => data["velocity"][:, :, stepstart],
+        )
+    end
+
+    node_type = device(
+        Float32.(
+            GraphNetCore.one_hot(
+                vec(data["node_type"][:, :, 1]),
+                ds_test.meta["features"]["node_type"]["data_max"] -
+                ds_test.meta["features"]["node_type"]["data_min"] + 1,
+                1 - ds_test.meta["features"]["node_type"]["data_min"],
+            ),
+        ),
+    )
+    return initial_state, node_type, stepstart
+end
+
+"""
+    _extract_trajectory_arrays(sol)
+
+Collect ODE solution arrays into `(pos, vel, acc)` stacked along the time dimension.
+
+Position and velocity come from `sol.u`; acceleration is read from `sol(sol.t, Val{1})`
+(the first time derivative).
+
+## Returns
+- `Tuple`: `(sol_t::Vector{Float32}, prediction::NamedTuple{(:pos, :vel, :acc)})`.
+"""
+function _extract_trajectory_arrays(sol)
+    sol_acc = sol(sol.t, Val{1})
+    sol_pos = [u.x for u in sol.u]
+    sol_vel = [u.dx for u in sol.u]
+    sol_acc = [u.dx for u in sol_acc.u]
+
+    sol_pos = cpu_device()(cat(sol_pos...; dims=3))
+    sol_vel = cat(sol_vel...; dims=3)
+    sol_acc = cat(sol_acc...; dims=3)
+
+    return sol.t, (pos=sol_pos, vel=sol_vel, acc=sol_acc)
+end
+
+"""
+    _slice_ground_truth(data, device, stepstart, noverlap)
+
+Slice ground-truth position, velocity, and acceleration fields to `noverlap` timesteps
+starting at `stepstart`.
+
+## Returns
+- `NamedTuple{(:pos, :vel, :acc)}`: Ground-truth arrays on the CPU.
+"""
+function _slice_ground_truth(data, device, stepstart, noverlap)
+    gt_pos = cpu_device()(
+        device(data["position"])[:, :, stepstart:(stepstart + noverlap - 1)]
+    )
+    gt_vel = cpu_device()(
+        device(data["velocity"])[:, :, stepstart:(stepstart + noverlap - 1)]
+    )
+    gt_acc = cpu_device()(
+        device(data["acceleration"])[:, :, stepstart:(stepstart + noverlap - 1)]
+    )
+    return (pos=gt_pos, vel=gt_vel, acc=gt_acc)
 end

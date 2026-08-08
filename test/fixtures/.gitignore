@@ -1,0 +1,3 @@
+# Generated at test time by generate_fixtures.jl — do not commit
+*.h5
+*.json

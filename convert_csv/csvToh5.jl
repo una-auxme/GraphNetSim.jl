@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2026 Josef Kircher, Julian Trommer
+# Copyright (c) 2026 Josef Jouaux, Julian Trommer
 # Licensed under the MIT license. See LICENSE file in the project root for details.
 #   
 
@@ -9,7 +9,70 @@ using DataFrames
 using DataInterpolations
 
 """
-    csv_to_hdf5(source::String, output::String; 
+    _write_trajectory!(fid, traj_id, position, velocity, acceleration, types, dt;
+                       extras=Dict{String,Array{Float32,3}}())
+
+Write one assembled trajectory into an open HDF5 file `fid` using the dataset
+layout the loader expects (see `src/dataset.jl`): per-timestep `pos[\$t]`,
+`vel[\$t]`, `acc[\$t]` (each `dims × n_particles`), plus the static `type`
+vector and the scalars `dt`, `n_particles`, `trajectory_length`.
+
+Node types are remapped to sequential integers `1:k` to keep one-hot encodings
+small. This is the single source of truth for the on-disk layout — both
+`csv_to_hdf5` and `vtk_to_hdf5` funnel through it so the two importers stay
+byte-compatible.
+
+## Arguments
+- `fid`: Open, writable HDF5 file handle.
+- `traj_id::Integer`: 1-based trajectory index; the group is `"trajectory_\$traj_id"`.
+- `position`/`velocity`/`acceleration::AbstractArray{<:Real,3}`: `dims × n_particles × trajectory_length`.
+- `types::AbstractVector{<:Integer}`: per-particle node type (length `n_particles`).
+- `dt::Real`: time step.
+
+## Keyword Arguments
+- `extras::AbstractDict{String,<:AbstractArray{<:Real,3}}`: additional dynamic
+  fields, each `d × n_particles × trajectory_length`, written as `"<name>[\$t]"`.
+"""
+function _write_trajectory!(
+    fid,
+    traj_id::Integer,
+    position::AbstractArray{<:Real,3},
+    velocity::AbstractArray{<:Real,3},
+    acceleration::AbstractArray{<:Real,3},
+    types::AbstractVector{<:Integer},
+    dt::Real;
+    extras::AbstractDict{String,<:AbstractArray{<:Real,3}}=Dict{String,Array{Float32,3}}(),
+)
+    tra = "trajectory_$traj_id"
+    create_group(fid, tra)
+
+    trajectory_length = size(position, 3)
+    n_particles = size(position, 2)
+
+    # Remap particle types to sequential integers (1, 2, 3, ...) to minimize one-hot encoding size
+    unique_types = sort(unique(types))
+    type_mapping = Dict(zip(unique_types, 1:length(unique_types)))
+    types_remapped = [type_mapping[t] for t in types]
+
+    fid["$tra/n_particles"] = n_particles
+    fid["$tra/dt"] = dt
+    fid["$tra/trajectory_length"] = trajectory_length
+    fid["$tra/type"] = types_remapped
+
+    for t in 1:trajectory_length
+        fid["$tra/pos[$t]"] = convert(Matrix{Float32}, position[:, :, t])
+        fid["$tra/vel[$t]"] = convert(Matrix{Float32}, velocity[:, :, t])
+        fid["$tra/acc[$t]"] = convert(Matrix{Float32}, acceleration[:, :, t])
+        for (name, arr) in extras
+            fid["$tra/$name[$t]"] = convert(Matrix{Float32}, arr[:, :, t])
+        end
+    end
+
+    return nothing
+end
+
+"""
+    csv_to_hdf5(source::String, output::String;
                  dt::Float64=0.01, 
                  n_trajectories::Int=1,
                  dims::Vector{Int}=[1, 2],
@@ -112,11 +175,6 @@ function csv_to_hdf5(
 
     try
         for traj_id in 1:n_trajectories
-            tra = "trajectory_$traj_id"
-            create_group(fid, tra)
-            fid["$tra/n_particles"] = length(grp)
-            fid["$tra/dt"] = dt
-
             # Store trajectory length and initialize arrays (determined from first particle)
             trajectory_length = 0
             position_arrays = nothing
@@ -179,22 +237,16 @@ function csv_to_hdf5(
                 particle_types[j] = prtl[!, type_col][1]
             end
 
-            # Remap particle types to sequential integers (1, 2, 3, ...) to minimize one-hot encoding size
-            unique_types = unique(particle_types)
-            sort!(unique_types)
-            type_mapping = Dict(zip(unique_types, 1:length(unique_types)))
-            particle_types_remapped = [type_mapping[t] for t in particle_types]
-
-            # Store trajectory length and metadata
-            fid["$tra/trajectory_length"] = trajectory_length
-            fid["$tra/type"] = particle_types_remapped
-
-            # Store data in timestep-based format (dimensions × particles)
-            for t in 1:trajectory_length
-                fid["$tra/pos[$t]"] = convert(Matrix{Float32}, position_arrays[:, :, t])
-                fid["$tra/vel[$t]"] = convert(Matrix{Float32}, velocity_arrays[:, :, t])
-                fid["$tra/acc[$t]"] = convert(Matrix{Float32}, acceleration_arrays[:, :, t])
-            end
+            # Store in the timestep-based layout the loader expects (shared with vtk_to_hdf5).
+            _write_trajectory!(
+                fid,
+                traj_id,
+                position_arrays,
+                velocity_arrays,
+                acceleration_arrays,
+                particle_types,
+                dt,
+            )
         end
     finally
         close(fid)

@@ -1,26 +1,10 @@
 #
-# Copyright (c) 2026 Josef Kircher, Julian Trommer
+# Copyright (c) 2026 Josef Jouaux, Julian Trommer
 # Licensed under the MIT license. See LICENSE file in the project root for details.
 #
 
 import Printf: @sprintf
 import JSON: print as json_print, parsefile as json_parsefile
-
-"""
-    n_node_types(meta)
-
-Returns the number of distinct node types in the dataset.
-
-## Arguments
-- `meta`: Feature metadata dictionary containing `node_type` feature spec.
-
-## Returns
-- `Int`: `data_max - data_min + 1` for the `node_type` feature.
-"""
-function n_node_types(meta)
-    meta["features"]["node_type"]["data_max"] - meta["features"]["node_type"]["data_min"] +
-    1
-end
 
 """
     n_node_types(meta)
@@ -84,7 +68,7 @@ function der_minmax(path)
 end
 
 """
-    data_minmax(path)
+    data_minmax(path; kws...)
 
 Calculates the minimum and maximum values for each numeric feature across all dataset partitions.
 
@@ -94,11 +78,15 @@ for all numeric features (Int32 and Float32 types).
 ## Arguments
 - `path`: Path to the dataset files.
 
+## Keyword Arguments
+All keyword arguments are forwarded to [`Args`](@ref) to configure dataset loading
+(e.g. `types_updated`, `types_noisy`, `noise_stddevs`).
+
 ## Returns
 - `Dict`: Dictionary mapping feature names to [min, max] value pairs computed from all datasets.
 """
-function data_minmax(path)
-    args = Args()
+function data_minmax(path; kws...)
+    args = Args(; kws...)
     ds_train = Dataset(:train, path, args)
     ds_train.meta["types_updated"] = args.types_updated
     ds_train.meta["types_noisy"] = args.types_noisy
@@ -190,18 +178,22 @@ function data_minmax(path)
 end
 
 """
-    data_meanstd(path)
+    data_meanstd(path; kws...)
 
 Calculates the mean and standard deviation for each feature in the given part of the dataset.
 
 ## Arguments
 - `path`: Path to the dataset files.
 
+## Keyword Arguments
+All keyword arguments are forwarded to [`Args`](@ref) to configure dataset loading
+(e.g. `types_updated`, `types_noisy`, `noise_stddevs`).
+
 ## Returns
 - Mean and standard deviation in training, validation and test set
 """
-function data_meanstd(path)
-    args = Args()
+function data_meanstd(path; kws...)
+    args = Args(; kws...)
     ds_train = Dataset(:train, path, args)
     ds_train.meta["types_updated"] = args.types_updated
     ds_train.meta["types_noisy"] = args.types_noisy
