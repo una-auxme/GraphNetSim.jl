@@ -1,6 +1,6 @@
 name = "GraphNetSim"
 uuid = "5ff66f56-808c-48e7-ac84-dd29877231f8"
-version = "0.1.0"
+version = "0.1.1"
 authors = ["Josef Jouaux <Josef.Kircher@uni-a.de>", "JT <julian.trommer@uni-a.de>"]
 
 [deps]
