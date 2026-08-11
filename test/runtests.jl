@@ -16,12 +16,7 @@ include("generate_fixtures.jl")
         # stale-deps check:
         #  - GPUCompiler: deps-only version pin (see Project.toml [compat]), loaded
         #    transitively via CUDA/Reactant.
-        #  - JuliaFormatter: dev/CI tool invoked as `using JuliaFormatter; format(".")`.
-        Aqua.test_all(
-            GraphNetSim;
-            ambiguities=false,
-            stale_deps=(ignore=[:GPUCompiler, :JuliaFormatter],),
-        )
+        Aqua.test_all(GraphNetSim; ambiguities=false, stale_deps=(ignore=[:GPUCompiler],))
     end
 
     include("test_converters.jl")

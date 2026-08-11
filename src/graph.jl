@@ -26,6 +26,7 @@ using CUDA
 import Statistics: norm
 using JLD2
 using PointNeighbors
+using Octopus: Octopus
 using ChainRulesCore
 
 """
@@ -65,15 +66,7 @@ function build_graph(
         data["velocity"][:, :, datapoint]
     end
 
-    build_graph(
-        gns,
-        current_position,
-        velocity,
-        meta,
-        node_type,
-        data["mask"],
-        device,
-    )
+    build_graph(gns, current_position, velocity, meta, node_type, data["mask"], device)
 end
 
 """
@@ -100,8 +93,10 @@ All features are normalized using the normalizers stored in the model.
 function build_graph(
     gns::GraphNetCore.GraphNetwork, position, velocity, meta, node_type, mask, device
 ) # TODO check ODE solve and if this is really repeatedly done
-    senders, receivers, rel_displacement, rel_dist_norm = point_neighbor_ns(
-        position, Float32(meta["default_connectivity_radius"])
+    senders, receivers, rel_displacement, rel_dist_norm = neighbor_search(
+        device(position),
+        Float32(meta["default_connectivity_radius"]),
+        get(meta, "neighbor_backend", :pointneighbors),
     )
 
     multi_type = n_node_types(meta) > 1
@@ -112,16 +107,23 @@ function build_graph(
 
     edge_features = device(vcat(rel_displacement, rel_dist_norm) .+ 1.0f-8)
 
-    nf = vel_norm
-    if use_position
-        nf = vcat(gns.n_norm["position"](position), nf)
-    end
-    if use_wall
-        nf = vcat(nf, _wall_distance(position, mask, meta, device))
-    end
-    if multi_type
-        nf = vcat(nf, node_type)
-    end
+    # Node features are the vertical concatenation of, in order:
+    #   [position?, velocity, wall_distance?, node_type?]
+    # Build this as a single `vcat` over the present blocks rather than chaining one
+    # `vcat` per block. Chaining re-allocates and re-copies the growing feature matrix
+    # at every link — it allocated 1.7-2.1x the final array in transient GPU garbage
+    # (worse with velocity history, since the tall velocity block is recopied each
+    # link), whereas a single `vcat` allocates exactly the output once (~4.8x faster
+    # forward, ~1/3 less total fwd+bwd allocation; values/gradients bit-identical).
+    # The block tuple uses immutable splats (no `push!`) so the expression stays
+    # Zygote-differentiable on the training RHS; a lone present block returns untouched.
+    nf_blocks = (
+        (use_position ? (gns.n_norm["position"](position),) : ())...,
+        vel_norm,
+        (use_wall ? (_wall_distance(position, mask, meta, device),) : ())...,
+        (multi_type ? (node_type,) : ())...,
+    )
+    nf = length(nf_blocks) == 1 ? nf_blocks[1] : vcat(nf_blocks...)
     node_features = device(nf)
 
     return GraphNetCore.FeatureGraph(
@@ -160,8 +162,7 @@ function _wall_distance(position, mask, meta, device)
     dist_low_bound = position .- boundaries[:, 1]
     dist_up_bound = boundaries[:, 2] .- position
     return clamp.(
-        vcat(dist_low_bound, dist_up_bound) ./
-        Float32(meta["default_connectivity_radius"]),
+        vcat(dist_low_bound, dist_up_bound) ./ Float32(meta["default_connectivity_radius"]),
         -1.0f0,
         1.0f0,
     )
@@ -340,20 +341,26 @@ Returns normalized relative displacements and distances.
 - Supports arbitrary dimension (2D, 3D, etc.).
 """
 function point_neighbor_ns(pos::CuArray, radius::Float32)
-    system = pos#[:,mask]
+    system = pos
     min_corner = minimum(pos; dims=2)
     max_corner = maximum(pos; dims=2)
     nhs = GridNeighborhoodSearch{size(pos, 1)}(;
         search_radius=radius,
         n_points=size(pos, 2),
         cell_list=FullGridCellList(; min_corner, max_corner, search_radius=radius),
+        update_strategy=ParallelUpdate(),
     )
-    initialize!(nhs, Array(system), Array(pos))
-    backend = CUDABackend()
-    # Simple example: just count the neighbors of each particle
-    n_neighbors_gpu = CuArray(zeros(Int, size(pos, 2)))
-    nhs_gpu = adapt(backend, nhs)
+    # Build the cell list on-device: adapt the (empty) nhs to the GPU, then `initialize!` with the
+    # CuArray positions so PointNeighbors dispatches to the parallel atomic init
+    # (`default_backend(::CuArray)` => GPU; `ParallelUpdate`'s `initialize_grid!` is the parallel one).
+    # Avoids the GPU->CPU->GPU round trip of the old `initialize!(nhs, Array(...), Array(...))` +
+    # adapt-back, whose serial CPU cell-list build was ~16 ms at 33k particles vs ~2 ms here (~8x).
+    # Edge set is identical; edge order may differ (atomic push), perturbing the downstream scatter
+    # by ~eps only. Benchmarked in example/RuntimeBenchmark/.
+    nhs_gpu = adapt(CUDABackend(), nhs)
+    initialize!(nhs_gpu, pos, pos)
 
+    n_neighbors_gpu = CuArray(zeros(Int, size(pos, 2)))
     foreach_point_neighbor(system, pos, nhs_gpu) do i, _, _, _
         n_neighbors_gpu[i] += 1
     end
@@ -434,6 +441,80 @@ function point_neighbor_ns(pos::Array, radius::Float32)
     end
 
     return senders, receivers, rel_displacement, rel_dist_norm
+end
+
+"""
+    octopus_ns(pos, radius::Float32)
+
+Neighbor search backend using [Octopus.jl](https://github.com/una-auxme/Octopus.jl)'s fast octree
+(`TNS`). Dispatches on the array type internally (CPU `Array` or `CuArray`), so the same code serves
+both devices. Returns `(senders, receivers, rel_displacement, rel_dist_norm)` in exactly the format
+of [`point_neighbor_ns`](@ref) — same receiver/sender convention, displacement sign, radius
+normalization, and appended self-edges — so the two backends are interchangeable in [`build_graph`](@ref).
+Gradients flow through `pos` via Octopus's differentiable `build_edges_diff` rrule; the tree build is
+non-differentiable (`@ignore_derivatives`). The octree is O(N) and ~18x leaner than PointNeighbors'
+dense grid on the GPU, so it's the backend for large point clouds where the grid OOMs.
+"""
+function octopus_ns(pos, radius::Float32)
+    D = size(pos, 1)
+    n = size(pos, 2)
+    tns = ChainRulesCore.@ignore_derivatives begin
+        t = Octopus.TNS(eltype(pos); ndims=D)
+        Octopus.set_search_radius!(t, radius)
+        pid = Octopus.add_point_set!(t, pos)
+        Octopus.set_active_search!(t, pid, pid)
+        Octopus.run!(t)
+        t
+    end
+    e = Octopus.build_edges_diff(pos, tns, 1, radius)
+
+    self_s, self_r, self_disp, self_dist = ChainRulesCore.@ignore_derivatives begin
+        s = similar(e.senders, n)
+        copyto!(s, Int32.(1:n))
+        (
+            s,
+            copy(s),
+            fill!(similar(e.rel_displacement, D, n), zero(eltype(e.rel_displacement))),
+            fill!(similar(e.rel_dist_norm, 1, n), zero(eltype(e.rel_dist_norm))),
+        )
+    end
+
+    senders = vcat(e.senders, self_s)
+    receivers = vcat(e.receivers, self_r)
+    rel_displacement = hcat(e.rel_displacement, self_disp)
+    rel_dist_norm = hcat(e.rel_dist_norm, self_dist)
+    return senders, receivers, rel_displacement, rel_dist_norm
+end
+
+"""
+    neighbor_search(pos, radius::Float32, backend::Symbol)
+
+Select the neighborhood-search implementation for graph construction. `backend` comes from
+`Args.neighbor_backend` (threaded via `meta["neighbor_backend"]`):
+
+- `:pointneighbors` — [`point_neighbor_ns`](@ref), PointNeighbors.jl grid search (default).
+- `:octopus`        — [`octopus_ns`](@ref), Octopus.jl octree search (memory-lean on GPU; needed for
+                      large clouds where the dense grid OOMs).
+- `:auto`           — PointNeighbors on CPU (`Array`), Octopus on GPU (`CuArray`).
+
+All branches return the identical `(senders, receivers, rel_displacement, rel_dist_norm)` format and
+are differentiable in `pos`.
+"""
+function neighbor_search(pos, radius::Float32, backend::Symbol)
+    if backend === :pointneighbors
+        return point_neighbor_ns(pos, radius)
+    elseif backend === :octopus
+        return octopus_ns(pos, radius)
+    elseif backend === :auto
+        return pos isa CuArray ? octopus_ns(pos, radius) : point_neighbor_ns(pos, radius)
+    else
+        throw(
+            ArgumentError(
+                "unknown neighbor_backend $(repr(backend)); " *
+                "use :pointneighbors, :octopus, or :auto",
+            ),
+        )
+    end
 end
 
 """
