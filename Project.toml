@@ -1,6 +1,6 @@
 name = "GraphNetSim"
 uuid = "5ff66f56-808c-48e7-ac84-dd29877231f8"
-version = "0.1.0"
+version = "0.1.2"
 authors = ["Josef Jouaux <Josef.Kircher@uni-a.de>", "JT <julian.trommer@uni-a.de>"]
 
 [deps]
@@ -61,7 +61,7 @@ LightXML = "0.9"
 Lux = "1.13 - 1"
 LuxCUDA = "0.3"
 MLUtils = "0.4.4 - 0.4"
-Octopus = "0.1"
+Octopus = "0.2"
 Optimisers = "0.4, 1"
 OrdinaryDiffEq = "6.85 - 6"
 Plots = "1.40.18"
