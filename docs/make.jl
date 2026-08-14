@@ -21,6 +21,8 @@ makedocs(;
     pages=[
         "Home" => "index.md",
         "Loading Data" => "loading_data.md",
+        "Examples" => "examples.md",
+        "Hyperparameter Optimization" => "hyperparameter_optimization.md",
         "API Reference" => "api.md",
     ],
 )
