@@ -90,7 +90,7 @@ function Dataset(datafile::String, metafile::String, args)
         )
     end
 
-    meta = parse(Base.read(metafile), String)
+    meta = parse(Base.read(metafile, String))
     keys_traj = keystraj(datafile)
     meta["n_trajectories"] = length(keys_traj)
     meta["keys_trajectories"] = keys_traj
@@ -851,13 +851,11 @@ function _stack_velocity_history!(
     data::Dict{String,Any}, meta::Dict{String,Any}, device::Function
 )
     C = get(meta, "history_size", 1)
-    C == 1 && return
-    haskey(data, "velocity") || return
+    C == 1 && return nothing
+    haskey(data, "velocity") || return nothing
     vel = data["velocity"]
     T = size(vel, 3)
-    T >= C || throw(
-        ArgumentError("trajectory_length=$T is shorter than history_size=$C"),
-    )
+    T >= C || throw(ArgumentError("trajectory_length=$T is shorter than history_size=$C"))
     M = T - C + 1
 
     dim, np = size(vel, 1), size(vel, 2)
@@ -875,5 +873,5 @@ function _stack_velocity_history!(
     end
 
     data["trajectory_length"] = M
-    return
+    return nothing
 end
