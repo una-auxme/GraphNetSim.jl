@@ -13,10 +13,11 @@ const MODEL_CONFIG_FILENAME = "model_config.json"
 Persists the minimal set of parameters required to reconstruct the GNN model
 from a checkpoint without re-specifying them at the call site.
 
-Only the three architecture fields (`mps`, `layer_size`, `hidden_layers`) are
-strictly required for model reconstruction.  All other fields are derived from
-`meta.json` or the JLD2 checkpoint at load time.  The training fields are saved
-as documentation and may legitimately differ between training phases.
+The architecture fields (`mps`, `layer_size`, `hidden_layers`, `bounded`) affect
+weight shapes and must match on resume; `bounded` additionally must agree with the
+dataset's `meta["bounds"]` presence at load time (a bounded model has a wider encoder
+input).  The remaining fields are derived from `meta.json` or the JLD2 checkpoint and
+are saved as documentation; they may legitimately differ between training phases.
 
 ## Fields
 - `mps`: Number of message passing steps.
@@ -27,6 +28,10 @@ as documentation and may legitimately differ between training phases.
 - `types_noisy`: Node types receiving noise injection during training.
 - `noise_stddevs`: Per-type noise standard deviations.
 - `norm_type`: Normalization strategy for Float32 features (`:online`, `:minmax`, `:meanstd`).
+- `bounded`: Whether the model was trained with the boundary (wall-distance) node feature,
+  i.e. whether the training dataset defined `meta["bounds"]`. Part of the architecture: a
+  bounded model has a wider encoder input than an unbounded one, so this must match the
+  dataset at load time.
 """
 @kwdef struct ModelConfig
     format_version::Int = 2
@@ -38,7 +43,7 @@ as documentation and may legitimately differ between training phases.
     types_noisy::Vector{Int}
     noise_stddevs::Vector{Float32}
     norm_type::Symbol = :online
-    history_size::Int = 1
+    bounded::Bool = false
 end
 
 """
@@ -60,15 +65,14 @@ function save_model_config(cfg::ModelConfig, cp_path::String)
         if !isnothing(existing)
             if existing.mps != cfg.mps ||
                 existing.layer_size != cfg.layer_size ||
-                existing.hidden_layers != cfg.hidden_layers ||
-                existing.history_size != cfg.history_size
+                existing.hidden_layers != cfg.hidden_layers
                 error(
                     "Architecture mismatch between supplied arguments and saved " *
                     "model config at \"$path\".\n" *
                     "  Saved:    mps=$(existing.mps), layer_size=$(existing.layer_size), " *
-                    "hidden_layers=$(existing.hidden_layers), history_size=$(existing.history_size)\n" *
+                    "hidden_layers=$(existing.hidden_layers)\n" *
                     "  Supplied: mps=$(cfg.mps), layer_size=$(cfg.layer_size), " *
-                    "hidden_layers=$(cfg.hidden_layers), history_size=$(cfg.history_size)\n" *
+                    "hidden_layers=$(cfg.hidden_layers)\n" *
                     "These parameters must match the existing checkpoint. " *
                     "Use a different cp_path to start a new training run.",
                 )
@@ -87,7 +91,7 @@ function save_model_config(cfg::ModelConfig, cp_path::String)
                     "mps" => cfg.mps,
                     "layer_size" => cfg.layer_size,
                     "hidden_layers" => cfg.hidden_layers,
-                    "history_size" => cfg.history_size,
+                    "bounded" => cfg.bounded,
                 ),
                 "training" => Dict(
                     "norm_steps" => cfg.norm_steps,
@@ -123,7 +127,7 @@ function load_model_config(cp_path::String)::Union{ModelConfig,Nothing}
             mps=arch["mps"],
             layer_size=arch["layer_size"],
             hidden_layers=arch["hidden_layers"],
-            history_size=Int(get(arch, "history_size", 1)),
+            bounded=Bool(get(arch, "bounded", false)),
             norm_steps=train["norm_steps"],
             types_updated=Int.(train["types_updated"]),
             types_noisy=Int.(train["types_noisy"]),

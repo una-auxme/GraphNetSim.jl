@@ -238,6 +238,30 @@ end
 MLUtils.numobs(ds::Dataset) = ds.meta["n_trajectories"]
 
 """
+    _updated_particle_indices(node_types, types_updated, idx, key)
+
+Indices of the particles whose node type is in `types_updated` — the per-trajectory
+training/prediction mask. Throws an `ArgumentError` if the trajectory has none, because an
+empty mask silently yields `NaN` losses and zero gradient signal. Non-updated particles
+(e.g. boundaries) are expected and fine, as long as at least one updated particle exists.
+"""
+function _updated_particle_indices(node_types, types_updated, idx, key)
+    updated = findall(x -> x in types_updated, node_types)
+    if isempty(updated)
+        present = sort(unique(node_types))
+        throw(
+            ArgumentError(
+                "Trajectory $idx (key \"$key\") has no particles of any updated type " *
+                "(present node types: $present; types_updated=$types_updated). An empty " *
+                "mask yields NaN losses and no gradient signal. Adjust types_updated, or " *
+                "exclude this trajectory.",
+            ),
+        )
+    end
+    return updated
+end
+
+"""
     MLUtils.getobs!(buffer::Dict{String,Any}, ds::Dataset, idx::Int)
 
 Load trajectory data into a pre-allocated buffer using the MLUtils interface.
@@ -272,11 +296,10 @@ function MLUtils.getobs!(buffer, ds::Dataset, idx)
         n_out = sum(size(buffer[field], 1) for field in ds.meta["output_features"])
         buffer["val_mask"] = ds.meta["device"](ones(Float32, n_out, n_particles))
     else
-        buffer["mask"] = ds.meta["device"](
-            Int32.(
-                findall(x -> x in ds.meta["types_updated"], buffer["node_type"][1, :, 1])
-            ),
+        updated = _updated_particle_indices(
+            buffer["node_type"][1, :, 1], ds.meta["types_updated"], idx, key
         )
+        buffer["mask"] = ds.meta["device"](Int32.(updated))
         val_mask = Float32.(
             map(x -> x in ds.meta["types_updated"], buffer["node_type"][:, :, 1])
         )
@@ -821,7 +844,6 @@ function prepare_trajectory!(
     if !isnothing(meta["training_strategy"]) &&
         (typeof(meta["training_strategy"]) <: DerivativeStrategy)
         add_targets!(data, meta["derivative_target_features"], device)
-        _stack_velocity_history!(data, meta, device)
         preprocess!(
             data,
             meta["input_features"],
@@ -845,33 +867,4 @@ function prepare_trajectory!(
         end
     end
     return data, meta
-end
-
-function _stack_velocity_history!(
-    data::Dict{String,Any}, meta::Dict{String,Any}, device::Function
-)
-    C = get(meta, "history_size", 1)
-    C == 1 && return nothing
-    haskey(data, "velocity") || return nothing
-    vel = data["velocity"]
-    T = size(vel, 3)
-    T >= C || throw(ArgumentError("trajectory_length=$T is shorter than history_size=$C"))
-    M = T - C + 1
-
-    dim, np = size(vel, 1), size(vel, 2)
-    slices = [reshape(vel[:, :, c:(c + M - 1)], dim, np, 1, M) for c in 1:C]
-    data["velocity_history"] = device(cat(slices...; dims=3))
-
-    for key in collect(keys(data))
-        key == "velocity_history" && continue
-        v = data[key]
-        (v isa AbstractArray) || continue
-        ndims(v) >= 3 || continue
-        size(v, ndims(v)) == T || continue
-        idx = ntuple(i -> i == ndims(v) ? (C:T) : Colon(), ndims(v))
-        data[key] = v[idx...]
-    end
-
-    data["trajectory_length"] = M
-    return nothing
 end

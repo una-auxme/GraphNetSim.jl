@@ -60,11 +60,7 @@ function build_graph(
     # fluid_position = data["position"][:, data["mask"], datapoint]
     current_position = data["position"][:, :, datapoint]
 
-    velocity = if get(meta, "history_size", 1) > 1 && haskey(data, "velocity_history")
-        data["velocity_history"][:, :, :, datapoint]
-    else
-        data["velocity"][:, :, datapoint]
-    end
+    velocity = data["velocity"][:, :, datapoint]
 
     build_graph(gns, current_position, velocity, meta, node_type, data["mask"], device)
 end
@@ -100,10 +96,15 @@ function build_graph(
     )
 
     multi_type = n_node_types(meta) > 1
-    use_wall = multi_type || "wall_distance" in meta["input_features"]
+    # Wall distance is driven purely by the presence of a domain box in the dataset meta
+    # (`meta["bounds"]`) — independent of the node-type count and of `input_features`. A
+    # bounded dataset gives every particle a distance-to-walls block; an unbounded one
+    # (no `bounds`) yields a correspondingly shorter input vector. `multi_type` only
+    # controls the `node_type` one-hot block below.
+    use_wall = haskey(meta, "bounds")
     use_position = "position" in meta["input_features"]
 
-    vel_norm = _normalize_velocity(gns, velocity)
+    vel_norm = gns.n_norm["velocity"](velocity)
 
     edge_features = device(vcat(rel_displacement, rel_dist_norm) .+ 1.0f-8)
 
@@ -111,16 +112,15 @@ function build_graph(
     #   [position?, velocity, wall_distance?, node_type?]
     # Build this as a single `vcat` over the present blocks rather than chaining one
     # `vcat` per block. Chaining re-allocates and re-copies the growing feature matrix
-    # at every link — it allocated 1.7-2.1x the final array in transient GPU garbage
-    # (worse with velocity history, since the tall velocity block is recopied each
-    # link), whereas a single `vcat` allocates exactly the output once (~4.8x faster
+    # at every link — it allocated 1.7-2.1x the final array in transient GPU garbage,
+    # whereas a single `vcat` allocates exactly the output once (~4.8x faster
     # forward, ~1/3 less total fwd+bwd allocation; values/gradients bit-identical).
     # The block tuple uses immutable splats (no `push!`) so the expression stays
     # Zygote-differentiable on the training RHS; a lone present block returns untouched.
     nf_blocks = (
         (use_position ? (gns.n_norm["position"](position),) : ())...,
         vel_norm,
-        (use_wall ? (_wall_distance(position, mask, meta, device),) : ())...,
+        (use_wall ? (_wall_distance(position, meta, device),) : ())...,
         (multi_type ? (node_type,) : ())...,
     )
     nf = length(nf_blocks) == 1 ? nf_blocks[1] : vcat(nf_blocks...)
@@ -131,33 +131,17 @@ function build_graph(
     )
 end
 
-function _normalize_velocity(gns::GraphNetCore.GraphNetwork, velocity)
-    nv = gns.n_norm["velocity"]
-    if ndims(velocity) == 2
-        return nv(velocity)
-    elseif ndims(velocity) == 3
-        C = size(velocity, 3)
-        slices = map(1:C) do c
-            slc = velocity[:, :, c]
-            return nv isa NormaliserOnline ? nv(slc, c == C) : nv(slc)
-        end
-        stacked = cat(slices...; dims=3)
-        permuted = permutedims(stacked, (1, 3, 2))
-        return reshape(permuted, :, size(velocity, 2))
-    else
-        throw(
-            ArgumentError(
-                "velocity must be 2D (dim, particles) or 3D (dim, particles, C); " *
-                "got ndims=$(ndims(velocity))",
-            ),
-        )
-    end
-end
-
-function _wall_distance(position, mask, meta, device)
-    if length(mask) == size(position, 2)
-        return device(ones(Float32, size(position)...))
-    end
+# Clipped per-particle distance to the domain box `meta["bounds"]`, following
+# DeepMind's "distance to walls" node feature. This depends only on `meta["bounds"]`
+# and positions — NOT on node types or on the presence of boundary particles — so it
+# is computed for every particle whenever the feature is enabled. Returns `2 * dims`
+# rows (low + high bound per spatial dimension), matching the width reserved by
+# `calc_norms`. An implicit domain box with no boundary particles is fully supported;
+# the only hard requirement is that `meta["bounds"]` is defined.
+function _wall_distance(position, meta, device)
+    haskey(meta, "bounds") || throw(
+        ArgumentError("wall_distance requires meta[\"bounds\"] to be defined."),
+    )
     boundaries = device(Float32.(vcat(permutedims.(meta["bounds"])...)))
     dist_low_bound = position .- boundaries[:, 1]
     dist_up_bound = boundaries[:, 2] .- position
