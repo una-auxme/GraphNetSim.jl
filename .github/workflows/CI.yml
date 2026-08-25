@@ -23,7 +23,7 @@ jobs:
       fail-fast: false
       matrix:
         version:
-          - '1.11'   # minimum supported (see Project.toml [compat] julia)
+          - '1.12'   # minimum supported (Octopus requires Julia ≥ 1.12; see Project.toml [compat])
           - '1'      # latest stable 1.x
     steps:
       - uses: actions/checkout@v7
