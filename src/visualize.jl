@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2026 Josef Kircher, Julian Trommer, Simon Küchle
+# Copyright (c) 2026 Josef Jouaux, Simon Küchle
 # Licensed under the MIT license. See LICENSE file in the project root for details.
 #
 

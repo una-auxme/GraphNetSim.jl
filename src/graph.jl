@@ -1,6 +1,25 @@
 #
-# Copyright (c) 2026 Josef Kircher, Julian Trommer
+# Copyright (c) 2026 Josef Jouaux, Julian Trommer
 # Licensed under the MIT license. See LICENSE file in the project root for details.
+#
+# This file contains work derived from DeepMind's "learning_to_simulate"
+# (https://github.com/google-deepmind/deepmind-research), modified from the original:
+#
+#   Copyright 2020 DeepMind Technologies Limited. All Rights Reserved.
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+#
+# See THIRD_PARTY_NOTICES.md for details.
 #
 
 using CUDA
@@ -41,16 +60,24 @@ function build_graph(
     # fluid_position = data["position"][:, data["mask"], datapoint]
     current_position = data["position"][:, :, datapoint]
 
-    build_graph(
-        gns,
-        current_position,
-        data["velocity"][:, :, datapoint],
-        meta,
-        node_type,
-        data["mask"],
-        device,
-    )
+    velocity = data["velocity"][:, :, datapoint]
+
+    build_graph(gns, current_position, velocity, meta, node_type, data["mask"], device)
 end
+
+# Materialise `position` into a concrete, device-native matrix for neighbor search.
+#
+# In `build_graph`, `position === x.x` is a view into the ODE-state ComponentArray
+# (on CPU a `ReshapedArray` over a 1-D `SubArray`). Neighbor search dispatches on the
+# concrete array type (`point_neighbor_ns(::Array)` vs `(::CuArray)`), and the
+# SingleShooting/MultipleShooting backward pass differentiates through this call, so the
+# result must be (a) a concrete `Array`/`CuArray` and (b) produced by a
+# Zygote-differentiable op. On GPU, `device(x)` yields a `CuArray` (unchanged from the
+# original code). On CPU, `collect(x)` yields a dense `Array` via a differentiable copy —
+# unlike `adapt_structure(::CPUDevice, ::SubArray)`, whose `SubArray` constructor has no
+# adjoint (`Need an adjoint for constructor SubArray`).
+_neighbor_positions(device, x) = device(x)
+_neighbor_positions(::CPUDevice, x) = collect(x)
 
 """
     build_graph(gns::GraphNetCore.GraphNetwork, position, velocity, meta, node_type, mask, device)
@@ -76,85 +103,66 @@ All features are normalized using the normalizers stored in the model.
 function build_graph(
     gns::GraphNetCore.GraphNetwork, position, velocity, meta, node_type, mask, device
 ) # TODO check ODE solve and if this is really repeatedly done
-    # if size(boundaries,2)== 0
-    #     current_position = position
-    # else
-    #     current_position = hcat(position, boundaries)
-    #     velocity = hcat(velocity, zeros(Float32, meta["dims"], size(boundaries,2)))
-    # end
-
-    # Materialize `position` onto the active device's *concrete* array type
-    # before the neighbor search. In the ODE solver path `position` is `x.x`, a
-    # GPU-backed ComponentArray view (`<: AbstractArray` but not `<: CuArray`),
-    # which would otherwise miss `point_neighbor_ns(::CuArray)` and fall back to
-    # the host search. `device(...)` yields a `CuArray` on GPU / `Array` on CPU,
-    # selecting the matching method so the search AND its gradient
-    # (Octopus `build_edges_diff`) stay on-device. `device` differentiates
-    # (MLDataDevices rrule), so ∂L/∂pos flows back to the view.
     senders, receivers, rel_displacement, rel_dist_norm = neighbor_search(
-        device(position),
+        _neighbor_positions(device, position),
         Float32(meta["default_connectivity_radius"]),
         get(meta, "neighbor_backend", :pointneighbors),
     )
-    # if size(boundaries,2) != 0
-    # #     # sender_old, receiver_old, senders, receivers, _, b_particle = check_and_delete_filtered(senders, receivers, size(position, 2), true)
-    # #     # rel_displacement = (position[:, receiver_old] - position[:, sender_old]) ./ Float32(meta["default_connectivity_radius"])
-    # #     # rel_dist_norm = sqrt.(sum(abs2, rel_displacement; dims = 1))
-    #     dist_bound = compute_clostest_dist_bound(Array(senders), Array(receivers), Array(rel_dist_norm), Array(rel_displacement), size(position,2), length(unique(Array(b_particle))))
-    #     particles = unique(Array(senders))
-    # else
-    #     dist_bound = cu(ones(Float32, size(position)...))
-    #     particles = Colon()
-    # end
 
-    if n_node_types(meta) > 1
-        # DIVERGENCES.md D4 (2026-06-16): always compute the 4-wide clamped box distance.
-        # Previously, when `mask` covered all particles (a single-type trajectory, e.g. an all-water
-        # WaterRamps frame) this took a `dist_bound = ones(dim, n)` shortcut — only 2-wide — while
-        # mixed trajectories produced the 4-wide real distance. That made the node-feature width vary
-        # per trajectory, so a model trained on mixed trajectories crashed at eval on a single-type
-        # one (6 vs 8 inputs). The real clamped box distance is well-defined for every frame (it uses
-        # `meta["bounds"]`, not boundary particles) and matches DeepMind/`dm_boundary_features`.
-        boundaries = device(Float32.(vcat(permutedims.(meta["bounds"])...)))
-        dist_low_bound = position .- boundaries[:, 1]
-        dist_up_bound = boundaries[:, 2] .- position
-        dist_bound = clamp.(
-            vcat(dist_low_bound, dist_up_bound) ./
-            Float32(meta["default_connectivity_radius"]),
-            -1.0f0,
-            1.0f0,
-        )
-    end
+    multi_type = n_node_types(meta) > 1
+    # Wall distance is driven purely by the presence of a domain box in the dataset meta
+    # (`meta["bounds"]`) — independent of the node-type count and of `input_features`. A
+    # bounded dataset gives every particle a distance-to-walls block; an unbounded one
+    # (no `bounds`) yields a correspondingly shorter input vector. `multi_type` only
+    # controls the `node_type` one-hot block below.
+    use_wall = haskey(meta, "bounds")
+    use_position = "position" in meta["input_features"]
+
+    vel_norm = gns.n_norm["velocity"](velocity)
 
     edge_features = device(vcat(rel_displacement, rel_dist_norm) .+ 1.0f-8)
 
-    if n_node_types(meta) == 1
-        if length(meta["input_features"]) == 2
-            node_features = device(
-                vcat(gns.n_norm["position"](position), gns.n_norm["velocity"](velocity))
-            )
-        else
-            node_features = device(gns.n_norm["velocity"](velocity))
-        end
-    else
-        if length(meta["input_features"]) == 2
-            node_features = device(
-                vcat(
-                    gns.n_norm["position"](position),
-                    gns.n_norm["velocity"](velocity),
-                    dist_bound,
-                    node_type,
-                ),
-            )
-        else
-            node_features = device(
-                vcat(gns.n_norm["velocity"](velocity), dist_bound, node_type)
-            )
-        end
-    end
+    # Node features are the vertical concatenation of, in order:
+    #   [position?, velocity, wall_distance?, node_type?]
+    # Build this as a single `vcat` over the present blocks rather than chaining one
+    # `vcat` per block. Chaining re-allocates and re-copies the growing feature matrix
+    # at every link — it allocated 1.7-2.1x the final array in transient GPU garbage,
+    # whereas a single `vcat` allocates exactly the output once (~4.8x faster
+    # forward, ~1/3 less total fwd+bwd allocation; values/gradients bit-identical).
+    # The block tuple uses immutable splats (no `push!`) so the expression stays
+    # Zygote-differentiable on the training RHS; a lone present block returns untouched.
+    nf_blocks = (
+        (use_position ? (gns.n_norm["position"](position),) : ())...,
+        vel_norm,
+        (use_wall ? (_wall_distance(position, meta, device),) : ())...,
+        (multi_type ? (node_type,) : ())...,
+    )
+    nf = length(nf_blocks) == 1 ? nf_blocks[1] : vcat(nf_blocks...)
+    node_features = device(nf)
 
     return GraphNetCore.FeatureGraph(
         node_features, gns.e_norm(edge_features), senders, receivers
+    )
+end
+
+# Clipped per-particle distance to the domain box `meta["bounds"]`, following
+# DeepMind's "distance to walls" node feature. This depends only on `meta["bounds"]`
+# and positions — NOT on node types or on the presence of boundary particles — so it
+# is computed for every particle whenever the feature is enabled. Returns `2 * dims`
+# rows (low + high bound per spatial dimension), matching the width reserved by
+# `calc_norms`. An implicit domain box with no boundary particles is fully supported;
+# the only hard requirement is that `meta["bounds"]` is defined.
+function _wall_distance(position, meta, device)
+    haskey(meta, "bounds") || throw(
+        ArgumentError("wall_distance requires meta[\"bounds\"] to be defined."),
+    )
+    boundaries = device(Float32.(vcat(permutedims.(meta["bounds"])...)))
+    dist_low_bound = position .- boundaries[:, 1]
+    dist_up_bound = boundaries[:, 2] .- position
+    return clamp.(
+        vcat(dist_low_bound, dist_up_bound) ./ Float32(meta["default_connectivity_radius"]),
+        -1.0f0,
+        1.0f0,
     )
 end
 
@@ -352,23 +360,27 @@ flipped sign (see the corrected CPU rrule below for the right convention).
 - All distances and displacements are normalized by the search radius.
 - Supports arbitrary dimension (2D, 3D, etc.).
 """
-function point_neighbor_ns(pos::CuArray, radius::Float32; max_points_per_cell::Integer=100)
-    system = pos#[:,mask]
+function point_neighbor_ns(pos::CuArray, radius::Float32)
+    system = pos
     min_corner = minimum(pos; dims=2)
     max_corner = maximum(pos; dims=2)
     nhs = GridNeighborhoodSearch{size(pos, 1)}(;
         search_radius=radius,
         n_points=size(pos, 2),
-        cell_list=FullGridCellList(;
-            min_corner, max_corner, search_radius=radius, max_points_per_cell
-        ),
+        cell_list=FullGridCellList(; min_corner, max_corner, search_radius=radius),
+        update_strategy=ParallelUpdate(),
     )
-    initialize!(nhs, Array(system), Array(pos))
-    backend = CUDABackend()
-    # Simple example: just count the neighbors of each particle
-    n_neighbors_gpu = CuArray(zeros(Int, size(pos, 2)))
-    nhs_gpu = adapt(backend, nhs)
+    # Build the cell list on-device: adapt the (empty) nhs to the GPU, then `initialize!` with the
+    # CuArray positions so PointNeighbors dispatches to the parallel atomic init
+    # (`default_backend(::CuArray)` => GPU; `ParallelUpdate`'s `initialize_grid!` is the parallel one).
+    # Avoids the GPU->CPU->GPU round trip of the old `initialize!(nhs, Array(...), Array(...))` +
+    # adapt-back, whose serial CPU cell-list build was ~16 ms at 33k particles vs ~2 ms here (~8x).
+    # Edge set is identical; edge order may differ (atomic push), perturbing the downstream scatter
+    # by ~eps only. Benchmarked in example/RuntimeBenchmark/.
+    nhs_gpu = adapt(CUDABackend(), nhs)
+    initialize!(nhs_gpu, pos, pos)
 
+    n_neighbors_gpu = CuArray(zeros(Int, size(pos, 2)))
     foreach_point_neighbor(system, pos, nhs_gpu) do i, _, _, _
         n_neighbors_gpu[i] += 1
     end
@@ -456,20 +468,14 @@ end
 """
     octopus_ns(pos, radius::Float32)
 
-Neighbor search backend using [Octopus.jl](https://github.com/una-auxme/Octopus.jl)'s
-fast octree (`TNS`). Dispatches on the array type internally (CPU `Array` or
-`CuArray`), so the same code serves both devices.
-
-Returns `(senders, receivers, rel_displacement, rel_dist_norm)` in exactly the
-format of [`point_neighbor_ns`](@ref) — same receiver/sender convention, same
-displacement sign and radius normalization, self-edges included — so the two
-backends are interchangeable inside [`build_graph`](@ref). Edge sets are
-byte-identical to `point_neighbor_ns` (verified in `benchmark_derivative_batching/`).
-
-Gradients flow through `pos` via Octopus's differentiable `build_edges_diff`
-rrule (CPU and GPU); the tree build itself is non-differentiable
-(`@ignore_derivatives`). Octopus excludes the self-pair, so self-edges (zero
-displacement/distance, matching PointNeighbors) are appended explicitly.
+Neighbor search backend using [Octopus.jl](https://github.com/una-auxme/Octopus.jl)'s fast octree
+(`TNS`). Dispatches on the array type internally (CPU `Array` or `CuArray`), so the same code serves
+both devices. Returns `(senders, receivers, rel_displacement, rel_dist_norm)` in exactly the format
+of [`point_neighbor_ns`](@ref) — same receiver/sender convention, displacement sign, radius
+normalization, and appended self-edges — so the two backends are interchangeable in [`build_graph`](@ref).
+Gradients flow through `pos` via Octopus's differentiable `build_edges_diff` rrule; the tree build is
+non-differentiable (`@ignore_derivatives`). The octree is O(N) and ~18x leaner than PointNeighbors'
+dense grid on the GPU, so it's the backend for large point clouds where the grid OOMs.
 """
 function octopus_ns(pos, radius::Float32)
     D = size(pos, 1)
@@ -505,17 +511,16 @@ end
 """
     neighbor_search(pos, radius::Float32, backend::Symbol)
 
-Select the neighborhood-search implementation for graph construction. `backend`
-comes from `Args.neighbor_backend` (threaded via `meta["neighbor_backend"]`):
+Select the neighborhood-search implementation for graph construction. `backend` comes from
+`Args.neighbor_backend` (threaded via `meta["neighbor_backend"]`):
 
 - `:pointneighbors` — [`point_neighbor_ns`](@ref), PointNeighbors.jl grid search (default).
-- `:octopus`        — [`octopus_ns`](@ref), Octopus.jl octree search.
+- `:octopus`        — [`octopus_ns`](@ref), Octopus.jl octree search (memory-lean on GPU; needed for
+                      large clouds where the dense grid OOMs).
 - `:auto`           — PointNeighbors on CPU (`Array`), Octopus on GPU (`CuArray`).
-                      PointNeighbors wins on CPU; Octopus's octree is ~18x leaner
-                      than the dense grid on the GPU acceleration struct.
 
-All branches return the identical `(senders, receivers, rel_displacement,
-rel_dist_norm)` format and are differentiable in `pos`.
+All branches return the identical `(senders, receivers, rel_displacement, rel_dist_norm)` format and
+are differentiable in `pos`.
 """
 function neighbor_search(pos, radius::Float32, backend::Symbol)
     if backend === :pointneighbors

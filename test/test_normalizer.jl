@@ -17,6 +17,7 @@ using Statistics
 using GraphNetSim
 using GraphNetCore
 using Lux
+using Random
 using CUDA
 using JLD2
 using MLUtils
@@ -35,25 +36,28 @@ device = cpu_device()
     @testset "A: NormaliserOfflineMinMax unit math" begin
         println("Running: A — NormaliserOfflineMinMax unit math")
         @testset "A1: data_min→0, data_max→1, midpoint→0.5" begin
-            n = NormaliserOfflineMinMax(-3.0f0, 5.0f0)
+            n = NormaliserOfflineMinMax(-3.0f0, 5.0f0, device)
             @test only(n([-3.0f0])) ≈ 0.0f0 atol=1.0f-6
             @test only(n([5.0f0])) ≈ 1.0f0 atol=1.0f-6
             @test only(n([1.0f0])) ≈ 0.5f0 atol=1.0f-6   # midpoint: (-3+5)/2 = 1
         end
 
-        @testset "A2: inverse_data is exact left-inverse" begin
-            n = NormaliserOfflineMinMax(-3.0f0, 5.0f0)
-            x = Float32[-3.0, -1.0, 0.0, 2.5, 5.0]
-            @test all(isapprox.(inverse_data(n, n(x)), x; atol=1.0f-6))
+        @testset "A2: inverse_data is identity (v0.4: decoder handles denorm)" begin
+            # GraphNetCore >= 0.4 makes inverse_data(::NormaliserOfflineMinMax) the
+            # identity — the decoder is expected to undo the output scaling.
+            n = NormaliserOfflineMinMax(-3.0f0, 5.0f0, device)
+            y = Float32[-3.0, -1.0, 0.0, 2.5, 5.0]
+            @test inverse_data(n, y) == y
         end
 
         @testset "A3: non-default target range [-1, 1]" begin
-            n = NormaliserOfflineMinMax(0.0f0, 10.0f0, -1.0f0, 1.0f0)
+            n = NormaliserOfflineMinMax(0.0f0, 10.0f0, -1.0f0, 1.0f0, device)
             @test only(n([0.0f0])) ≈ -1.0f0 atol=1.0f-6
             @test only(n([10.0f0])) ≈ 1.0f0 atol=1.0f-6
             @test only(n([5.0f0])) ≈ 0.0f0 atol=1.0f-6
+            # inverse_data is identity in v0.4 (see A2)
             x = Float32[0.0, 3.0, 7.0, 10.0]
-            @test all(isapprox.(inverse_data(n, n(x)), x; atol=1.0f-6))
+            @test inverse_data(n, x) == x
         end
 
         @testset "A4: NormaliserOfflineMeanStd mean→0, mean±std→±1" begin
@@ -84,7 +88,7 @@ device = cpu_device()
     @testset "B: NormaliserOnline state machine" begin
         println("Running: B — NormaliserOnline state machine")
         @testset "B1: fresh normalizer has zero counters" begin
-            n = NormaliserOnline(3, cpu_device())
+            n = NormaliserOnline(Float32, 3, cpu_device())
             @test n.num_accumulations == 0.0f0
             @test n.acc_count == 0.0f0
             @test all(iszero, n.acc_sum)
@@ -92,7 +96,7 @@ device = cpu_device()
         end
 
         @testset "B2: one call accumulates correct acc_count and acc_sum" begin
-            n = NormaliserOnline(2, cpu_device(); max_acc=10.0f0)
+            n = NormaliserOnline(Float32, 2, cpu_device(); max_acc=10.0f0)
             # Shape (2, 4): 2-dim feature, 4 samples
             data = Float32[
                 1.0 3.0 5.0 7.0;
@@ -106,38 +110,41 @@ device = cpu_device()
         end
 
         @testset "B3: normalized midpoint ≈ 0 after warm-up" begin
-            n = NormaliserOnline(1, cpu_device(); max_acc=100.0f0)
+            n = NormaliserOnline(Float32, 1, cpu_device(); max_acc=100.0f0)
             for v in 1.0f0:1.0f0:100.0f0
                 n(reshape([v], 1, 1))
             end
-            # mean ≈ 50.5; normalizing 50.5 should give ≈ 0
-            result = n(reshape([50.5f0], 1, 1), false)
+            # mean ≈ 50.5; normalizing 50.5 should give ≈ 0. After 100 accumulations
+            # num_accumulations == max_acc, so this extra call no longer accumulates.
+            result = n(reshape([50.5f0], 1, 1))
             @test abs(result[1]) < 0.01f0
         end
 
         @testset "B4: accumulation stops at max_accumulations" begin
-            n = NormaliserOnline(1, cpu_device(); max_acc=3.0f0)
+            n = NormaliserOnline(Float32, 1, cpu_device(); max_acc=3.0f0)
             for _ in 1:5
                 n(reshape([1.0f0], 1, 1))
             end
             @test n.num_accumulations == 3.0f0
         end
 
-        @testset "B5: acc=false does not mutate state" begin
-            n = NormaliserOnline(2, cpu_device(); max_acc=10.0f0)
+        @testset "B5: no accumulation once max_accumulations reached" begin
+            # v0.4 removed the per-call `acc` flag; accumulation is gated purely on
+            # num_accumulations < max_accumulations (this is how the freeze helper works).
+            n = NormaliserOnline(Float32, 2, cpu_device(); max_acc=1.0f0)
             data = Float32[1.0 2.0; 3.0 4.0]
-            n(data)
+            n(data)   # num_accumulations → 1 == max_acc
             count_before = n.num_accumulations
             sum_before = copy(n.acc_sum)
-            n(data, false)
+            n(data)   # must NOT accumulate anymore
             @test n.num_accumulations == count_before
             @test n.acc_sum == sum_before
         end
 
         @testset "B6: serialize/deserialize round-trip is lossless" begin
-            n = NormaliserOnline(3, cpu_device(); max_acc=5.0f0)
+            n = NormaliserOnline(Float32, 3, cpu_device(); max_acc=5.0f0)
             data = Float32[1.0 2.0 3.0; 4.0 5.0 6.0; 7.0 8.0 9.0]
-            n(data);
+            n(data)
             n(data .* 2)
 
             d = GraphNetCore.serialize(n)
@@ -149,9 +156,12 @@ device = cpu_device()
             @test n2.acc_sum == n.acc_sum
             @test n2.acc_sum_squared == n.acc_sum_squared
 
-            # Applying both to the same input should give identical output
+            # Freeze both (cap accumulation) so the call does not mutate state, then
+            # applying both to the same input gives identical output.
+            n.num_accumulations = n.max_accumulations
+            n2.num_accumulations = n2.max_accumulations
             x = reshape(Float32[1.5, 4.5, 7.5], 3, 1)
-            @test n(x, false) == n2(x, false)
+            @test n(x) == n2(x)
         end
     end
 
@@ -292,17 +302,19 @@ device = cpu_device()
         traj = MLUtils.getobs(ds, 1)
         vel = traj["velocity"][:, :, 5]     # (3, 10) at timestep 5
 
-        @testset "D1: e_norm accumulates when called with default acc=true" begin
+        @testset "D1: e_norm accumulates on a default call" begin
             n_before = e_norms.num_accumulations
             fake_edges = randn(Float32, 4, 20)  # dims+1=4 edge features, 20 edges
             e_norms(fake_edges)
             @test e_norms.num_accumulations == n_before + 1.0f0
         end
 
-        @testset "D2: e_norm does NOT accumulate with acc=false" begin
+        @testset "D2: e_norm does NOT accumulate once frozen at max" begin
+            # v0.4 has no per-call acc flag; freezing = capping num_accumulations at max.
+            e_norms.num_accumulations = e_norms.max_accumulations
             n_before = e_norms.num_accumulations
             fake_edges = randn(Float32, 4, 15)
-            e_norms(fake_edges, false)
+            e_norms(fake_edges)
             @test e_norms.num_accumulations == n_before
         end
 
@@ -349,16 +361,15 @@ device = cpu_device()
         e_norms(randn(Float32, 4, 8))
         @test e_norms.num_accumulations > 0.0f0
 
-        # Build a minimal GraphNetwork wrapper. The freeze/restore helpers
-        # only touch the normaliser fields, so a trivial model/ps/st suffices.
-        gns = GraphNetCore.GraphNetwork(
-            Chain(Dense(1 => 1)),
-            ComponentArray{Float32}(),
-            NamedTuple(),
-            e_norms,
-            n_norms,
-            o_norms,
+        # Build a minimal GraphNetwork wrapper. The freeze/restore helpers only touch
+        # the normaliser fields, so a trivial TrainState suffices (GraphNetCore >= 0.4
+        # wraps model/params/state/optimiser in a Lux.Training.TrainState).
+        model = Chain(Dense(1 => 1))
+        ps, st = Lux.setup(Random.default_rng(), model)
+        train_state = Lux.Training.TrainState(
+            model, ComponentArray(ps), st, Optimisers.Adam(1.0f-4)
         )
+        gns = GraphNetCore.GraphNetwork(train_state, e_norms, n_norms, o_norms)
 
         e_before = gns.e_norm.num_accumulations
         n_before = Dict(
@@ -516,8 +527,11 @@ device = cpu_device()
                 n1 = GraphNetCore.deserialize(e_dict, cpu_device())
                 n2 = GraphNetCore.deserialize(GraphNetCore.serialize(n1), cpu_device())
 
+                # Freeze so the comparison call does not mutate accumulation state.
+                n1.num_accumulations = n1.max_accumulations
+                n2.num_accumulations = n2.max_accumulations
                 x = ones(Float32, 4, 10)
-                @test n1(x, false) == n2(x, false)
+                @test n1(x) == n2(x)
             end
         end
     end

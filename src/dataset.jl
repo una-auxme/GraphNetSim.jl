@@ -1,6 +1,25 @@
 #
-# Copyright (c) 2026 Josef Kircher, Julian Trommer
+# Copyright (c) 2026 Josef Jouaux, Julian Trommer
 # Licensed under the MIT license. See LICENSE file in the project root for details.
+#
+# This file contains work derived from DeepMind's "learning_to_simulate"
+# (https://github.com/google-deepmind/deepmind-research), modified from the original:
+#
+#   Copyright 2020 DeepMind Technologies Limited. All Rights Reserved.
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+#
+# See THIRD_PARTY_NOTICES.md for details.
 #
 
 ## new
@@ -54,7 +73,7 @@ then loads trajectories and merges metadata with provided arguments.
 function Dataset(datafile::String, metafile::String, args)
     if !isfile(datafile)
         throw(ArgumentError("Invalid datafile: $datafile"))
-    elseif !endswith(datafile, ".jld2") || !endswith(datafile, ".h5")
+    elseif !endswith(datafile, ".jld2") && !endswith(datafile, ".h5")
         throw(
             ArgumentError(
                 "Invalid file format for datafile: $datafile. Possible formats are [.jld2, .h5]",
@@ -71,7 +90,7 @@ function Dataset(datafile::String, metafile::String, args)
         )
     end
 
-    meta = parse(Base.read(metafile), String)
+    meta = parse(Base.read(metafile, String))
     keys_traj = keystraj(datafile)
     meta["n_trajectories"] = length(keys_traj)
     meta["keys_trajectories"] = keys_traj
@@ -219,6 +238,30 @@ end
 MLUtils.numobs(ds::Dataset) = ds.meta["n_trajectories"]
 
 """
+    _updated_particle_indices(node_types, types_updated, idx, key)
+
+Indices of the particles whose node type is in `types_updated` — the per-trajectory
+training/prediction mask. Throws an `ArgumentError` if the trajectory has none, because an
+empty mask silently yields `NaN` losses and zero gradient signal. Non-updated particles
+(e.g. boundaries) are expected and fine, as long as at least one updated particle exists.
+"""
+function _updated_particle_indices(node_types, types_updated, idx, key)
+    updated = findall(x -> x in types_updated, node_types)
+    if isempty(updated)
+        present = sort(unique(node_types))
+        throw(
+            ArgumentError(
+                "Trajectory $idx (key \"$key\") has no particles of any updated type " *
+                "(present node types: $present; types_updated=$types_updated). An empty " *
+                "mask yields NaN losses and no gradient signal. Adjust types_updated, or " *
+                "exclude this trajectory.",
+            ),
+        )
+    end
+    return updated
+end
+
+"""
     MLUtils.getobs!(buffer::Dict{String,Any}, ds::Dataset, idx::Int)
 
 Load trajectory data into a pre-allocated buffer using the MLUtils interface.
@@ -253,11 +296,10 @@ function MLUtils.getobs!(buffer, ds::Dataset, idx)
         n_out = sum(size(buffer[field], 1) for field in ds.meta["output_features"])
         buffer["val_mask"] = ds.meta["device"](ones(Float32, n_out, n_particles))
     else
-        buffer["mask"] = ds.meta["device"](
-            Int32.(
-                findall(x -> x in ds.meta["types_updated"], buffer["node_type"][1, :, 1])
-            ),
+        updated = _updated_particle_indices(
+            buffer["node_type"][1, :, 1], ds.meta["types_updated"], idx, key
         )
+        buffer["mask"] = ds.meta["device"](Int32.(updated))
         val_mask = Float32.(
             map(x -> x in ds.meta["types_updated"], buffer["node_type"][:, :, 1])
         )

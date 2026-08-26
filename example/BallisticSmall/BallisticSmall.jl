@@ -1,5 +1,5 @@
 #
-# Copyright (c) 2026 Josef Kircher
+# Copyright (c) 2026 Josef Jouaux
 # Licensed under the MIT license. See LICENSE file in the project root for details.
 #
 # Small ballistic dataset: 10 particles, no boundary nodes, linear drag physics.

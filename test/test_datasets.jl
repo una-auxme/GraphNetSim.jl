@@ -1076,14 +1076,18 @@ for cfg in CONFIGS
         end
 
         # ─────────────────────────────────────────────────────────────────
-        # Group I: Regression anchor — two-arg Dataset constructor bug
+        # Group I: three-arg Dataset(datafile, metafile, args) constructor
+        # Regression anchor for the dataset.jl:93 meta-parse bug (read then
+        # parse) — with valid files this constructor must build a Dataset.
         # ─────────────────────────────────────────────────────────────────
-        @testset "I: Two-arg Dataset constructor bug (dataset.jl:57)" begin
-            println("Running: I — Two-arg Dataset constructor bug ($(cfg.name))")
+        @testset "I: three-arg Dataset(datafile, metafile, args) constructor" begin
+            println("Running: I — three-arg Dataset constructor ($(cfg.name))")
             args = make_args(cfg)
-            @test_throws ArgumentError GraphNetSim.Dataset(
+            ds = GraphNetSim.Dataset(
                 joinpath(cfg.path, "train.h5"), joinpath(cfg.path, "meta.json"), args
             )
+            @test ds isa GraphNetSim.Dataset
+            @test ds.meta["n_trajectories"] > 0
         end
 
         # ─────────────────────────────────────────────────────────────────

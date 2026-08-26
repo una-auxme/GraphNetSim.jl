@@ -1,9 +1,47 @@
 #
-# Copyright (c) 2026 Josef Kircher, Julian Trommer
+# Copyright (c) 2026 Josef Jouaux, Julian Trommer
 # Licensed under the MIT license. See LICENSE file in the project root for details.
 #
+# This file contains work derived from DeepMind's "learning_to_simulate"
+# (https://github.com/google-deepmind/deepmind-research), modified from the original:
+#
+#   Copyright 2020 DeepMind Technologies Limited. All Rights Reserved.
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+#
+# See THIRD_PARTY_NOTICES.md for details.
+#
+# This file contains work derived from DeepMind's "learning_to_simulate"
+# (https://github.com/google-deepmind/deepmind-research), modified from the original:
+#
+#   Copyright 2020 DeepMind Technologies Limited. All Rights Reserved.
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+#
+# See THIRD_PARTY_NOTICES.md for details.
+#
 
-import SciMLBase: AbstractSensitivityAlgorithm, ODEFunction, ReturnCode, isadaptive
+import SciMLBase: AbstractSensitivityAlgorithm, ODEFunction, ReturnCode
 import SciMLSensitivity: InterpolatingAdjoint, ZygoteVJP, STACKTRACE_WITH_VJPWARN
 import Zygote: pullback
 using RecursiveArrayTools, CUDA
@@ -133,7 +171,8 @@ function _validation_step(t::Tuple, sim_interval, data_interval)
     gns, data, meta, _, solver, solver_dt, node_type, pr = t
 
     initial_state = Dict(
-        "position" => data["position"][:, :, 1], "velocity" => data["velocity"][:, :, 1]
+        "position" => data["position"][:, :, 1],
+        "velocity" => data["velocity"][:, :, 1],
     )
 
     target_dict = Dict{String,Int32}()
@@ -166,7 +205,9 @@ function _validation_step(t::Tuple, sim_interval, data_interval)
         CUDA.reclaim()  # Force garbage collection and free unused memory
     end
     sol_pos = [u.x for u in sol.u]
-    prediction = cat(sol_pos...; dims=3)[:, data["mask"], data_interval]
+    # `sol.u[k]` is the predicted state at frame `k`; the comparison takes the first
+    # `length(data_interval)` saved entries.
+    prediction = cat(sol_pos...; dims=3)[:, data["mask"], 1:length(data_interval)]
 
     error = mean((prediction - gt) .^ 2; dims=3)
 
@@ -326,7 +367,7 @@ function train_step(strategy::SolverStrategy, t::Tuple)
             t,
         ),
     )
-    prob = ODEProblem(ff, u0, (strategy.tstart, strategy.tstop), gns.ps)
+    prob = ODEProblem(ff, u0, (strategy.tstart, strategy.tstop), gns.train_state.parameters)
     shoot_loss, shoot_gs = Zygote.withgradient(
         ps -> train_loss(
             strategy,
@@ -342,7 +383,7 @@ function train_step(strategy::SolverStrategy, t::Tuple)
                 [meta["features"][tf]["dim"] for tf in target_fields],
             ),
         ),
-        gns.ps,
+        gns.train_state.parameters,
     )
     return shoot_gs, shoot_loss
 end
@@ -462,7 +503,9 @@ function BatchingStrategy(
     solver::OrdinaryDiffEqAlgorithm,
     steps;
     loss_function=:mae,
-    sense::AbstractSensitivityAlgorithm=_default_solver_sense(solver),
+    sense::AbstractSensitivityAlgorithm=InterpolatingAdjoint(
+        autojacvec=ZygoteVJP(), checkpointing=true
+    ),
     scheduler::Scheduler=WorstLoss(0),
     solargs...,
 )
@@ -645,17 +688,15 @@ function train_step(strategy::BatchingStrategy, t::Tuple)
         ff,
         u0,
         (round(batches[b].batchStart; digits=4), round(batches[b].batchStop; digits=4)),
-        gns.ps,
+        gns.train_state.parameters,
     )
     # Read the loss-variant selector OUTSIDE the differentiated region: an ENV
     # lookup is a `ccall` that Zygote cannot differentiate through.
     p2mode = get(ENV, "P2_LOSS", "pos")
     shoot_loss, shoot_gs = Zygote.withgradient(
-        ps -> train_loss(
-            strategy,
-            (prob, ps, u0, nothing, gt, mask, data["dt"], batches[b], gt_vel, pos_std, p2mode),
-        ),
-        gns.ps,
+        ps ->
+            train_loss(strategy, (prob, ps, u0, nothing, gt, mask, data["dt"], batches[b])),
+        gns.train_state.parameters,
     )
     return shoot_gs, shoot_loss
 end
@@ -766,7 +807,9 @@ function SingleShooting(
     dt::Float32,
     tstop::Float32,
     solver::OrdinaryDiffEqAlgorithm;
-    sense::AbstractSensitivityAlgorithm=_default_solver_sense(solver),
+    sense::AbstractSensitivityAlgorithm=InterpolatingAdjoint(
+        autojacvec=ZygoteVJP(), checkpointing=true
+    ),
     loss_function=:mae,
     solargs...,
 )
@@ -900,7 +943,13 @@ function MultipleShooting(
     solver::OrdinaryDiffEqAlgorithm,
     interval_size,
     continuity_term=100;
-    sense::AbstractSensitivityAlgorithm=_default_solver_sense(solver),
+    # checkpointing=false for MultipleShooting: its short sub-interval solves can produce
+    # single-point checkpoint segments, and the checkpointed reverse pass then evaluates
+    # `abs(cpsol_t[end] - cpsol_t[end-1])` -> BoundsError at index 0 (SciMLSensitivity's
+    # interpolating_adjoint.jl). Storing the full forward trajectory avoids that re-solve.
+    sense::AbstractSensitivityAlgorithm=InterpolatingAdjoint(
+        autojacvec=ZygoteVJP(), checkpointing=false
+    ),
     solargs...,
 )
     MultipleShooting(
@@ -962,9 +1011,10 @@ function train_step(strategy::MultipleShooting, t::Tuple)
             t,
         ),
     )
-    prob = ODEProblem(ff, u0, (strategy.tstart, strategy.tstop), gns.ps)
+    prob = ODEProblem(ff, u0, (strategy.tstart, strategy.tstop), gns.train_state.parameters)
     shoot_loss, shoot_gs = Zygote.withgradient(
-        ps -> train_loss(strategy, (prob, ps, data, gt, mask, device)), gns.ps
+        ps -> train_loss(strategy, (prob, ps, data, gt, mask, device)),
+        gns.train_state.parameters,
     )
     return shoot_gs, shoot_loss
 end
@@ -1126,7 +1176,7 @@ function train_step(strategy::DerivativeStrategy, t::Tuple)
                 device,
             ),
         ),
-        gns.ps,
+        gns.train_state.parameters,
     )
 
     return gs, loss
@@ -1146,21 +1196,10 @@ output and target derivatives.
 """
 function train_loss(strategy::DerivativeStrategy, t::Tuple)
     ps, gns, position, velocity, meta, target, node_type, mask, device = t
-    # In `DerivativeTraining` the positions are fixed dataset values, so the
-    # graph is constant w.r.t. `ps`: its backward pass (neighbor search,
-    # normalizers, concat) is computed by Zygote only to be discarded. Wrap it
-    # in `@ignore_derivatives` to skip that wasted work. ODE-based
-    # `DerivativeStrategy` variants would evolve `position` from `ps` and so
-    # need the graph gradient — guard the optimization on the concrete type.
-    if strategy isa DerivativeTraining
-        graph = ChainRulesCore.@ignore_derivatives build_graph(
-            gns, position, velocity, meta, node_type, mask, device
-        )
-    else
-        graph = build_graph(gns, position, velocity, meta, node_type, mask, device)
-    end
-    output, st = gns.model(graph, ps, gns.st)
-    gns.st = st
+    graph = build_graph(gns, position, velocity, meta, node_type, mask, device)
+    # GraphNetCore >= 0.4: model/state live inside the TrainState; layers are
+    # stateless under a forward pass so no state write-back is needed.
+    output, _ = gns.train_state.model(graph, ps, gns.train_state.states)
 
     if strategy.loss_function == :mse
         error = (target .- output[:, mask]) .^ 2

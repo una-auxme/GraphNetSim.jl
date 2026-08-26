@@ -1,5 +1,9 @@
 # GraphNetSim.jl
 
+<p align="center">
+  <img src="https://raw.githubusercontent.com/una-auxme/GraphNetSim.jl/main/docs/src/assets/logo.svg" alt="GraphNetSim.jl logo" width="200"/>
+</p>
+
 [![Docs](https://img.shields.io/badge/docs-dev-blue.svg)](https://una-auxme.github.io/GraphNetSim.jl/dev)
 [![ColPrac: Contributor's Guide on Collaborative Practices for Community Packages](https://img.shields.io/badge/ColPrac-Contributor's%20Guide-blueviolet)](https://github.com/SciML/ColPrac)
 [![Code Style: Blue](https://img.shields.io/badge/code%20style-blue-4495d1.svg)](https://github.com/JuliaDiff/BlueStyle)
@@ -16,6 +20,13 @@
 - **Feature noise injection** for robust model training
 
 The package is build upon [**GraphNetCore.jl**](https://github.com/una-auxme/GraphNetCore.jl) for the underlying graph neural network architecture.
+
+## Requirements
+
+- **Julia ≥ 1.12**
+- Built on [GraphNetCore.jl](https://github.com/una-auxme/GraphNetCore.jl) **v0.4**, which uses a
+  [Lux.jl](https://github.com/LuxDL/Lux.jl) `TrainState` and pulls in a CUDA-capable stack.
+- A CUDA-capable GPU is recommended for training (falls back to CPU when CUDA is unavailable).
 
 ## Installation
 
@@ -62,16 +73,18 @@ min_loss = train_network(
     training_strategy=DerivativeTraining()  # Training strategy
 )
 
-# Evaluate the trained network with long-term rollouts
+# Evaluate the trained network with long-term rollouts.
+# Note: the ODE solver is the 4th *positional* argument (not a keyword).
 eval_network(
     ds_path,
     cp_path,
-    "./results";               # Output directory
-    solver=Tsit5(),            # ODE solver
+    "./results",               # Output directory
+    Tsit5();                   # ODE solver (positional)
     start=0.0f0,
     stop=1.0f0,
-    saves=0.0:0.01:1.0,        # Time points to save
-    mse_steps=0.0:0.1:1.0      # Time points for error metrics
+    dt=0.01f0,                 # fixed timestep (omit for adaptive stepping)
+    saves=0.0f0:0.01f0:1.0f0,  # Time points to save
+    mse_steps=collect(0.0f0:0.1f0:1.0f0),  # Time points for error metrics
 )
 ```
 
@@ -93,7 +106,7 @@ The metadata file defines feature dimensions, node types, graph connectivity, an
 
 ## Key Features
 
-- **Multiple Training Strategies**: Choose between `BatchingTraining` and `DerivativeTraining` to suit your problem
+- **Multiple Training Strategies**: `DerivativeTraining` (fast, no ODE solve), plus the ODE-based `BatchingStrategy`, `SingleShooting`, and `MultipleShooting` for fine-tuning
 - **GPU-accelerated Training**: Automatic CUDA detection and memory management
 - **Flexible Architecture**: Configurable message passing steps, layer sizes, and hidden layers
 - **Progress Monitoring**: Built-in progress bars and logging for training and validation
@@ -136,29 +149,40 @@ See the [full API documentation](https://una-auxme.github.io/GraphNetSim.jl/dev/
 
 ## Visualization
 
-Export predicted trajectories as VTK files for visualization:
+Export the evaluation results as VTK HDF files for visualization in ParaView. The
+`eval_network` output is written under `<out_path>/<solver>/trajectories.h5`:
 
 ```julia
-visualize(
-    "trajectories.h5",           # Results file from eval_network
-    "./vtk_output",              # Output directory
-    "pos",                        # Position dataset name
-    "prediction";                 # Subgroup to visualize
-    Trajectorys=1:5              # Trajectory indices
+visualize_eval(
+    "./results/tsit5/trajectories.h5",  # trajectories.h5 written by eval_network
+    "./results/vtkhdf/",                # output directory for the VTK HDF files
 )
 ```
+
+The lower-level `visualize` function is also available for exporting a single group of a
+custom HDF5 file (see the [API reference](https://una-auxme.github.io/GraphNetSim.jl/dev/api/)).
 
 ## Related Packages
 
 - [**PointNeighbors.jl**](https://github.com/una-auxme/PointNeighbors.jl): Efficient spatial indexing for neighbor queries
+- [**Octopus.jl**](https://github.com/una-auxme/Octopus.jl): Fast octree neighborhood search on CPU and NVIDIA GPUs
 - [**GraphNetCore.jl**](https://github.com/una-auxme/GraphNetCore.jl): Core GNN architecture and normalization strategies
-- [**DifferentialEquations.jl**](https://github.com/SciML/DifferentialEquations.jl): ODE solvers for trajectory integration
 
 ## References
 
 This package is inspired by the Graph Network-based Simulator (GNS) framework:
 
 - Sanchez-Gonzalez, A., Godwin, J., Pfaff, T., et al. (2020). "Learning to Simulate Complex Physics with Graph Networks." *Proceedings of the 37th International Conference on Machine Learning (ICML)*.
+
+## License and Attribution
+
+GraphNetSim.jl is distributed under the [MIT License](https://github.com/una-auxme/GraphNetSim.jl/blob/main/LICENSE).
+
+It includes / is derived from portions of DeepMind's
+[`learning_to_simulate`](https://github.com/google-deepmind/deepmind-research/tree/master/learning_to_simulate)
+(Copyright 2020 DeepMind Technologies Limited), which is licensed under the Apache License,
+Version 2.0. The attribution and the full Apache 2.0 license text are provided in
+[`THIRD_PARTY_NOTICES.md`](https://github.com/una-auxme/GraphNetSim.jl/blob/main/THIRD_PARTY_NOTICES.md).
 
 ## Contributing
 
