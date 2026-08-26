@@ -22,5 +22,7 @@ include("generate_fixtures.jl")
     include("test_converters.jl")
     include("test_normalizer.jl")
     include("test_datasets.jl")
-    include("test_history_stack.jl")
+    include("test_wall_distance.jl")
+    include("test_trajectory_mask.jl")
+    include("test_visualize.jl")
 end

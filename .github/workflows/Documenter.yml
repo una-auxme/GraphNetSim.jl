@@ -28,7 +28,7 @@ jobs:
       - name: "Set up Julia"
         uses: julia-actions/setup-julia@v3
         with:
-          version: '1.11'
+          version: '1.12'   # Octopus 0.2 requires Julia ≥ 1.12 (see Project.toml [compat])
           arch: x64
 
       - name: "Copy readme to doc"

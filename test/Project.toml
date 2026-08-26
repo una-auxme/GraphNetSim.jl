@@ -1,6 +1,7 @@
 [deps]
 Aqua = "4c88cf16-eb10-579e-8560-4a9242c79595"
 CUDA = "052768ef-5323-5732-b1bb-66c8b64840ba"
+ComponentArrays = "b0b7db55-cfe3-40fc-9ded-d10e2dbeff66"
 DataFrames = "a93c6f00-e57d-5684-b7b6-d8193f3e46c0"
 GraphNetCore = "7809f980-de1b-4f9a-8451-85f041491431"
 HDF5 = "f67ccb44-e63f-5c2f-98bd-6dc0ccc4ba2f"
