@@ -65,6 +65,20 @@ function build_graph(
     build_graph(gns, current_position, velocity, meta, node_type, data["mask"], device)
 end
 
+# Materialise `position` into a concrete, device-native matrix for neighbor search.
+#
+# In `build_graph`, `position === x.x` is a view into the ODE-state ComponentArray
+# (on CPU a `ReshapedArray` over a 1-D `SubArray`). Neighbor search dispatches on the
+# concrete array type (`point_neighbor_ns(::Array)` vs `(::CuArray)`), and the
+# SingleShooting/MultipleShooting backward pass differentiates through this call, so the
+# result must be (a) a concrete `Array`/`CuArray` and (b) produced by a
+# Zygote-differentiable op. On GPU, `device(x)` yields a `CuArray` (unchanged from the
+# original code). On CPU, `collect(x)` yields a dense `Array` via a differentiable copy —
+# unlike `adapt_structure(::CPUDevice, ::SubArray)`, whose `SubArray` constructor has no
+# adjoint (`Need an adjoint for constructor SubArray`).
+_neighbor_positions(device, x) = device(x)
+_neighbor_positions(::CPUDevice, x) = collect(x)
+
 """
     build_graph(gns::GraphNetCore.GraphNetwork, position, velocity, meta, node_type, mask, device)
 
@@ -90,7 +104,7 @@ function build_graph(
     gns::GraphNetCore.GraphNetwork, position, velocity, meta, node_type, mask, device
 ) # TODO check ODE solve and if this is really repeatedly done
     senders, receivers, rel_displacement, rel_dist_norm = neighbor_search(
-        device(position),
+        _neighbor_positions(device, position),
         Float32(meta["default_connectivity_radius"]),
         get(meta, "neighbor_backend", :pointneighbors),
     )
