@@ -616,6 +616,60 @@ for cfg in CONFIGS
                 @test sched.step == 2
             end
 
+            @testset "D1r: TemporalWindow pooling scheduler" begin
+                sched = TemporalWindow(4; radius=2)
+                # Budget = base pass + reruns, and it tracks losses.
+                @test GraphNetSim.total_iters(sched, 10) == 14
+                @test GraphNetSim.tracks_losses(sched) == true
+                # Scalar pick is identical to WorstLoss: linear base pass,
+                # argmax rerun, norm-window wrap.
+                losses = Float32[1, 9, 3, 2, 7]
+                @test GraphNetSim.next_index(sched, 1, 5, losses, false) == 1
+                @test GraphNetSim.next_index(sched, 5, 5, losses, false) == 5
+                @test GraphNetSim.next_index(sched, 6, 5, losses, false) == 2  # argmax
+                @test GraphNetSim.next_index(sched, 7, 5, losses, true) == 2   # norm wrap
+                # update_state! writes the (pooled) loss to the centre index.
+                GraphNetSim.update_state!(sched, 6, 2, 0.5f0, 5, losses)
+                @test losses[2] == 0.5f0
+
+                # Pooling traits distinguish it from every other scheduler.
+                @test GraphNetSim.requires_sequential(sched) == true
+                @test GraphNetSim.pools_in_inner_loop(sched) == true
+
+                # window_indices: interior full width, boundary clamping, and a
+                # radius=0 window collapsing to the singleton scalar path.
+                @test GraphNetSim.window_indices(sched, 5, 10) == (3, 4, 5, 6, 7)
+                @test GraphNetSim.window_indices(sched, 1, 10) == (1, 2, 3)   # left edge
+                @test GraphNetSim.window_indices(sched, 10, 10) == (8, 9, 10) # right edge
+                @test GraphNetSim.window_indices(TemporalWindow(1; radius=0), 4, 10) == (4,)
+
+                # Constructor validation.
+                @test_throws ArgumentError TemporalWindow(-1)
+                @test_throws ArgumentError TemporalWindow(1; radius=-1)
+            end
+
+            @testset "D1s: TemporalWindow combination guards" begin
+                # DerivativeTraining must reject a pooling scheduler under the
+                # default random=true (in-place shuffle scrambles neighbours),
+                # but accept it with random=false.
+                @test_throws ArgumentError DerivativeTraining(; scheduler=TemporalWindow(3))
+                dt = DerivativeTraining(; random=false, scheduler=TemporalWindow(3))
+                @test dt.scheduler isa TemporalWindow
+                @test dt.random == false
+                # A non-pooling scheduler is unaffected by random=true (default).
+                @test DerivativeTraining(; scheduler=WorstLoss(3)).scheduler isa WorstLoss
+
+                # BatchingStrategy rejects pooling schedulers outright.
+                @test_throws ArgumentError BatchingStrategy(
+                    0.0f0, cfg.dt * 20, Euler(), 20; scheduler=TemporalWindow(3)
+                )
+
+                # Trait fallbacks: non-pooling schedulers are singleton-windowed.
+                @test GraphNetSim.requires_sequential(WorstLoss(0)) == false
+                @test GraphNetSim.pools_in_inner_loop(Sequential()) == false
+                @test GraphNetSim.window_indices(WorstLoss(0), 3, 10) == (3,)
+            end
+
             @testset "D1f: Inf32 init invariant (WorstLoss rerun pass)" begin
                 # The training loop initialises losses to fill(Inf32, n_units).
                 # For BatchingStrategy this is load-bearing: when base-pass
@@ -757,14 +811,16 @@ for cfg in CONFIGS
                 end
             end
 
-            @testset "D7: solver-adaptive default sensealg (checkpointing)" begin
+            @testset "D7: solver default sensealg (checkpointing disabled)" begin
                 # The checkpointed InterpolatingAdjoint reverse pass re-solves the
-                # forward problem without forwarding dt/tstops, so fixed-timestep
-                # solvers (Euler) need checkpointing disabled. The constructors must
-                # auto-select this: checkpointing == isadaptive(solver). Guards the
-                # path that lets Euler() be used as solver_train.
+                # forward problem between checkpoints and breaks for the short-interval
+                # solves these strategies use: fixed-step solvers (Euler) throw
+                # "Fixed timestep methods require a choice of dt", and adaptive solvers
+                # (Tsit5) over short batches hit a BoundsError at index [0] when a
+                # checkpoint segment has a single time point. So the default sense
+                # disables checkpointing for EVERY solver (see _default_solver_sense).
                 @test GraphNetSim._default_solver_sense(Euler()).checkpointing == false
-                @test GraphNetSim._default_solver_sense(Tsit5()).checkpointing == true
+                @test GraphNetSim._default_solver_sense(Tsit5()).checkpointing == false
 
                 for build in (
                     s -> BatchingStrategy(0.0f0, cfg.dt * 20, s, 20),
@@ -772,7 +828,7 @@ for cfg in CONFIGS
                     s -> MultipleShooting(0.0f0, cfg.dt, cfg.dt * 5, s, 2),
                 )
                     @test build(Euler()).sense.checkpointing == false
-                    @test build(Tsit5()).sense.checkpointing == true
+                    @test build(Tsit5()).sense.checkpointing == false
                 end
             end
         end
@@ -864,6 +920,44 @@ for cfg in CONFIGS
                     cp_path;
                     make_train_kwargs(cfg)...,
                     training_strategy=DerivativeTraining(; scheduler=UniqueWorst(rerun)),
+                    steps=n_steps,
+                    checkpoint=cp_interval,
+                    on_grad=(step, gs, ps, loss) -> (grad_calls[] += 1),
+                )
+
+                df_train, df_valid = load_latest_checkpoint(cp_path)
+
+                @test isfinite(min_val_loss)
+                @test nrow(df_valid) >= 1
+                @test grad_calls[] >= n_steps
+            end
+        end
+
+        # ─────────────────────────────────────────────────────────────────
+        # Group E2c: TemporalWindow gradient-pooling smoke test
+        # Same shape as E2 but drives the multi-forward / single-pooled-backward
+        # path: each rerun step expands into a ±radius window pooled into ONE
+        # gradient. `isfinite(min_val_loss)` guards that the tuple-map adjoint
+        # over the window produces valid gradients (not just scheduler logic).
+        # Requires random=false (TemporalWindow rejects the in-place shuffle).
+        # ─────────────────────────────────────────────────────────────────
+        @testset "E2c: DerivativeTraining TemporalWindow smoke" begin
+            println("Running: E2c — DerivativeTraining TemporalWindow smoke ($(cfg.name))")
+            mktempdir() do cp_path
+                rerun = 2
+                base = cfg.traj_length
+                n_steps = (base + rerun) * 3
+                cp_interval = base + rerun
+
+                grad_calls = Ref(0)
+                min_val_loss = train_network(
+                    Adam(1.0f-4),
+                    cfg.path,
+                    cp_path;
+                    make_train_kwargs(cfg)...,
+                    training_strategy=DerivativeTraining(;
+                        random=false, scheduler=TemporalWindow(rerun; radius=2)
+                    ),
                     steps=n_steps,
                     checkpoint=cp_interval,
                     on_grad=(step, gs, ps, loss) -> (grad_calls[] += 1),

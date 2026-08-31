@@ -77,7 +77,8 @@ export Scheduler,
     LearningProgress,
     PercentileWorst,
     Staleness,
-    AnnealedWeighted
+    AnnealedWeighted,
+    TemporalWindow
 
 export train_network,
     eval_network, extrapolate_network, data_minmax, data_meanstd, update_meta!
@@ -729,6 +730,18 @@ function train_gns!(
                     next_index(effective_sched, datapoint, n_units, losses_per_dp, norm_active)
                 end
 
+                # Expand the selected unit into a temporal window only during the
+                # rerun phase of a pooling scheduler (e.g. `TemporalWindow`). The
+                # base pass (`datapoint <= n_units`), the norm window, and every
+                # non-pooling scheduler keep a length-1 window via the
+                # `window_indices` fallback, so their throughput is unchanged. A
+                # pooled window is one gradient step over `2*radius+1` forwards.
+                window = if isnothing(effective_sched) || datapoint <= n_units
+                    (actual_dp,)
+                else
+                    window_indices(effective_sched, actual_dp, n_units)
+                end
+
                 train_tuple = init_train_step(
                     args.training_strategy,
                     (
@@ -741,7 +754,7 @@ function train_gns!(
                         data["mask"],
                         data["val_mask"],
                         ds_train.meta["device"],
-                        actual_dp,
+                        window,
                         batches,
                         args.show_progress_bars,
                     ),
@@ -915,10 +928,7 @@ function train_gns!(
                         next!(
                             pr_valid;
                             showvalues=[
-                                (
-                                    :trajectory,
-                                    "$traj_idx/$(n_val_denom)",
-                                ),
+                                (:trajectory, "$traj_idx/$(n_val_denom)"),
                                 (:valid_loss, "$(valid_error / traj_idx)"),
                             ],
                         )
@@ -963,7 +973,12 @@ function train_gns!(
                 cp_progress = 0
             end
 
-            if reached_budget
+            # Gate the budget break by `step > norm_steps`, matching the checkpoint
+            # block above: during the norm-accumulation warmup no training happens,
+            # so the `steps` budget must not cut the epoch short (otherwise a run with
+            # `steps <= norm_steps` exits after a single trajectory). In normal
+            # training `norm_steps << steps`, so this fires exactly as before.
+            if reached_budget && step > args.norm_steps
                 break
             end
         end
@@ -1543,7 +1558,8 @@ function extrapolate_network!(
             traj_saves, traj_stop = if isnothing(extrapolate_factor)
                 saves, stop
             else
-                nframes = round(Int, extrapolate_factor * (data["trajectory_length"] - 1)) + 1
+                nframes =
+                    round(Int, extrapolate_factor * (data["trajectory_length"] - 1)) + 1
                 s = Float32.(start .+ dt .* (0:(nframes - 1)))
                 s, s[end]
             end

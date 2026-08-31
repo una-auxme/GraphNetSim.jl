@@ -780,6 +780,94 @@ end
 tracks_losses(::AnnealedWeighted) = true
 
 """
+    TemporalWindow(rerun_steps; radius=2)
+
+Rerun-phase scheduler that pools the loss over the `±radius` temporal
+neighbours of the worst timestep. Each rerun iteration runs `2*radius + 1` GNN
+forward passes and **one** pooled backward pass — a single gradient update
+informed by the whole hard region rather than a single timestep.
+
+The scalar pick is identical to [`WorstLoss`](@ref): a linear base pass (which,
+with the `Inf32`-initialised losses buffer, preserves the "uncomputed-first"
+invariant) followed by `argmax(losses)` reruns. The *pooling* happens through
+the [`window_indices`](@ref) hook, which the training loop expands into a
+multi-forward window only during the rerun phase — the base pass and the
+norm-accumulation window stay length-1, so initial-pass throughput is unchanged.
+
+!!! note "Naming vs. `DerivativeTraining.window_size`"
+    `window_size` is the trajectory-slicing field on `DerivativeTraining` (how
+    many timesteps per trajectory). `TemporalWindow`'s `radius` is the
+    neighbourhood half-width around the `argmax` pick during a rerun. They are
+    unrelated concepts and must not be confused.
+
+!!! warning "Buffer semantics"
+    After a windowed rerun, `losses[centre]` holds the *window-pooled mean*, not
+    the single-step loss at `centre`; neighbour entries are untouched. Writing
+    only the centre index is the cheapest way to advance the `argmax` state
+    without a second no-grad forward per member.
+
+!!! warning "Combination guards"
+    Requires sequential timesteps, so only supported on
+    `DerivativeTraining(; random=false, …)` — with `random=true` the trajectory
+    arrays are shuffled in-place and index neighbours no longer correspond to
+    adjacent physics steps (the constructor throws via `requires_sequential`).
+    Not supported on `BatchingStrategy` (rejected via `pools_in_inner_loop`);
+    that strategy already pools temporally through its ODE interval.
+"""
+struct TemporalWindow <: Scheduler
+    rerun_steps::Integer
+    radius::Integer
+end
+
+function TemporalWindow(rerun_steps::Integer; radius::Integer=2)
+    rerun_steps >= 0 || throw(ArgumentError("rerun_steps must be >= 0"))
+    radius >= 0 || throw(ArgumentError("radius must be >= 0"))
+    return TemporalWindow(rerun_steps, radius)
+end
+
+total_iters(sched::TemporalWindow, n_units::Integer) = n_units + sched.rerun_steps
+
+# Scalar pick is identical to WorstLoss: linear base pass / norm-window cycling,
+# `argmax` otherwise. The temporal batching is applied separately via
+# `window_indices` at the training-loop call site.
+function next_index(
+    ::TemporalWindow,
+    i::Integer,
+    n_units::Integer,
+    losses::Vector{Float32},
+    norm_active::Bool,
+)
+    return _rerun_next_index(i, n_units, losses, norm_active)
+end
+
+function update_state!(
+    ::TemporalWindow,
+    ::Integer,
+    actual::Integer,
+    loss::Real,
+    ::Integer,
+    losses::Vector{Float32},
+)
+    # `loss` is the window-pooled mean during the rerun phase (length-1 windows
+    # on the base pass collapse to the single-step loss). Writing the centre
+    # index is enough to advance the argmax state.
+    losses[actual] = Float32(loss)
+    return nothing
+end
+
+tracks_losses(::TemporalWindow) = true
+requires_sequential(::TemporalWindow) = true
+pools_in_inner_loop(::TemporalWindow) = true
+
+# Temporal neighbourhood `[centre-radius, centre+radius]` clamped to `1:n_units`.
+# Boundary clamping silently shrinks the window at trajectory edges.
+function window_indices(sched::TemporalWindow, centre::Integer, n_units::Integer)
+    lo = max(1, centre - sched.radius)
+    hi = min(n_units, centre + sched.radius)
+    return Tuple(lo:hi)
+end
+
+"""
     get_scheduler(strategy)
 
 Return the `Scheduler` attached to `strategy`, or `nothing` for strategies
@@ -800,3 +888,31 @@ function outer_iters(::TrainingStrategy, sched::Scheduler, n_units::Integer)
     total_iters(sched, n_units)
 end
 outer_iters(::TrainingStrategy, ::Nothing, n_units::Integer) = n_units
+
+"""
+    requires_sequential(sched)
+
+Whether `sched` needs the training units visited in their natural (unshuffled)
+order — e.g. schedulers that pool over temporal neighbours. `DerivativeTraining`
+rejects such schedulers when `random=true`. Defaults to `false`.
+"""
+requires_sequential(::Scheduler) = false
+
+"""
+    pools_in_inner_loop(sched)
+
+Whether `sched` expands a selected unit into a multi-member [`window_indices`](@ref)
+window that is pooled into a single gradient step. `BatchingStrategy` rejects
+such schedulers (it already pools temporally via its ODE interval). Defaults to
+`false`.
+"""
+pools_in_inner_loop(::Scheduler) = false
+
+"""
+    window_indices(sched, centre, n_units)
+
+Training units pooled into one gradient step when `sched` selects `centre`.
+Defaults to the singleton `(centre,)`; only pooling schedulers (e.g.
+[`TemporalWindow`](@ref)) override it to return a wider neighbourhood.
+"""
+window_indices(::Scheduler, centre::Integer, ::Integer) = (centre,)
