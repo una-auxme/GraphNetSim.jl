@@ -812,13 +812,9 @@ for cfg in CONFIGS
             end
 
             @testset "D7: solver default sensealg (checkpointing disabled)" begin
-                # The checkpointed InterpolatingAdjoint reverse pass re-solves the
-                # forward problem between checkpoints and breaks for the short-interval
-                # solves these strategies use: fixed-step solvers (Euler) throw
-                # "Fixed timestep methods require a choice of dt", and adaptive solvers
-                # (Tsit5) over short batches hit a BoundsError at index [0] when a
-                # checkpoint segment has a single time point. So the default sense
-                # disables checkpointing for EVERY solver (see _default_solver_sense).
+                # The default sense disables checkpointing for EVERY solver, adaptive
+                # or fixed — the checkpointed reverse pass breaks for both (see
+                # _default_solver_sense for the two failure modes).
                 @test GraphNetSim._default_solver_sense(Euler()).checkpointing == false
                 @test GraphNetSim._default_solver_sense(Tsit5()).checkpointing == false
 
@@ -935,11 +931,9 @@ for cfg in CONFIGS
 
         # ─────────────────────────────────────────────────────────────────
         # Group E2c: TemporalWindow gradient-pooling smoke test
-        # Same shape as E2 but drives the multi-forward / single-pooled-backward
-        # path: each rerun step expands into a ±radius window pooled into ONE
-        # gradient. `isfinite(min_val_loss)` guards that the tuple-map adjoint
-        # over the window produces valid gradients (not just scheduler logic).
-        # Requires random=false (TemporalWindow rejects the in-place shuffle).
+        # Like E2 but exercises the multi-forward / single-pooled-backward path;
+        # `isfinite` guards the tuple-map adjoint over the window. Requires
+        # random=false (TemporalWindow rejects the in-place shuffle).
         # ─────────────────────────────────────────────────────────────────
         @testset "E2c: DerivativeTraining TemporalWindow smoke" begin
             println("Running: E2c — DerivativeTraining TemporalWindow smoke ($(cfg.name))")

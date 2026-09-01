@@ -1161,9 +1161,8 @@ feature normalizers.
 """
 function init_train_step(::DerivativeStrategy, t::Tuple)
     gns, data, meta, _, target_fields, node_type, mask, _, device, window, _, _ = t
-    # One pre-normalised target tensor per window member. A length-1 window
-    # (every non-pooling scheduler, and `TemporalWindow`'s base pass) yields a
-    # length-1 tuple, exactly reproducing the scalar path.
+    # One pre-normalised target tensor per window member; a length-1 window
+    # reproduces the scalar path exactly.
     targets = map(window) do datapoint
         vcat(
             [
