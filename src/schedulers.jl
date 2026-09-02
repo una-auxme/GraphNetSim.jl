@@ -234,6 +234,16 @@ function _weighted_pick(losses::Vector{Float32}, temperature::Float32)
     if !(total > 0.0)
         return rand(1:length(losses))
     end
+    # `losses` is all-finite here (non-finite entries short-circuit to argmax above), so
+    # an infinite `total` can only come from `^inv_t` overflowing Float64 - which happens
+    # once the temperature is small enough that loss^(1/T) leaves range (e.g. T=1e-3 with
+    # a loss of 9). The cumulative scan below would then hit `Inf <= Inf` at the *first*
+    # overflowing index and return it, which coincides with `argmax` only by accident of
+    # ordering. A vanishing temperature is documented to converge on `WorstLoss`, so
+    # return that directly instead of letting position decide.
+    if !isfinite(total)
+        return argmax(losses)
+    end
     r = rand() * total
     acc = 0.0
     @inbounds for k in eachindex(losses)
