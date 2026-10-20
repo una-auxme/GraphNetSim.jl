@@ -23,8 +23,7 @@ jobs:
       fail-fast: false
       matrix:
         version:
-          - '1.12'   # minimum supported (Octopus requires Julia ≥ 1.12; see Project.toml [compat])
-          - '1'      # latest stable 1.x
+          - '1.12'   # only supported version: Julia 1.13 needs a newer Reactant, which needs CUDA/cuDNN versions GraphNetCore 0.4 does not allow
     steps:
       - uses: actions/checkout@v7
       - uses: julia-actions/setup-julia@v3

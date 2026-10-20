@@ -25,7 +25,7 @@ The package is build upon [**GraphNetCore.jl**](https://github.com/una-auxme/Gra
 
 ## Requirements
 
-- **Julia ≥ 1.12**
+- **Julia 1.12** (Julia 1.13 is not supported yet; it needs dependency versions that GraphNetCore v0.4 does not allow)
 - Built on [GraphNetCore.jl](https://github.com/una-auxme/GraphNetCore.jl) **v0.4**, which uses a
   [Lux.jl](https://github.com/LuxDL/Lux.jl) `TrainState` and pulls in a CUDA-capable stack.
 - A CUDA-capable GPU is recommended for training (falls back to CPU when CUDA is unavailable).
