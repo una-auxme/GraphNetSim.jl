@@ -46,8 +46,9 @@ import Base: @kwdef
 import SciMLBase: solve, remake
 import HDF5: h5open, create_group, open_group
 import ProgressMeter: next!, update!, finish!
-import Statistics: mean
+import Statistics: mean, quantile
 import Printf: @sprintf
+import Random: randperm
 # GraphNetCore >= 0.4 stores the model/params/state in a Lux.Training.TrainState
 # (immutable), so parameter updates go through Setfield's @set! rather than
 # reassigning a `gns.ps` field.
@@ -63,6 +64,21 @@ include("import_data/csvToh5.jl")
 include("import_data/vtkToh5.jl")
 
 export SingleShooting, MultipleShooting, DerivativeTraining, BatchingStrategy
+export Scheduler,
+    Sequential,
+    WorstLoss,
+    UniqueWorst,
+    Shuffled,
+    WeightedWorst,
+    TopKWorst,
+    EpsilonGreedy,
+    ProgressiveHorizon,
+    UCB,
+    LearningProgress,
+    PercentileWorst,
+    Staleness,
+    AnnealedWeighted,
+    TemporalWindow
 
 export train_network,
     eval_network, extrapolate_network, data_minmax, data_meanstd, update_meta!
@@ -392,6 +408,24 @@ function calc_norms(dataset, device, args)
     return quantities, e_norms, n_norms, o_norms
 end
 
+# Bridge between GraphNetCore.load()'s 2-col df_step (step, loss) and the
+# 3-col schema (step, interval_idx, loss). Idempotent: 3-col input is left
+# unchanged. Legacy 2-col rows preserve their original interval indices in
+# `interval_idx`; `step` is rebuilt as a monotonic 1:N counter so historical
+# rows stay plottable.
+function _migrate_df_step!(df_step::DataFrame)
+    if names(df_step) == ["step", "interval_idx", "loss"]
+        return df_step
+    end
+    legacy_idx = copy(df_step.step)
+    legacy_loss = copy(df_step.loss)
+    select!(df_step, Int[])
+    df_step.step = collect(Int.(1:length(legacy_idx)))
+    df_step.interval_idx = Int.(legacy_idx)
+    df_step.loss = legacy_loss
+    return df_step
+end
+
 """
     train_network(opt, ds_path::String, cp_path::String; kws...)
 
@@ -665,7 +699,49 @@ function train_gns!(
             if args.training_strategy isa BatchingStrategy
                 batches = batchTrajectory(args.training_strategy, data)
             end
-            for datapoint in 1:delta
+
+            sched = get_scheduler(args.training_strategy)
+            n_units = isnothing(batches) ? delta : length(batches)
+
+            # During the norm-accumulation phase, force Sequential to prevent
+            # rerun steps from biasing online normalizer statistics. The real
+            # scheduler activates once norm accumulation is complete.
+            norm_phase = step + n_units <= args.norm_steps
+            effective_sched = norm_phase ? nothing : sched
+
+            outer_iters_n = outer_iters(args.training_strategy, effective_sched, n_units)
+            losses_per_dp =
+                if (!isnothing(effective_sched) && tracks_losses(effective_sched))
+                    # Inf32 init is load-bearing: for BatchingStrategy + WorstLoss
+                    # the base pass picks `argmax(fill(Inf32, n))` linearly. For
+                    # DerivativeTraining the losses buffer is never read on the
+                    # base pass (scheduler short-circuits to `i`), so the init
+                    # value is a no-op there. Test D1f guards this invariant.
+                    fill(Inf32, n_units)
+                else
+                    nothing
+                end
+
+            for datapoint in 1:outer_iters_n
+                norm_active = step + datapoint <= args.norm_steps
+                actual_dp = if isnothing(effective_sched)
+                    datapoint
+                else
+                    next_index(effective_sched, datapoint, n_units, losses_per_dp, norm_active)
+                end
+
+                # Expand the selected unit into a temporal window only during the
+                # rerun phase of a pooling scheduler (e.g. `TemporalWindow`). The
+                # base pass (`datapoint <= n_units`), the norm window, and every
+                # non-pooling scheduler keep a length-1 window via the
+                # `window_indices` fallback, so their throughput is unchanged. A
+                # pooled window is one gradient step over `2*radius+1` forwards.
+                window = if isnothing(effective_sched) || datapoint <= n_units
+                    (actual_dp,)
+                else
+                    window_indices(effective_sched, actual_dp, n_units)
+                end
+
                 train_tuple = init_train_step(
                     args.training_strategy,
                     (
@@ -678,12 +754,22 @@ function train_gns!(
                         data["mask"],
                         data["val_mask"],
                         ds_train.meta["device"],
-                        datapoint,
+                        window,
                         batches,
                         args.show_progress_bars,
                     ),
                 )
                 gs, losses = train_step(args.training_strategy, train_tuple)
+                if !isnothing(effective_sched)
+                    update_state!(
+                        effective_sched,
+                        datapoint,
+                        actual_dp,
+                        sum(losses),
+                        n_units,
+                        losses_per_dp,
+                    )
+                end
                 if !isnothing(args.on_grad)
                     args.on_grad(
                         step + datapoint, gs, gns.train_state.parameters, sum(losses)
@@ -751,8 +837,8 @@ function train_gns!(
                 end
             end
 
-            cp_progress += delta
-            step += delta
+            cp_progress += outer_iters_n
+            step += outer_iters_n
             avg_loss += tmp_loss
             traj_tmp_loss = tmp_loss
             tmp_loss = 0.0f0
@@ -770,13 +856,24 @@ function train_gns!(
             end
             t_last_traj = time()
 
-            if step > args.norm_steps && cp_progress >= args.checkpoint
+            # `steps` is the total training-step budget. The outer `while` only
+            # re-checks between full epochs, so without this an epoch over a large
+            # dataset blows far past the budget (and host RAM). Force a final
+            # checkpoint+validation when the budget is hit, then break.
+            reached_budget = step >= args.steps
+            if step > args.norm_steps && (cp_progress >= args.checkpoint || reached_budget)
                 push!(df_train, [step, avg_loss / Float32(cp_progress)])
+
+                # Optional validation subset (experiment knob): validate on only the
+                # first P2_VAL_SUBSET trajectories to make sweeps cheap. 0 = full set.
+                nt_full = ds_valid.meta["n_trajectories"]
+                val_subset = Base.parse(Int, get(ENV, "P2_VAL_SUBSET", "0"))
+                n_val_denom = val_subset > 0 ? min(val_subset, nt_full) : nt_full
 
                 traj_idx = 1
                 valid_error = 0.0f0
                 pr_valid = Progress(
-                    ds_valid.meta["n_trajectories"];
+                    n_val_denom;
                     desc="Validation progress: ",
                     barlen=50,
                     enabled=args.show_progress_bars,
@@ -789,6 +886,7 @@ function train_gns!(
                 frozen_state = _freeze_online_normalisers!(gns)
                 try
                     for data_valid in valid_loader
+                        val_subset > 0 && traj_idx > val_subset && break
                         if args.show_progress_bars
                             print("\n\n\n")
                         end
@@ -830,10 +928,7 @@ function train_gns!(
                         next!(
                             pr_valid;
                             showvalues=[
-                                (
-                                    :trajectory,
-                                    "$traj_idx/$(ds_valid.meta["n_trajectories"])",
-                                ),
+                                (:trajectory, "$traj_idx/$(n_val_denom)"),
                                 (:valid_loss, "$(valid_error / traj_idx)"),
                             ],
                         )
@@ -856,10 +951,10 @@ function train_gns!(
                         step,
                         joinpath(cp_path, "valid"),
                     )
-                    min_validation_loss = valid_error / ds_valid.meta["n_trajectories"]
+                    min_validation_loss = valid_error / n_val_denom
                     cp_progress = args.checkpoint
                 end
-                last_validation_loss = valid_error / ds_valid.meta["n_trajectories"]
+                last_validation_loss = valid_error / n_val_denom
                 if !isnothing(args.on_valid)
                     args.on_valid(step, last_validation_loss)
                 end
@@ -876,6 +971,15 @@ function train_gns!(
                 )
                 avg_loss = 0.0f0
                 cp_progress = 0
+            end
+
+            # Gate the budget break by `step > norm_steps`, matching the checkpoint
+            # block above: during the norm-accumulation warmup no training happens,
+            # so the `steps` budget must not cut the epoch short (otherwise a run with
+            # `steps <= norm_steps` exits after a single trajectory). In normal
+            # training `norm_steps << steps`, so this fires exactly as before.
+            if reached_budget && step > args.norm_steps
+                break
             end
         end
     end
@@ -1091,10 +1195,13 @@ function eval_network!(
     local errors = Dict{Tuple{Int,String},Array{Float32,3}}()
     local timesteps = Dict{Tuple{Int,String},Array{Float32,1}}()
 
-    test_loader = DataLoader(ds_test; batchsize=-1, buffer=false, parallel=true)
+    # parallel=false: the parallel loader yields trajectories in nondeterministic worker-completion
+    # order, so output `trajectory_<ti>` would not match dataset index `ti` (DIVERGENCES.md D6). Eval
+    # is only a handful of trajectories, so sequential, index-faithful iteration is the right tradeoff.
+    test_loader = DataLoader(ds_test; batchsize=-1, buffer=false, parallel=false)
 
-    # Optional cap on the number of evaluated trajectories (default: all). Lets bounded eval and
-    # A/B timing runs stay tractable — a full rollout over every test trajectory is very slow.
+    # Optional cap on the number of evaluated trajectories (default: all). Lets bounded/provisional
+    # eval runs stay tractable — a full rollout over every test trajectory × solver is very slow.
     # NB: bare `parse` resolves to `JSON.parse` in this module (see dataset.jl), so qualify Base.parse.
     n_eval_traj = Base.parse(Int, get(ENV, "GNS_EVAL_NTRAJ", string(typemax(Int))))
 
@@ -1272,6 +1379,7 @@ function extrapolate_network(
     saves,
     mse_steps=Float32[],
     has_ground_truth::Bool=true,
+    extrapolate_factor::Union{Nothing,Real}=nothing,
     kws...,
 )
     existing_cfg = load_model_config(cp_path)
@@ -1358,6 +1466,7 @@ function extrapolate_network(
         mse_steps,
         args;
         has_ground_truth=has_ground_truth,
+        extrapolate_factor=extrapolate_factor,
     )
 end
 
@@ -1367,9 +1476,18 @@ end
                          has_ground_truth::Bool=true)
 
 Inner evaluation loop for [`extrapolate_network`](@ref). Mirrors [`eval_network!`](@ref)
-but (a) never overrides the user-supplied time-grid arguments, (b) tolerates predictions
-longer than the ground truth (or missing ground truth entirely), and (c) freezes online
-feature normalisers during the rollout to prevent out-of-distribution drift.
+but (a) by default never overrides the user-supplied time-grid arguments, (b) tolerates
+predictions longer than the ground truth (or missing ground truth entirely), and (c)
+freezes online feature normalisers during the rollout to prevent out-of-distribution drift.
+
+## Per-trajectory horizons
+When `extrapolate_factor` is set (e.g. `2.0`), the global `stop`/`saves` are ignored and
+each trajectory instead rolls out to `extrapolate_factor` times its OWN ground-truth time
+window: a trajectory of `L` frames (GT window `dt*(L-1)`) is simulated over
+`[start, start + f*dt*(L-1)]`, i.e. `round(Int, f*(L-1)) + 1` frames. This is the correct
+setting for a dataset of varying-length trajectories, where a single global grid would
+extrapolate short trajectories far past `2×` while barely extrapolating the longest.
+`mse_steps` is still matched per trajectory against its own overlap region.
 
 ## Returns
 - `Tuple`: `(predictions::Dict{Int,NamedTuple}, errors::Dict{Int,Array{Float32,3}})`.
@@ -1388,10 +1506,15 @@ function extrapolate_network!(
     mse_steps,
     args::Args;
     has_ground_truth::Bool=true,
+    extrapolate_factor::Union{Nothing,Real}=nothing,
 )
-    @assert length(saves) > 0 "`saves` must not be empty"
-    @assert isapprox(Float32(saves[1]), Float32(start); atol=1.0f-6) "saves[1]=$(saves[1]) does not match start=$(start)"
-    @assert isapprox(Float32(saves[end]), Float32(stop); atol=1.0f-6) "saves[end]=$(saves[end]) does not match stop=$(stop)"
+    if isnothing(extrapolate_factor)
+        @assert length(saves) > 0 "`saves` must not be empty"
+        @assert isapprox(Float32(saves[1]), Float32(start); atol=1.0f-6) "saves[1]=$(saves[1]) does not match start=$(start)"
+        @assert isapprox(Float32(saves[end]), Float32(stop); atol=1.0f-6) "saves[end]=$(saves[end]) does not match stop=$(stop)"
+    else
+        @assert extrapolate_factor > 0 "`extrapolate_factor` must be positive, got $(extrapolate_factor)"
+    end
 
     local traj_pred = Dict{
         Int,
@@ -1411,7 +1534,10 @@ function extrapolate_network!(
     frozen_state = _freeze_online_normalisers!(gns)
 
     try
-        test_loader = DataLoader(ds_test; batchsize=-1, buffer=false, parallel=true)
+        # parallel=false: the parallel loader yields trajectories in nondeterministic worker-completion
+        # order, so output `trajectory_<ti>` would not match dataset index `ti` (DIVERGENCES.md D6). Eval
+        # is only a handful of trajectories, so sequential, index-faithful iteration is the right tradeoff.
+        test_loader = DataLoader(ds_test; batchsize=-1, buffer=false, parallel=false)
 
         for (ti, data) in enumerate(test_loader)
             target_features = ds_test.meta["solver_target_features"]
@@ -1424,6 +1550,18 @@ function extrapolate_network!(
                     "Requested dt=$(dt) does not match dataset dt=$(data_dt). " *
                     "Normalisation is trained at the dataset's dt.",
                 )
+            end
+
+            # Per-trajectory horizon: when extrapolate_factor is set, derive this
+            # trajectory's own time grid from its length (built by frame count to
+            # avoid Float32 range-endpoint drift); otherwise use the global grid.
+            traj_saves, traj_stop = if isnothing(extrapolate_factor)
+                saves, stop
+            else
+                nframes =
+                    round(Int, extrapolate_factor * (data["trajectory_length"] - 1)) + 1
+                s = Float32.(start .+ dt .* (0:(nframes - 1)))
+                s, s[end]
             end
 
             initial_state, node_type, stepstart = _prepare_rollout_inputs(
@@ -1447,9 +1585,9 @@ function extrapolate_network!(
                 data["mask"],
                 data["val_mask"],
                 start,
-                stop,
+                traj_stop,
                 dt,
-                saves,
+                traj_saves,
                 device,
                 pr,
             )
@@ -1477,13 +1615,13 @@ function extrapolate_network!(
 
                 reduced = mean(squared_err; dims=2)
                 valid_mse_steps = filter(mse_steps) do h
-                    idx = findfirst(x -> x == h, saves)
+                    idx = findfirst(x -> x == h, traj_saves)
                     return !isnothing(idx) && idx <= noverlap
                 end
                 if !isempty(valid_mse_steps)
                     println("MSE of state prediction ($noverlap of $npred steps covered):")
                     for horizon in valid_mse_steps
-                        idx = findfirst(x -> x == horizon, saves)
+                        idx = findfirst(x -> x == horizon, traj_saves)
                         err = mean(reduced[:, 1, idx])
                         cum_err = mean(reduced[:, 1, 1:idx])
                         println(

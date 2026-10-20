@@ -86,6 +86,70 @@ GraphNetSim.DerivativeTraining
 GraphNetSim.BatchingStrategy
 ```
 
+### Default Sensitivity Algorithm
+
+`BatchingStrategy`, `SingleShooting` and `MultipleShooting` default their `sense`
+keyword to the algorithm returned here.
+
+```@docs
+GraphNetSim._default_solver_sense
+```
+
+### Schedulers
+
+Per-pass selection rules used by `DerivativeTraining` and `BatchingStrategy`
+to choose which training unit (timestep or batch) is processed at each
+inner iteration of a trajectory pass.
+
+```@docs
+GraphNetSim.Scheduler
+```
+
+#### Stateless and loss-buffer schedulers
+
+```@docs
+GraphNetSim.Sequential
+GraphNetSim.Shuffled
+GraphNetSim.WorstLoss
+GraphNetSim.UniqueWorst
+GraphNetSim.WeightedWorst
+GraphNetSim.TopKWorst
+GraphNetSim.EpsilonGreedy
+GraphNetSim.PercentileWorst
+```
+
+#### Stateful schedulers (per-pass state)
+
+These keep per-unit state in mutable fields and rebuild it at the start of every
+trajectory pass, mirroring the training loop's fresh losses buffer.
+
+```@docs
+GraphNetSim.UCB
+GraphNetSim.LearningProgress
+GraphNetSim.Staleness
+```
+
+#### Annealing schedulers (global step counter)
+
+These keep a step counter across the whole run instead of resetting per pass, so
+their behaviour shifts as training progresses.
+
+```@docs
+GraphNetSim.ProgressiveHorizon
+GraphNetSim.AnnealedWeighted
+```
+
+#### Gradient-pooling scheduler
+
+Pools a window of neighbouring timesteps into a single gradient step. Supported by
+`DerivativeTraining` only; `BatchingStrategy` rejects it because it already pools
+temporally over its ODE interval.
+
+```@docs
+GraphNetSim.TemporalWindow
+GraphNetSim.window_indices
+```
+
 ## Normalization and Data Statistics
 
 ### Computing Normalization Statistics

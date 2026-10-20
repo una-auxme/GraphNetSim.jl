@@ -21,8 +21,27 @@
 #
 # See THIRD_PARTY_NOTICES.md for details.
 #
+# This file contains work derived from DeepMind's "learning_to_simulate"
+# (https://github.com/google-deepmind/deepmind-research), modified from the original:
+#
+#   Copyright 2020 DeepMind Technologies Limited. All Rights Reserved.
+#
+#   Licensed under the Apache License, Version 2.0 (the "License");
+#   you may not use this file except in compliance with the License.
+#   You may obtain a copy of the License at
+#
+#       http://www.apache.org/licenses/LICENSE-2.0
+#
+#   Unless required by applicable law or agreed to in writing, software
+#   distributed under the License is distributed on an "AS IS" BASIS,
+#   WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+#   See the License for the specific language governing permissions and
+#   limitations under the License.
+#
+# See THIRD_PARTY_NOTICES.md for details.
+#
 
-import SciMLBase: AbstractSensitivityAlgorithm, ODEFunction, ReturnCode
+import SciMLBase: AbstractSensitivityAlgorithm, ODEFunction, ReturnCode, isadaptive
 import SciMLSensitivity: InterpolatingAdjoint, ZygoteVJP, STACKTRACE_WITH_VJPWARN
 import Zygote: pullback
 using RecursiveArrayTools, CUDA
@@ -33,6 +52,8 @@ using JLD2
 #######################################################
 
 abstract type TrainingStrategy end
+
+include("schedulers.jl")
 
 """
     prepare_training(strategy)
@@ -77,10 +98,10 @@ Function that is executed before each training sample.
 ## Arguments
 - `strategy`: Used training strategy.
 - `t`: Tuple containing the variables necessary for initializing training.
-- `ta`: Tuple with additional variables that is returned from [prepare_training](@ref).
+- `ta`: Tuple with additional variables that is returned from [`prepare_training`](@ref).
 
 ## Returns
-- Tuple containing variables needed for [train_step](@ref).
+- Tuple containing variables needed for [`train_step`](@ref).
 """
 function init_train_step(strategy::TrainingStrategy, ::Tuple)
     throw(
@@ -150,8 +171,7 @@ function _validation_step(t::Tuple, sim_interval, data_interval)
     gns, data, meta, _, solver, solver_dt, node_type, pr = t
 
     initial_state = Dict(
-        "position" => data["position"][:, :, 1],
-        "velocity" => data["velocity"][:, :, 1],
+        "position" => data["position"][:, :, 1], "velocity" => data["velocity"][:, :, 1]
     )
 
     target_dict = Dict{String,Int32}()
@@ -211,6 +231,33 @@ predicted and ground truth trajectories at specified timesteps, using sensitivit
 algorithms for gradient computation.
 """
 abstract type SolverStrategy <: TrainingStrategy end
+
+"""
+    _default_solver_sense(solver)
+
+Default sensitivity algorithm for solver-based strategies:
+`InterpolatingAdjoint(autojacvec=ZygoteVJP(), checkpointing=false)`.
+
+`checkpointing=true` re-solves the forward problem between checkpoints during the
+reverse pass, which breaks in two ways for the short-interval solves these strategies
+use:
+
+- **Fixed-step solvers** (e.g. `Euler()`): the internal re-solve forwards neither `dt`
+  nor `tstops` (see SciMLSensitivity `interpolating_adjoint.jl`), so it throws
+  `ArgumentError: Fixed timestep methods require a choice of dt or choosing the tstops`.
+- **Adaptive solvers** (e.g. `Tsit5()`) over short batches: when a checkpoint segment's
+  forward solve holds a single time point, the reverse pass evaluates
+  `dt = abs(cpsol_t[end] - cpsol_t[end - 1])` and hits a `BoundsError` at index `[0]`
+  (`interpolating_adjoint.jl`).
+
+Disabling checkpointing skips that re-solve entirely — the forward solve's `dt` reaches
+the backward adjoint solve and the full forward trajectory is stored — so every solver
+works. Pass an explicit `sense=InterpolatingAdjoint(...; checkpointing=true)` to opt back
+into checkpointing when batches are long enough and GPU memory is tight.
+"""
+function _default_solver_sense(solver)
+    return InterpolatingAdjoint(; autojacvec=ZygoteVJP(), checkpointing=false)
+end
 
 """
     get_delta(::SolverStrategy, ::Integer)
@@ -413,39 +460,22 @@ struct BatchingStrategy <: SolverStrategy
     solver::OrdinaryDiffEqAlgorithm
     sense::AbstractSensitivityAlgorithm
     steps::Int64
-    loss_function::Any
+    loss_function::Symbol
     solargs::Any
+    scheduler::Scheduler
 end
 
-mutable struct Batch
+get_scheduler(s::BatchingStrategy) = s.scheduler
+outer_iters(s::BatchingStrategy, ::Scheduler, ::Integer) = s.steps
+outer_iters(s::BatchingStrategy, ::Nothing, ::Integer) = s.steps
+
+struct Batch
     batchStart::Float32
     batchStop::Float32
-    loss::Float32
 end
 
 """
-    Batch(start::Float32, stop::Float32; loss=Inf32)
-
-Constructs a batch for sequential trajectory training.
-
-Represents a contiguous time interval for ODE solving during batched training.
-
-## Arguments
-- `start::Float32`: Start time of the batch.
-- `stop::Float32`: Stop time of the batch.
-
-## Keyword Arguments
-- `loss::Float32=Inf32`: Initial loss for the batch (Inf32 means uncomputed).
-
-## Returns
-- `Batch`: Mutable struct with batch timing and loss information.
-"""
-function Batch(start, stop; loss=Inf32)
-    Batch(start, stop, loss)
-end
-
-"""
-    BatchingStrategy(tstart, intervall, solver, steps; loss_function=:mae, sense=..., solargs...)
+    BatchingStrategy(tstart, intervall, solver, steps; loss_function=:mae, sense=..., scheduler=WorstLoss(0), solargs...)
 
 Constructor for BatchingStrategy solver-based training.
 
@@ -453,11 +483,26 @@ Constructor for BatchingStrategy solver-based training.
 - `tstart::Float32`: Start time for first interval.
 - `intervall::Float32`: Duration of each batch interval.
 - `solver::OrdinaryDiffEqAlgorithm`: ODE solver algorithm.
-- `steps::Int64`: Number of steps per batch.
+- `steps::Int64`: Number of training iterations per trajectory pass
+  (total outer-loop budget; the scheduler decides which batch each iteration
+  trains on).
 
 ## Keyword Arguments
 - `loss_function::Symbol=:mae`: Loss function type.
-- `sense::AbstractSensitivityAlgorithm`: Gradient algorithm.
+- `sense::AbstractSensitivityAlgorithm`: Gradient algorithm. Defaults to
+  [`_default_solver_sense`](@ref)`(solver)`: `InterpolatingAdjoint` with
+  `checkpointing` enabled for adaptive solvers and disabled for fixed-timestep
+  solvers (e.g. `Euler()`), which are otherwise incompatible with the
+  checkpointed reverse pass.
+- `scheduler::Scheduler=WorstLoss(0)`: Per-pass batch-selection rule. The
+  default + `Inf32`-initialised losses buffer reproduces the historical
+  "uncomputed-first-else-highest-loss" curriculum. Any `Scheduler` works
+  (`Sequential`, `Shuffled`, `WorstLoss`, `UniqueWorst`, `WeightedWorst`,
+  `TopKWorst`, `EpsilonGreedy`, `PercentileWorst`, `UCB`, `LearningProgress`,
+  `Staleness`, `ProgressiveHorizon`, `AnnealedWeighted`); for loss-driven ones
+  the buffer fills during the implicit base pass. The scheduler's own
+  `rerun_steps` field (if any) is ignored — total outer iterations always equal
+  `strategy.steps`.
 - `solargs...`: Additional ODE solver keywords.
 """
 function BatchingStrategy(
@@ -466,12 +511,24 @@ function BatchingStrategy(
     solver::OrdinaryDiffEqAlgorithm,
     steps;
     loss_function=:mae,
-    sense::AbstractSensitivityAlgorithm=InterpolatingAdjoint(
-        autojacvec=ZygoteVJP(), checkpointing=true
-    ),
+    sense::AbstractSensitivityAlgorithm=_default_solver_sense(solver),
+    scheduler::Scheduler=WorstLoss(0),
     solargs...,
 )
-    BatchingStrategy(tstart, intervall, solver, sense, steps, loss_function, solargs)
+    loss_function in (:mse, :mae) ||
+        throw(ArgumentError("loss_function must be :mse or :mae, got :$loss_function"))
+    if pools_in_inner_loop(scheduler)
+        throw(
+            ArgumentError(
+                "Scheduler $(typeof(scheduler)) pools gradients over an inner-loop " *
+                "window, which BatchingStrategy does not support (it already pools " *
+                "temporally via its ODE interval). Use it with DerivativeTraining.",
+            ),
+        )
+    end
+    BatchingStrategy(
+        tstart, intervall, solver, sense, steps, loss_function, solargs, scheduler
+    )
 end
 
 """
@@ -518,46 +575,17 @@ function batchTrajectory(strategy::BatchingStrategy, data)
 end
 
 """
-    nextBatch(batches::Vector{Batch})
-
-Selects the next batch to train on using highest-loss sampling.
-
-Returns the index of the first uncomputed batch (loss = Inf32).
-If all batches are computed, returns the index of the batch with highest loss
-(prioritizing difficult batches).
-
-## Arguments
-- `batches::Vector{Batch}`: Array of batch objects with loss information.
-
-## Returns
-- `Integer`: Index of selected batch for next training iteration.
-"""
-function nextBatch(batches)
-    maxe = 0.0
-    element = 0
-    for i in eachindex(batches)
-        if batches[i].loss == Inf32
-            return i
-        end
-        if batches[i].loss > maxe
-            maxe = batches[i].loss
-            element = i
-        end
-    end
-    return element
-end
-
-"""
     init_train_step(strategy::BatchingStrategy, t::Tuple)
 
 Initializes a training step for the BatchingStrategy.
 
-Selects the next batch via `nextBatch()`, extracts initial conditions for that
-time window, packs state into ComponentArray, and prepares ground truth data.
+Receives the scheduler-selected batch index from the caller, extracts initial
+conditions for that time window, packs state into ComponentArray, and
+prepares ground truth data.
 
 ## Arguments
 - `strategy::BatchingStrategy`: BatchingStrategy instance.
-- `t::Tuple`: Input tuple (gns, data, meta, output_fields, target_fields, node_type, mask, val_mask, device, _, batches, show_progress_bars).
+- `t::Tuple`: Input tuple (gns, data, meta, output_fields, target_fields, node_type, mask, val_mask, device, batch_index, batches, show_progress_bars).
 
 ## Returns
 - `Tuple`: Initialized batch data for training step.
@@ -572,11 +600,12 @@ function init_train_step(strategy::BatchingStrategy, t::Tuple)
     mask,
     val_mask,
     device,
-    _,
+    window,
     batches,
     show_progress_bars = t
-
-    b = nextBatch(batches)
+    # BatchingStrategy rejects `pools_in_inner_loop` schedulers at construction,
+    # so `window` is always the length-1 tuple carrying the scalar batch index.
+    b = only(window)
 
     tstart = round(Int, (batches[b].batchStart/data["dt"]) + 1)
     tstop = round(Int, (batches[b].batchStop/data["dt"]) + 1)
@@ -592,6 +621,12 @@ function init_train_step(strategy::BatchingStrategy, t::Tuple)
 
     u0 = device(ComponentArray(; x=x0, dx=dx0))
     gt = vcat([data[tf][:, mask, tstart:tstop] for tf in target_fields]...)
+    # Extra targets for env-toggled Phase-2 loss experiments (see `train_loss`):
+    #   P2_LOSS=posvel  -> adds a velocity term (velocity depends on the network
+    #                      acceleration even for a 1-step Euler batch)
+    #   P2_LOSS=posnorm -> normalises the position residual by per-dim std
+    gt_vel = data["velocity"][:, mask, tstart:tstop]
+    pos_std = reshape(Float32.(meta["features"]["position"]["data_std"]), :, 1, 1)
     return (
         gns,
         data,
@@ -607,6 +642,8 @@ function init_train_step(strategy::BatchingStrategy, t::Tuple)
         batches,
         b,
         show_progress_bars,
+        gt_vel,
+        pos_std,
     )
 end
 
@@ -636,7 +673,9 @@ function train_step(strategy::BatchingStrategy, t::Tuple)
     device,
     batches,
     b,
-    show_progress_bars = t
+    show_progress_bars,
+    gt_vel,
+    pos_std = t
 
     pr = ProgressUnknown(;
         desc="Solver progress: ", showspeed=true, enabled=show_progress_bars
@@ -669,12 +708,28 @@ function train_step(strategy::BatchingStrategy, t::Tuple)
         (round(batches[b].batchStart; digits=4), round(batches[b].batchStop; digits=4)),
         gns.train_state.parameters,
     )
+    # Read the loss-variant selector OUTSIDE the differentiated region: an ENV
+    # lookup is a `ccall` that Zygote cannot differentiate through.
+    p2mode = get(ENV, "P2_LOSS", "pos")
     shoot_loss, shoot_gs = Zygote.withgradient(
-        ps ->
-            train_loss(strategy, (prob, ps, u0, nothing, gt, mask, data["dt"], batches[b])),
+        ps -> train_loss(
+            strategy,
+            (
+                prob,
+                ps,
+                u0,
+                nothing,
+                gt,
+                mask,
+                data["dt"],
+                batches[b],
+                gt_vel,
+                pos_std,
+                p2mode,
+            ),
+        ),
         gns.train_state.parameters,
     )
-    batches[b].loss = shoot_loss
     return shoot_gs, shoot_loss
 end
 
@@ -691,7 +746,7 @@ with ground truth using the configured loss function.
 - `t::Tuple`: Tuple containing problem, parameters, and ground truth data.
 """
 function train_loss(strategy::BatchingStrategy, t::Tuple)
-    prob, ps, u0, callback_solve, gt, mask, dt, batch = t
+    prob, ps, u0, callback_solve, gt, mask, dt, batch, gt_vel, pos_std, mode = t
     sol = solve(
         remake(prob; p=ps),
         strategy.solver;
@@ -699,19 +754,40 @@ function train_loss(strategy::BatchingStrategy, t::Tuple)
         dt=dt,
         sensealg=strategy.sense,
         callback=callback_solve,
-        # tstops = batch.batchStart:dt:batch.batchStop,
         saveat=(batch.batchStart:dt:batch.batchStop),
         strategy.solargs...,
     )
     sol_pos = [u.x for u in sol.u]
     pred = cat(sol_pos...; dims=3)
 
-    if strategy.loss_function == :mse
-        error = cpu_device()((gt[:, :, 1:size(pred, 3)] .- pred[:, mask, :]) .^ 2)
-    elseif strategy.loss_function == :mae
-        error = cpu_device()(abs.(gt[:, :, 1:size(pred, 3)] .- pred[:, mask, :]))
+    # Env-toggled Phase-2 loss variants (experiment). Default "pos" reproduces the
+    # original position-only loss exactly. See the gradient-suppression analysis:
+    # with a 1-step forward-Euler batch the position is independent of the network
+    # acceleration, so "pos" has ~zero gradient; "posvel" (velocity term) and a
+    # longer `intervall` restore it. `mode` is read outside the AD region in
+    # `train_step` (an ENV `ccall` is not differentiable by Zygote).
+    if mode == "posnorm"
+        res = cpu_device()(gt[:, :, 1:size(pred, 3)] .- pred[:, mask, :]) ./ pos_std
+        loss = strategy.loss_function == :mse ? mean(res .^ 2) : mean(abs.(res))
+    elseif mode == "posvel"
+        sol_vel = [u.dx for u in sol.u]
+        predv = cat(sol_vel...; dims=3)
+        if strategy.loss_function == :mse
+            ep = cpu_device()((gt[:, :, 1:size(pred, 3)] .- pred[:, mask, :]) .^ 2)
+            ev = cpu_device()((gt_vel[:, :, 1:size(predv, 3)] .- predv[:, mask, :]) .^ 2)
+        else
+            ep = cpu_device()(abs.(gt[:, :, 1:size(pred, 3)] .- pred[:, mask, :]))
+            ev = cpu_device()(abs.(gt_vel[:, :, 1:size(predv, 3)] .- predv[:, mask, :]))
+        end
+        loss = mean(ep) + mean(ev)
+    else  # "pos" — original behaviour
+        if strategy.loss_function == :mse
+            error = cpu_device()((gt[:, :, 1:size(pred, 3)] .- pred[:, mask, :]) .^ 2)
+        elseif strategy.loss_function == :mae
+            error = cpu_device()(abs.(gt[:, :, 1:size(pred, 3)] .- pred[:, mask, :]))
+        end
+        loss = mean(error)
     end
-    loss = mean(error)
     return loss
 end
 
@@ -728,7 +804,9 @@ Simulates the system from `tstart` to `tstop` and calculates the loss based on t
 - `solver`: Solver that is used for simulating the system.
 
 ## Keyword Arguments
-- `sense = InterpolatingAdjoint(autojacvec = ZygoteVJP())`: The sensitivity algorithm that is used for caluclating the sensitivities.
+- `sense`: The sensitivity algorithm used for calculating the sensitivities. Defaults to
+  [`_default_solver_sense`](@ref)`(solver)` (`InterpolatingAdjoint` with `checkpointing`
+  on for adaptive solvers, off for fixed-timestep solvers such as `Euler()`).
 - `solargs`: Keyword arguments that are passed on to the solver.
 """
 struct SingleShooting <: SolverStrategy
@@ -761,9 +839,7 @@ function SingleShooting(
     dt::Float32,
     tstop::Float32,
     solver::OrdinaryDiffEqAlgorithm;
-    sense::AbstractSensitivityAlgorithm=InterpolatingAdjoint(
-        autojacvec=ZygoteVJP(), checkpointing=true
-    ),
+    sense::AbstractSensitivityAlgorithm=_default_solver_sense(solver),
     loss_function=:mae,
     solargs...,
 )
@@ -857,7 +933,9 @@ Useful if the network tends to get stuck in a local minimum if SingleShooting is
 - `continuity_term = 100`: Factor by which the error between points of concurrent intervals is multiplied.
 
 ## Keyword Arguments
-- `sense = InterpolatingAdjoint(autojacvec = ZygoteVJP(), checkpointing = true)`:
+- `sense`: The sensitivity algorithm used for calculating the sensitivities. Defaults to
+  [`_default_solver_sense`](@ref)`(solver)` (`InterpolatingAdjoint` with `checkpointing`
+  on for adaptive solvers, off for fixed-timestep solvers such as `Euler()`).
 - `solargs`: Keyword arguments that are passed on to the solver.
 """
 struct MultipleShooting <: SolverStrategy
@@ -895,13 +973,7 @@ function MultipleShooting(
     solver::OrdinaryDiffEqAlgorithm,
     interval_size,
     continuity_term=100;
-    # checkpointing=false for MultipleShooting: its short sub-interval solves can produce
-    # single-point checkpoint segments, and the checkpointed reverse pass then evaluates
-    # `abs(cpsol_t[end] - cpsol_t[end-1])` -> BoundsError at index 0 (SciMLSensitivity's
-    # interpolating_adjoint.jl). Storing the full forward trajectory avoids that re-solve.
-    sense::AbstractSensitivityAlgorithm=InterpolatingAdjoint(
-        autojacvec=ZygoteVJP(), checkpointing=false
-    ),
+    sense::AbstractSensitivityAlgorithm=_default_solver_sense(solver),
     solargs...,
 )
     MultipleShooting(
@@ -1006,6 +1078,12 @@ function train_loss(strategy::MultipleShooting, t::Tuple)
                 ),
             ),
             strategy.solver;
+            # Pass dt only for fixed-timestep solvers (e.g. Euler): they require
+            # it, and it must flow through to the InterpolatingAdjoint reverse
+            # pass via kwargs. Adaptive solvers choose their own initial step, so
+            # we omit it to keep their trajectories byte-identical to the historical
+            # MultipleShooting behavior (which passed no dt at all).
+            (isadaptive(strategy.solver) ? (;) : (; dt=strategy.dt))...,
             saveat=tsteps[rg],
             sensealg=strategy.sense,
             strategy.solargs...,
@@ -1082,15 +1160,19 @@ feature normalizers.
 - `t::Tuple`: Input tuple with network, data, and sampling information.
 """
 function init_train_step(::DerivativeStrategy, t::Tuple)
-    gns, data, meta, _, target_fields, node_type, mask, _, device, datapoint, _, _ = t
-    target_quantities_change = vcat(
-        [
-            gns.o_norm[field](data["target|" * field][:, mask, datapoint]) for
-            field in target_fields
-        ]...,
-    )
+    gns, data, meta, _, target_fields, node_type, mask, _, device, window, _, _ = t
+    # One pre-normalised target tensor per window member; a length-1 window
+    # reproduces the scalar path exactly.
+    targets = map(window) do datapoint
+        vcat(
+            [
+                gns.o_norm[field](data["target|" * field][:, mask, datapoint]) for
+                field in target_fields
+            ]...,
+        )
+    end
 
-    return (gns, data, meta, target_quantities_change, node_type, mask, device, datapoint)
+    return (gns, data, meta, targets, node_type, mask, device, window)
 end
 
 """
@@ -1106,22 +1188,33 @@ derivatives. Computes gradients via backpropagation.
 - `t::Tuple`: Data tuple from init_train_step().
 """
 function train_step(strategy::DerivativeStrategy, t::Tuple)
-    gns, data, meta, target_quantities_change, node_type, mask, device, datapoint = t # TODO here own function
+    gns, data, meta, targets, node_type, mask, device, window = t
     loss, gs = Zygote.withgradient(
-        ps -> train_loss(
-            strategy,
-            (
-                ps,
-                gns,
-                data["position"][:, :, datapoint],
-                data["velocity"][:, :, datapoint],
-                meta,
-                target_quantities_change,
-                node_type,
-                mask,
-                device,
-            ),
-        ),
+        ps -> begin
+            # One loss per window member inside a single backward pass; the
+            # pooled mean yields ONE gradient informed by the whole window.
+            # Length-1 windows (all non-pooling schedulers) collapse to the
+            # scalar path; multi-member windows rely on Zygote's generic
+            # tuple-map adjoint and are not type-stable — a deliberate cost paid
+            # only on `TemporalWindow` reruns.
+            per_step = map(window, targets) do datapoint, target
+                train_loss(
+                    strategy,
+                    (
+                        ps,
+                        gns,
+                        data["position"][:, :, datapoint],
+                        data["velocity"][:, :, datapoint],
+                        meta,
+                        target,
+                        node_type,
+                        mask,
+                        device,
+                    ),
+                )
+            end
+            sum(per_step) / length(per_step)
+        end,
         gns.train_state.parameters,
     )
 
@@ -1147,13 +1240,12 @@ function train_loss(strategy::DerivativeStrategy, t::Tuple)
     # stateless under a forward pass so no state write-back is needed.
     output, _ = gns.train_state.model(graph, ps, gns.train_state.states)
 
-    # error = loss_function(target, output)
-    # error = loss_function(target, output[:, mask])
-    # println(maximum(output))
-    # println(maximum(target))
-    error = (target .- output[:, mask]) .^ 2
+    if strategy.loss_function == :mse
+        error = (target .- output[:, mask]) .^ 2
+    elseif strategy.loss_function == :mae
+        error = abs.(target .- output[:, mask])
+    end
 
-    # loss = mean(error[mask])
     loss = mean(error)
 
     return loss
@@ -1223,23 +1315,58 @@ end
 Derivative-based training strategy using finite-difference ground truth.
 
 Compares network output with finite-difference derivatives from data. Faster than
-solver-based training, useful for initial model training. Supports temporal windowing
-and optional random shuffling.
+solver-based training, useful for initial model training. Supports temporal windowing,
+optional random shuffling, and a pluggable per-pass `Scheduler`.
 """
 struct DerivativeTraining <: DerivativeStrategy
     window_size::Integer
     random::Bool
+    scheduler::Scheduler
+    loss_function::Symbol
 end
 
 """
-    DerivativeTraining(; window_size=0, random=true)
+    DerivativeTraining(; window_size=0, random=true, scheduler=Sequential(), loss_function=:mse)
 
 Constructor for DerivativeTraining strategy.
 
 ## Keyword Arguments
 - `window_size::Integer=0`: Number of timesteps per trajectory (0 means use all).
 - `random::Bool=true`: Whether to shuffle timesteps within the window.
+- `scheduler::Scheduler=Sequential()`: Per-pass selection rule. Options:
+  `Sequential()` (linear), `Shuffled()` (random permutation per cycle),
+  `WorstLoss(n)` (revisit `argmax`-worst step `n` times, repeats allowed),
+  `UniqueWorst(n)` (revisit each of the `n` worst steps at most once),
+  `WeightedWorst(n; temperature)` (loss-proportional rerun sampling),
+  `TopKWorst(n, k)` (round-robin over the `k` worst),
+  `EpsilonGreedy(n; epsilon)` (greedy-worst with `epsilon` random exploration),
+  `PercentileWorst(n; q)` (uniform among the top-`q`-quantile worst),
+  `UCB(n; c)` (upper-confidence-bound bandit), `LearningProgress(n)` (prioritise
+  by `|Δloss|`), `Staleness(n; weight)` (loss + recency anti-starvation),
+  `ProgressiveHorizon(n; warmup_frac, growth_steps)` (growing time-horizon
+  curriculum), `AnnealedWeighted(n; t0, t1, decay_steps)` (temperature-decayed
+  `WeightedWorst`), or `TemporalWindow(n; radius)` (pool each rerun's gradient
+  over `±radius` neighbouring timesteps — requires `random=false`).
+- `loss_function::Symbol=:mse`: Loss function type (`:mse` or `:mae`).
 """
-function DerivativeTraining(; window_size::Integer=0, random=true)
-    DerivativeTraining(window_size, random)
+function DerivativeTraining(;
+    window_size::Integer=0,
+    random=true,
+    scheduler::Scheduler=Sequential(),
+    loss_function::Symbol=:mse,
+)
+    loss_function in (:mse, :mae) ||
+        throw(ArgumentError("loss_function must be :mse or :mae, got :$loss_function"))
+    if random && requires_sequential(scheduler)
+        throw(
+            ArgumentError(
+                "Scheduler $(typeof(scheduler)) requires random=false — it pools over " *
+                "adjacent timesteps, which the in-place shuffle of random=true would " *
+                "scramble. Pass DerivativeTraining(; random=false, …).",
+            ),
+        )
+    end
+    DerivativeTraining(window_size, random, scheduler, loss_function)
 end
+
+get_scheduler(s::DerivativeTraining) = s.scheduler
