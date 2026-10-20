@@ -1,20 +1,11 @@
 name: Documenter
 
+# Manual-only. GitHub Actions path filters match file paths, not diff content, so
+# there is no way to trigger solely on docstring changes. Rather than rebuilding on
+# every push/PR, the docs are deployed on demand from the Actions tab
+# ("Run workflow"). Remember to run it after merging docstring or docs/ changes.
 on:
-  pull_request:
-    branches:
-      - main
-  push:
-    branches: 
-      - main
-    paths:
-      - 'docs/**'
-      - 'README.md'
-      - '.github/workflows/Documenter.yml'
-    tags: 
-      - '*'
   workflow_dispatch:
-
 jobs:
   build:
     permissions:

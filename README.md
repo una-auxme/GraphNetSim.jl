@@ -5,6 +5,8 @@
 </p>
 
 [![Docs](https://img.shields.io/badge/docs-dev-blue.svg)](https://una-auxme.github.io/GraphNetSim.jl/dev)
+[![CI](https://github.com/una-auxme/GraphNetSim.jl/actions/workflows/CI.yml/badge.svg)](https://github.com/una-auxme/GraphNetSim.jl/actions/workflows/CI.yml)
+[![codecov](https://codecov.io/gh/una-auxme/GraphNetSim.jl/branch/main/graph/badge.svg)](https://codecov.io/gh/una-auxme/GraphNetSim.jl)
 [![ColPrac: Contributor's Guide on Collaborative Practices for Community Packages](https://img.shields.io/badge/ColPrac-Contributor's%20Guide-blueviolet)](https://github.com/SciML/ColPrac)
 [![Code Style: Blue](https://img.shields.io/badge/code%20style-blue-4495d1.svg)](https://github.com/JuliaDiff/BlueStyle)
 
