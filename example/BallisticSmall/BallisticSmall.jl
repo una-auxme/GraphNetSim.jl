@@ -8,7 +8,7 @@
 
 using GraphNetSim
 
-import OrdinaryDiffEq: Euler, Tsit5
+import OrdinaryDiffEq: Tsit5
 import Optimisers: Adam
 
 # Generate dataset into data/ballistic_small if not already present

@@ -23,7 +23,7 @@
 
 using GraphNetSim
 using Optuna
-import OrdinaryDiffEq: Euler
+import OrdinaryDiffEqLowOrderRK: Euler
 import Optimisers: Adam, AdamW, RAdam
 
 # ── Dataset setup ────────────────────────────────────────────────────────

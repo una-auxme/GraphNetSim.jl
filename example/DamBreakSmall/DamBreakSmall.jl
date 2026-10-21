@@ -12,7 +12,8 @@
 
 using GraphNetSim
 
-import OrdinaryDiffEq: Euler, Tsit5
+import OrdinaryDiffEq: Tsit5
+import OrdinaryDiffEqLowOrderRK: Euler
 import Optimisers: Adam
 
 # Generate dataset into data/dam_break_small if not already present

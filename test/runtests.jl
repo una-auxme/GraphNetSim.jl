@@ -12,11 +12,7 @@ include("generate_fixtures.jl")
         @testset "Method ambiguity" begin
             Aqua.test_ambiguities([GraphNetSim])
         end
-        # Deps that are intentionally not `import`ed from src/, so exclude them from the
-        # stale-deps check:
-        #  - GPUCompiler: deps-only version pin (see Project.toml [compat]), loaded
-        #    transitively via CUDA/Reactant.
-        Aqua.test_all(GraphNetSim; ambiguities=false, stale_deps=(ignore=[:GPUCompiler],))
+        Aqua.test_all(GraphNetSim; ambiguities=false)
     end
 
     include("test_converters.jl")

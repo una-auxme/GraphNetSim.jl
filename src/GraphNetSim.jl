@@ -38,7 +38,8 @@ using Plots
 import SciMLBase: ODEProblem, SecondOrderODEProblem
 # Newer OrdinaryDiffEq relocated `OrdinaryDiffEqAlgorithm` into its OrdinaryDiffEqCore
 # subpackage; alias it back to the original name so solver-type signatures stay unchanged.
-import OrdinaryDiffEq: OrdinaryDiffEqCore, Tsit5, Euler
+import OrdinaryDiffEq: OrdinaryDiffEqCore, Tsit5
+import OrdinaryDiffEqLowOrderRK: Euler
 const OrdinaryDiffEqAlgorithm = OrdinaryDiffEqCore.OrdinaryDiffEqAlgorithm
 import ProgressMeter: Progress
 
@@ -408,7 +409,7 @@ function calc_norms(dataset, device, args)
     return quantities, e_norms, n_norms, o_norms
 end
 
-# Bridge between GraphNetCore.load()'s 2-col df_step (step, loss) and the
+# Bridge between GraphNetCore.load_checkpoint()'s 2-col df_step (step, loss) and the
 # 3-col schema (step, interval_idx, loss). Idempotent: 3-col input is left
 # unchanged. Legacy 2-col rows preserve their original interval indices in
 # `interval_idx`; `step` is rebuilt as a monotonic 1:N counter so historical
@@ -560,9 +561,9 @@ function train_network(opt, ds_path, cp_path; kws...)
         outputs += ds_train.meta["features"][tf]["dim"]
     end
 
-    # GraphNetCore >= 0.4: load() returns (gns, df_train, df_valid). The optimiser
+    # load_checkpoint() returns (gns, df_train, df_valid). The optimiser
     # state now lives inside gns.train_state (df_step was dropped upstream).
-    gns, df_train, df_valid = load(
+    gns, df_train, df_valid = load_checkpoint(
         quantities,
         typeof(dims) <: AbstractArray ? length(dims) : dims,
         e_norms,
@@ -576,12 +577,6 @@ function train_network(opt, ds_path, cp_path; kws...)
         device,
         cp_path,
     ) # geht mit dims oder dimensions of array
-
-    # The optimiser state lives inside `gns.train_state` (populated on a fresh start by the
-    # TrainState constructor, restored on resume). On resume GraphNetCore loads it from the
-    # (CPU) checkpoint without moving it to the device, so re-`device` it in place here to keep
-    # it co-located with the (GPU) parameters.
-    @set! gns.train_state.optimizer_state = device(gns.train_state.optimizer_state)
 
     Lux.trainmode(gns.train_state.states)
 
@@ -938,12 +933,13 @@ function train_gns!(
                     _restore_online_normalisers!(frozen_state)
                 end
 
-                # GraphNetCore >= 0.4: save! no longer appends to df_valid, so record
-                # the validation loss here (once per checkpoint).
+                # GraphNetCore >= 0.4: save_checkpoint! (save! before 0.5) does not
+                # append to df_valid, so record the validation loss here (once per
+                # checkpoint).
                 push!(df_valid, [step, valid_error / ds_valid.meta["n_trajectories"]])
 
                 if valid_error / ds_valid.meta["n_trajectories"] < min_validation_loss
-                    save!(
+                    save_checkpoint!(
                         gns,
                         gns.train_state.optimizer_state,
                         df_train,
@@ -966,7 +962,7 @@ function train_gns!(
                     println("  min_validation_loss: $min_validation_loss")
                     println("  last_validation_loss: $last_validation_loss")
                 end
-                save!(
+                save_checkpoint!(
                     gns, gns.train_state.optimizer_state, df_train, df_valid, step, cp_path
                 )
                 avg_loss = 0.0f0
@@ -1102,7 +1098,7 @@ function eval_network(
         outputs += ds_test.meta["features"][tf]["dim"]
     end
 
-    gns, _, _ = load(
+    gns, _, _ = load_checkpoint(
         quantities,
         typeof(dims) <: AbstractArray ? length(dims) : dims,
         e_norms,
@@ -1112,7 +1108,7 @@ function eval_network(
         args.mps,
         args.layer_size,
         args.hidden_layers,
-        # v0.4 load() builds a Lux TrainState that requires a real optimiser even for
+        # load_checkpoint() builds a Lux TrainState that requires a real optimiser even for
         # eval/extrapolate (its optimiser state is unused here); pass a throwaway Adam.
         Optimisers.Adam(),
         device,
@@ -1432,7 +1428,7 @@ function extrapolate_network(
         outputs += ds_test.meta["features"][tf]["dim"]
     end
 
-    gns, _, _ = load(
+    gns, _, _ = load_checkpoint(
         quantities,
         typeof(dims) <: AbstractArray ? length(dims) : dims,
         e_norms,
@@ -1442,7 +1438,7 @@ function extrapolate_network(
         args.mps,
         args.layer_size,
         args.hidden_layers,
-        # v0.4 load() builds a Lux TrainState that requires a real optimiser even for
+        # load_checkpoint() builds a Lux TrainState that requires a real optimiser even for
         # eval/extrapolate (its optimiser state is unused here); pass a throwaway Adam.
         Optimisers.Adam(),
         device,

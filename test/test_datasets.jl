@@ -24,7 +24,8 @@ using LinearAlgebra
 using JSON
 using PointNeighbors
 using Random
-import OrdinaryDiffEq: Tsit5, Euler
+import OrdinaryDiffEq: Tsit5
+import OrdinaryDiffEqLowOrderRK: Euler
 import Optimisers: Adam
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -232,7 +233,9 @@ for cfg in CONFIGS
             # finiteness/non-triviality. Pin the actual values against stats
             # recomputed from the raw HDF5 instead.
             @testset "B4: meanstd matches ground truth" begin
-                meta = JSON.parsefile(joinpath(cfg.path, "meta.json"))
+                meta = JSON.parsefile(
+                    joinpath(cfg.path, "meta.json"); dicttype=Dict{String,Any}
+                )
                 result = data_meanstd(cfg.path)
 
                 for field in ("velocity", "acceleration")
@@ -1232,7 +1235,7 @@ for cfg in CONFIGS
                     cfg_path = joinpath(cp_path, "model_config.json")
                     @test isfile(cfg_path)
 
-                    d = JSON.parsefile(cfg_path)
+                    d = JSON.parsefile(cfg_path; dicttype=Dict{String,Any})
                     @test d["architecture"]["mps"] == 2
                     @test d["architecture"]["layer_size"] == 32
                     @test d["architecture"]["hidden_layers"] == 1

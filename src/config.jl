@@ -119,7 +119,7 @@ function load_model_config(cp_path::String)::Union{ModelConfig,Nothing}
     isfile(path) || return nothing
 
     try
-        d = json_parsefile(path)
+        d = json_parsefile(path; dicttype=Dict{String,Any})
         arch = d["architecture"]
         train = d["training"]
         return ModelConfig(;
