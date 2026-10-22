@@ -39,11 +39,8 @@ end
 
 ds_path = "data/dam_break_small"
 
-# Precompute both normalization statistics (reusable across trials).
-# `update_meta!` writes one statistic type per call, so run both — the trial
-# then selects between them via `norm_type` (:minmax / :meanstd).
-update_meta!(ds_path, :minmax)
-update_meta!(ds_path, :meanstd)
+# Normalization statistics are written per trial (see `objective`): `update_meta!`
+# keeps only one statistic type in meta.json at a time, removing the other.
 
 # ── Fixed training parameters ────────────────────────────────────────────
 
@@ -92,6 +89,9 @@ function objective(trial::Trial; params)
     end
 
     lr_stop = params[:lr] * params[:lr_decay_ratio]
+
+    # Write the statistics this trial's norm_type needs; update_meta! drops the other type.
+    update_meta!(ds_path, params[:norm_type])
 
     min_val_loss = train_network(
         opt,
