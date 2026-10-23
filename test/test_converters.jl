@@ -245,7 +245,7 @@ end
             pvd = _make_vtk_dataset(dir; T=5, with_acc=true)
             out = joinpath(dir, "train.h5")
             vtk_to_hdf5(pvd, out; write_meta=true, connectivity_radius=0.5)
-            meta = JSON.parsefile(joinpath(dir, "meta.json"))
+            meta = JSON.parsefile(joinpath(dir, "meta.json"); dicttype=Dict{String,Any})
             @test meta["dims"] == 3
             @test meta["trajectory_length"] == 5
             @test Set(meta["feature_names"]) ==
@@ -272,7 +272,9 @@ end
             out = joinpath(outdir, "train.h5")
             vtk_to_hdf5(pvd, out; meta=provided)
             @test isfile(joinpath(outdir, "meta.json"))
-            @test JSON.parsefile(joinpath(outdir, "meta.json"))["dims"] == 3
+            @test JSON.parsefile(
+                joinpath(outdir, "meta.json"); dicttype=Dict{String,Any}
+            )["dims"] == 3
         end
     end
 

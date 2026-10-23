@@ -436,7 +436,7 @@ function update_meta!(path::String, norm_type::Symbol)
         return meta_path
     end
 
-    meta = json_parsefile(meta_path)
+    meta = json_parsefile(meta_path; dicttype=Dict{String,Any})
 
     conflicting_minmax = ("data_min", "data_max", "output_min", "output_max")
     conflicting_meanstd = ("data_mean", "data_std")

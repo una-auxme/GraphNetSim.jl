@@ -68,7 +68,10 @@ end
 @testset "wall_distance gating (calc_norms, bounds-driven)" begin
     dev = GraphNetSim.cpu_device()
     args = GraphNetSim.Args()
-    base = JSON.parsefile(joinpath(@__DIR__, "fixtures", "ballistic_small", "meta.json"))
+    base = JSON.parsefile(
+        joinpath(@__DIR__, "fixtures", "ballistic_small", "meta.json");
+        dicttype=Dict{String,Any},
+    )
 
     q_bounded, = GraphNetSim.calc_norms((; meta=deepcopy(base)), dev, args)
 

@@ -504,7 +504,7 @@ function _install_provided_meta(meta_path::AbstractString, output::AbstractStrin
     dest = joinpath(dirname(abspath(output)), "meta.json")
     # Light structural check: every dynamic feature key `X[$t]` must have `X[1]`
     # in the written file, every static feature key must exist.
-    m = JSON.parsefile(meta_path)
+    m = JSON.parsefile(meta_path; dicttype=Dict{String,Any})
     h5open(output, "r") do fid
         g = fid[first(keys(fid))]
         for (fn, spec) in get(m, "features", Dict())

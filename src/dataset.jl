@@ -90,7 +90,7 @@ function Dataset(datafile::String, metafile::String, args)
         )
     end
 
-    meta = parse(Base.read(metafile, String))
+    meta = parse(Base.read(metafile, String); dicttype=Dict{String,Any})
     keys_traj = keystraj(datafile)
     meta["n_trajectories"] = length(keys_traj)
     meta["keys_trajectories"] = keys_traj
@@ -135,7 +135,7 @@ function Dataset(split::Symbol, path::String, args)
         )
     end
 
-    meta = parse(Base.read(joinpath(path, "meta.json"), String))
+    meta = parse(Base.read(joinpath(path, "meta.json"), String); dicttype=Dict{String,Any})
     datafile = get_file(split, path)
     keys_traj = keystraj(datafile)
     meta["n_trajectories"] = length(keys_traj)
